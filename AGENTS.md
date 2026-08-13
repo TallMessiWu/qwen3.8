@@ -1,0 +1,125 @@
+# AGENTS.md
+
+This file provides guidance to coding agents (Claude Code, Codex CLI, …) when working with code in this repository.
+
+本仓通过符号链接把各家 agent 的配置合并到一处：`AGENTS.md` 与 `.agents/skills/` 是真身，`CLAUDE.md`、`.claude/skills` 只是指向它们的链接。要改文档或加技能，一律动 `AGENTS.md` / `.agents/skills/`。
+
+## 这个仓库是干什么的
+
+在昇腾 NPU 上调试与测试 **Qwen3.8**，服务由 `vllm` + `vllm-ascend` 提供。所有让模型跑起来的改动都落在 `vllm-ascend`，通过 patch / 继承 / 自定义算子等手段适配，**不改 `vllm`**。
+
+## 硬性约束（每次动手前先确认）
+
+1. **`vllm/` 是只读参考。** 上游 vLLM 的克隆，用来查源码、确认被 patch 的函数签名与调用点。不要修改、不要提交、不要推送。需要改上游行为时，在 `vllm-ascend` 里写 patch。
+2. **本机没有 NPU，跑不了推理。** 本机只能写代码、读代码、做静态分析。有一块 5080 GPU，可以跑纯 PyTorch 的小脚本做数值等价性 / 算法逻辑的模拟验证（不能 import `torch_npu`）。
+3. **验证闭环靠脚本。** 需要在真机验证时，把可复现的脚本写进 `scripts/`，推送到主仓，由用户在服务器上拉取执行并把结果回传。脚本要自带打印/断言，输出要能直接贴回来判读，不要依赖交互式输入。
+4. **只能推私仓。** `vllm-ascend` 的 `origin` 是私仓，`upstream` 是主仓上游——upstream 只 fetch，永远不 push。
+5. **不要主动 push。** 提交后停下，由用户决定推送时机。
+
+## 目录结构
+
+```
+qwen3.8/                   # 主仓（git，分支 main）
+├── AGENTS.md              # 本文件
+├── .agents/skills/        # 技能目录
+├── skills-lock.json       # 外部技能来源与哈希（mattpocock/skills），由技能自身维护，勿手改
+├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
+├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
+└── vllm-ascend/           # git worktree 根，一个分支一个目录
+    └── main/              # submodule「vllm-ascend」→ 私仓，主 worktree，跟踪 origin/main
+```
+
+服务器上的对应路径是 `/vllm-workspace/vllm` 与 `/vllm-workspace/vllm-ascend`（见 `vllm-ascend/main/Dockerfile`），脚本里的路径按服务器布局写。
+
+**主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
+
+submodule 指针只有在需要固定「这套脚本对应哪个版本的 vllm / vllm-ascend」时才更新，日常在子仓里提交不必顺手 bump：
+
+```bash
+git submodule status                      # 看两个子仓当前指向的 commit
+git add vllm-ascend/main && git commit    # 需要时才推进指针
+git submodule update --init --recursive   # 新机器克隆后拉起子仓
+```
+
+## Worktree 工作流
+
+每个任务一个分支一个目录，并行开发互不干扰。主 worktree 在 `vllm-ascend/main`，从那里派生：
+
+```bash
+cd vllm-ascend/main
+git worktree add ../feat-xxx -b feat/xxx origin/main   # 新分支
+git worktree add ../bugfix-yyy origin/bugfix/yyy       # 检出已有远程分支
+git worktree list
+git worktree remove ../feat-xxx                        # 收尾清理
+```
+
+目录名用分支名去掉斜杠（`feat/mxfp8-quant-group-tp` → `feat-mxfp8-quant-group-tp`）。
+
+同步上游：`git fetch upstream && git merge upstream/main`（在 `main` 里做，再 rebase/merge 到特性分支）。
+
+## 常用命令（全部在某个 vllm-ascend worktree 目录内执行）
+
+```bash
+# Lint / 格式化：提交前必跑，覆盖所有文件类型（含 markdown）
+bash format.sh          # 等价 pre-commit run --all-files
+bash format.sh ci       # CI 口径，含 manual stage 的钩子
+pre-commit run ruff-check --all-files    # 只跑单个钩子
+
+# 单元测试
+pytest -sv tests/ut/ops/test_prepare_finalize.py
+pytest -sv tests/ut/ops/test_prepare_finalize.py::test_prepare_inputs
+
+# e2e（需要 NPU 硬件，只能在服务器上跑）
+pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
+```
+
+`tests/ut` 里大量用例 import `torch_npu`，本机跑不了；本机改动请靠 lint + 静态阅读把关，真实验证交给服务器。
+
+## 提交规范
+
+**每次提交都用 `/gitmoji-commit` 技能**（已复制到 `.agents/skills/gitmoji-commit/`）：中文 subject、`<emoji-code> <type>(<scope>): <subject>` 格式、执行前先展示命令请用户确认、只 commit 不 push。主仓和子仓的提交都走它。
+
+vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，**提交必须带 sign-off**——把 `-s` 加进 gitmoji 技能生成的命令里：
+
+```bash
+git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
+```
+
+分支命名沿用现有习惯：`feat/*`、`fix/*`、`bugfix/*`。
+
+## vllm-ascend 架构要点
+
+**它是 vLLM 的硬件插件，不是 fork。** 通过 `setup.py` 的 entry_points 注册：
+
+- `vllm.platform_plugins`: `ascend = vllm_ascend:register`
+- `vllm.general_plugins`: KV connector / model loader / service profiling / model 注册
+
+**Patch 分两个阶段生效**，选错阶段会导致 patch 不生效或在错误进程里打：
+
+| 阶段 | 目录 | 触发点 |
+| --- | --- | --- |
+| platform | `vllm_ascend/patch/platform/` | worker 启动前，`NPUPlatform.pre_register_and_update()` → `adapt_patch(is_global_patch=True)` |
+| worker | `vllm_ascend/patch/worker/` | 每个 worker 的 `__init__`，`adapt_patch(is_global_patch=False)` |
+
+新增 patch **必须**在 `vllm_ascend/patch/__init__.py` 追加说明块，四段齐全：Why / How / Related PR（没有就解释为什么没有）/ Future Plan。这是 review 硬要求。
+
+**改动优先级**：patch < 继承 < 直接改 model_runner。能用 patch 就别动 model_runner——`vllm_ascend/worker/model_runner_v1.py`（v1）、`vllm_ascend/worker/v2/model_runner.py`（v2）、`vllm_ascend/_310p/model_runner_310p.py`（310P）的改动都需要架构级 review。
+
+**设备差异走 `vllm_ascend/device/device_op.py`**：`BaseDeviceAdaptor` + 各代芯片子类（A2/A3/A5/310P，见 `AscendDeviceType`）。某代芯片缺算子时在这里做 Triton / 原生回退，而不是在调用处写 if-else。
+
+**环境变量集中在 `vllm_ascend/envs.py`** 的 `env_variables` 字典里，命名 `VLLM_ASCEND_*`，用 `from vllm_ascend import envs` 引用，禁止散落硬编码字符串。新增变量需要 review。
+
+**NPU 性能红线**：设备张量上的 `tensor.item()` 会触发 NPU→CPU 同步，热路径里会卡住 `AsyncScheduler`。优先保持数据在设备侧（`torch.max` / `torch.argmax` 等），必须同步时合并成一次批量同步并写注释说明原因。
+
+完整规范见 `vllm-ascend/main/AGENTS.md`（代码风格、测试要求、review checklist），仓内还有 `.agents/skills/vllm-ascend-model-adapter/`（模型适配 playbook 与踩坑记录，`references/troubleshooting.md` 值得先翻）。
+
+## 当前工作主线
+
+从私仓分支看，在跟的问题域：
+
+- **GDN / linear attention**：`vllm_ascend/ops/gdn.py`、`ops/gdn_attn_builder.py`、`ops/triton/fla/`（A5 算子未注册时回退 Triton、cumsum 分块导致乱码等）
+- **MTP / 投机解码**：`vllm_ascend/spec_decode/`（草稿下发前置消空泡）
+- **MXFP8 量化**：`vllm_ascend/quantization/`、`ops/group_aligned_linear.py`（ViT MLP 的 group 对齐 TP 分片）
+- **attention / flashcomm1**：`vllm_ascend/attention/attention_v1.py`（seq_lens/block_table padding 修 FIA 561002）
+
+改这些区域前，先 `git log --oneline origin/main..origin/<相关分支>` 看是否已有在途实现。

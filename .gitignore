@@ -1,0 +1,21 @@
+# vllm-ascend 只把 main 这个主 worktree 作为 submodule 跟踪；
+# 其余按分支派生的 worktree 目录（feat-xxx / bugfix-yyy ...）留在本地，不进主仓。
+/vllm-ascend/*
+!/vllm-ascend/main
+
+# Agent 本地配置（含机器相关路径与权限，不共享）
+.claude/settings.local.json
+AGENTS.local.md
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
