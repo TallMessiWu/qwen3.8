@@ -6,7 +6,7 @@
 
 它本身不含推理代码，是一个**给 AI coding agent 用的工作区壳子**——把「让 agent 高效开发 vllm-ascend 上的 Qwen3.8」需要的东西聚到一处：
 
-- **上下文完整**：`vllm/`（上游只读参考）和 `vllm-ascend/`（实际开发的私仓）以 submodule 挂在同一棵树下，agent 一次 clone 就能同时读到「被 patch 的上游函数长什么样」和「patch 怎么写的」，不用在两个互不可见的仓库之间猜。
+- **上下文完整**：`vllm/`（上游只读参考）和 `vllm-ascend/`（实际开发的个人 fork）以 submodule 挂在同一棵树下，agent 一次 clone 就能同时读到「被 patch 的上游函数长什么样」和「patch 怎么写的」，不用在两个互不可见的仓库之间猜。
 - **规则前置**：`AGENTS.md` 写清硬性约束（`vllm/` 只读、本机无 NPU、patch 分阶段、性能红线等），Claude Code 与 Codex CLI 通过符号链接读同一份，不会各说各话。
 - **技能复用**：`.agents/skills/` 收着提交规范（`gitmoji-commit`）、调试（`diagnosing-bugs`）、review、TDD、研究等技能，两家 agent 共用。
 - **验证闭环**：本机没有 NPU，跑不了推理。需要真机验证时把可复现脚本写进 `scripts/`，推到主仓，由人在服务器上执行并回传输出。`scripts/` 就是这条回路的交接点。
@@ -26,7 +26,7 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 ├── vllm/                  # submodule → 上游 vLLM（只读参考）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
-    └── main/              # submodule → 私仓，主 worktree，跟踪 origin/main
+    └── main/              # submodule → 个人 fork，主 worktree，跟踪 origin/main
 ```
 
 要改规则或加技能，一律动 `AGENTS.md` / `.agents/skills/`，别去改那两个符号链接。
@@ -67,7 +67,7 @@ git submodule update --init vllm-ascend/main      # 开发主仓，完整历史
 
 ### 克隆后必做的两件事
 
-**1. 给 vllm-ascend 补上 `upstream` remote。** `.gitmodules` 只记 `origin`（私仓），upstream 需要手动加：
+**1. 给 vllm-ascend 补上 `upstream` remote。** `.gitmodules` 只记 `origin`（个人 fork），upstream 需要手动加：
 
 ```bash
 cd vllm-ascend/main
@@ -75,7 +75,7 @@ git remote add upstream https://github.com/vllm-project/vllm-ascend.git
 git fetch upstream
 ```
 
-> ⚠️ **upstream 只 fetch，永远不 push。** 推送一律走 `origin`（私仓）。
+> ⚠️ **upstream 只 fetch，永远不 push。** 推送一律走 `origin`（自己的 fork）。
 
 **2. 把 vllm-ascend 从游离头指针切回 main 分支。** submodule 默认检出到 detached HEAD，这样没法提交：
 
@@ -173,7 +173,7 @@ pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
 1. **`vllm/` 是只读参考。** 需要改上游行为时，在 `vllm-ascend` 里写 patch。
 2. **本机没有 NPU，跑不了推理。** 有一块 5080 GPU，可以跑纯 PyTorch 小脚本做数值等价性验证（不能 `import torch_npu`）。
 3. **验证闭环靠脚本。** 可复现脚本写进 `scripts/`，自带打印/断言，输出能直接贴回来判读，不依赖交互式输入。
-4. **只能推私仓。** `upstream` 只 fetch，永远不 push。
+4. **推送只走自己的 fork。** `origin` 是本人的 fork，可自由推送；`upstream` 是上游官方仓，只 fetch，永远不 push。
 5. **不要主动 push。** 提交后停下，由人决定推送时机。
 6. **提交走 `/gitmoji-commit` 技能。** 中文 subject，`<emoji-code> <type>(<scope>): <subject>` 格式。vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，提交必须带 `-s`：
 
@@ -181,4 +181,6 @@ pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
    git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
    ```
 
-完整规则（patch 分阶段机制、改动优先级、设备差异抽象、环境变量约定、NPU 性能红线、当前工作主线）见 [`AGENTS.md`](AGENTS.md)；vllm-ascend 仓内规范见 `vllm-ascend/main/AGENTS.md`。
+完整规则（patch 分阶段机制、改动优先级、设备差异抽象、环境变量约定、NPU 性能红线）见 [`AGENTS.md`](AGENTS.md)；vllm-ascend 仓内规范见 `vllm-ascend/main/AGENTS.md`。
+
+> 仓库刚建起来，适配工作尚未开始——`origin` 上只有 `main`，没有在途特性分支，`scripts/` 也还是空的。

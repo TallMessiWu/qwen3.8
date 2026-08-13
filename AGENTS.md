@@ -13,7 +13,7 @@ This file provides guidance to coding agents (Claude Code, Codex CLI, …) when 
 1. **`vllm/` 是只读参考。** 上游 vLLM 的克隆，用来查源码、确认被 patch 的函数签名与调用点。不要修改、不要提交、不要推送。需要改上游行为时，在 `vllm-ascend` 里写 patch。
 2. **本机没有 NPU，跑不了推理。** 本机只能写代码、读代码、做静态分析。有一块 5080 GPU，可以跑纯 PyTorch 的小脚本做数值等价性 / 算法逻辑的模拟验证（不能 import `torch_npu`）。
 3. **验证闭环靠脚本。** 需要在真机验证时，把可复现的脚本写进 `scripts/`，推送到主仓，由用户在服务器上拉取执行并把结果回传。脚本要自带打印/断言，输出要能直接贴回来判读，不要依赖交互式输入。
-4. **只能推私仓。** `vllm-ascend` 的 `origin` 是私仓，`upstream` 是主仓上游——upstream 只 fetch，永远不 push。
+4. **推送只走自己的 fork。** `vllm-ascend` 的 `origin` 是本人的 fork（`TallMessiWu/vllm-ascend`，可自由推送），`upstream` 是上游官方仓（`vllm-project/vllm-ascend`）——upstream 只 fetch，永远不 push。注意这个 fork 是 public 的（fork 公开仓无法转为 private），推上去的内容对外可见。
 5. **不要主动 push。** 提交后停下，由用户决定推送时机。
 
 ## 目录结构
@@ -26,7 +26,7 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 ├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
-    └── main/              # submodule「vllm-ascend」→ 私仓，主 worktree，跟踪 origin/main
+    └── main/              # submodule「vllm-ascend」→ 个人 fork，主 worktree，跟踪 origin/main
 ```
 
 服务器上的对应路径是 `/vllm-workspace/vllm` 与 `/vllm-workspace/vllm-ascend`（见 `vllm-ascend/main/Dockerfile`），脚本里的路径按服务器布局写。
@@ -111,15 +111,10 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 **NPU 性能红线**：设备张量上的 `tensor.item()` 会触发 NPU→CPU 同步，热路径里会卡住 `AsyncScheduler`。优先保持数据在设备侧（`torch.max` / `torch.argmax` 等），必须同步时合并成一次批量同步并写注释说明原因。
 
-完整规范见 `vllm-ascend/main/AGENTS.md`（代码风格、测试要求、review checklist），仓内还有 `.agents/skills/vllm-ascend-model-adapter/`（模型适配 playbook 与踩坑记录，`references/troubleshooting.md` 值得先翻）。
+完整规范见 `vllm-ascend/main/AGENTS.md`（代码风格、测试要求、review checklist）。
 
-## 当前工作主线
+## 当前状态
 
-从私仓分支看，在跟的问题域：
+**仓库刚建起来，适配工作尚未开始。** `origin` 上只有 `main`（与 `upstream/main` 同步），没有在途特性分支，`scripts/` 也还是空的。
 
-- **GDN / linear attention**：`vllm_ascend/ops/gdn.py`、`ops/gdn_attn_builder.py`、`ops/triton/fla/`（A5 算子未注册时回退 Triton、cumsum 分块导致乱码等）
-- **MTP / 投机解码**：`vllm_ascend/spec_decode/`（草稿下发前置消空泡）
-- **MXFP8 量化**：`vllm_ascend/quantization/`、`ops/group_aligned_linear.py`（ViT MLP 的 group 对齐 TP 分片）
-- **attention / flashcomm1**：`vllm_ascend/attention/attention_v1.py`（seq_lens/block_table padding 修 FIA 561002）
-
-改这些区域前，先 `git log --oneline origin/main..origin/<相关分支>` 看是否已有在途实现。
+所以别去猜「已有实现」——开新任务时直接按上面的 Worktree 工作流从 `main` 派生分支即可。等分支多起来后，动某个区域前先 `git branch -r` 看看有没有相关的在途分支。
