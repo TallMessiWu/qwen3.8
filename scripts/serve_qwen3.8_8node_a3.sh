@@ -1,7 +1,17 @@
 #!/bin/bash
 # Qwen3.8-2.4T-A95B / 8 × Atlas 800 A3 (64GB × 16) / BF16 在线服务启动脚本
 #
+# 模型架构（取自官方 config.json，architectures = Qwen3_5MoeForCausalLM）：
+#   92 层混合骨干 = 23 × [3 × linear_attention(Gated DeltaNet) + 1 × full_attention(GQA)]
+#   hidden 8192 / vocab 248320 / max_position_embeddings 262144
+#   GQA:  64 Q heads, 4 KV heads, head_dim 256, partial_rotary_factor 0.25
+#   GDN:  linear_num_key_heads 16, linear_num_value_heads 128, head_dim 128, conv_kernel 4
+#   MoE:  512 experts, top-10 + 1 shared, moe_intermediate_size 2048
+#   MTP:  mtp_num_hidden_layers 1（投机解码可用，见下方 ENABLE_MTP）
+#
 # 并行策略：TP16 (机内) × DP8 (跨机) + EP128，attention 走 TP16+DP8，MoE 走全局 EP128。
+# TP16 整除性已核对：64/16=4, 128/16=8, 16/16=1, 512/128=4 全部整除；
+# 4 个 KV heads 少于 TP16，vLLM 会把 KV head 复制成 16 份（16%4=0 合法），KV cache 有 4× 冗余。
 #
 # 用法：8 台机器上跑同一个脚本，只改 NODE_RANK。node0 是 master，对外提供 API。
 #
@@ -23,14 +33,28 @@ SERVED_NAME="${SERVED_NAME:-qwen3.8}"
 API_PORT="${API_PORT:-8000}"
 DP_RPC_PORT="${DP_RPC_PORT:-13389}"
 
-# 显存预算（单 die 64GB，共 128 die = 8TB）：
-#   BF16 权重 2.4T 参数 ≈ 4.8TB，摊到 128 die ≈ 37.5GB/die
-#   64GB × 0.9 = 57.6GB 可用 → 扣掉权重后剩 ≈ 20GB/die 给 KV cache + 激活 + 通信 buffer
-#   起服务失败(OOM)就先降 MAX_MODEL_LEN 或 MAX_NUM_SEQS，再考虑降 GPU_MEM_UTIL
+# 显存预算（单 die 64GB，共 128 die = 8TB），按 config.json 实算：
+#   MoE 权重  2.37T 参数走 EP128，每 die 18.5B × 2B ≈ 37.1GB
+#   非 MoE    48.4B 参数（embed/lm_head/GQA/GDN/shared expert）在每个 DP rank 内按 TP16 切，
+#             每 die ≈ 6.1GB —— 注意 DP8 会让这部分在 8 个 rank 上各存一份
+#   合计权重 ≈ 43.2GB/die；64GB × 0.9 = 57.6GB → 只剩 ≈ 14.4GB/die 给 KV cache + GDN state + 激活
+#
+#   两类缓存的吃法完全不同，调参时分清楚：
+#   - KV cache 只有 23 层 full attention 有，每 die 1 个（复制后的）KV head
+#     ≈ 23KB/token，随「上下文长度 × 并发」增长
+#   - GDN state 是 69 层的常数状态，≈ 37MB/序列/die，**只随 MAX_NUM_SEQS 增长，与序列长度无关**，
+#     且按 max_num_seqs 预分配。所以调大并发比调长上下文更容易 OOM
+#   起服务 OOM 就先降 MAX_NUM_SEQS，再降 MAX_MODEL_LEN，最后才动 GPU_MEM_UTIL
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+
+# MTP 投机解码（config.json 里 mtp_num_hidden_layers=1，vLLM 侧 Qwen3_5MoeMTP 已注册）。
+# 默认关：BF16 权重已占掉 3/4 显存，投机会同时增加 MTP 层权重和 GDN state 的 num_spec 维度。
+# 先把基础服务跑通、确认余量后再置 1 打开。
+ENABLE_MTP="${ENABLE_MTP:-0}"
+NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
 # =================================================================
 
 for v in NODE_RANK LOCAL_IP NIC_NAME MASTER_IP; do
@@ -70,7 +94,14 @@ if ! ip addr show "$NIC_NAME" 2>/dev/null | grep -q "$LOCAL_IP"; then
     exit 1
 fi
 
-echo "[INFO] 权重架构：$(grep -o '"architectures"[^]]*]' "$MODEL_PATH/config.json" | head -1)"
+# 架构必须是 Qwen3_5MoeForCausalLM：vLLM registry 和 vllm-ascend 的 patch_qwen3_5 都按这个名字挂钩
+if ! grep -q "Qwen3_5MoeForCausalLM" "$MODEL_PATH/config.json"; then
+    echo "[WARN] config.json 里没有 Qwen3_5MoeForCausalLM，实际为：" >&2
+    grep -o '"architectures"[^]]*]' "$MODEL_PATH/config.json" | head -1 >&2
+    echo "[WARN] 当前 vLLM 可能不支持该架构，启动会在模型加载阶段失败。" >&2
+else
+    echo "[INFO] 架构校验通过：Qwen3_5MoeForCausalLM"
+fi
 
 # ---- 通信配置（A3 口径）----
 export HCCL_IF_IP="$LOCAL_IP"
@@ -108,6 +139,12 @@ if [ "$NODE_RANK" -ne 0 ]; then
     extra_args+=(--headless)
 else
     extra_args+=(--api-server-count 4)
+fi
+
+if [ "$ENABLE_MTP" = "1" ]; then
+    echo "[INFO] 启用 MTP 投机解码，num_speculative_tokens=$NUM_SPEC_TOKENS"
+    extra_args+=(--speculative-config \
+        "{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": $NUM_SPEC_TOKENS, \"enforce_eager\": true}")
 fi
 
 echo "[INFO] 启动 node$NODE_RANK：TP16 × DP8 (start-rank=$NODE_RANK)，master=$MASTER_IP:$DP_RPC_PORT"
