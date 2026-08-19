@@ -27,7 +27,8 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 ├── vllm/                  # submodule → 上游 vLLM（只读参考）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
-    └── main/              # submodule → 个人 fork，主 worktree，跟踪 origin/main
+    ├── main/              # submodule → 个人 fork，主 worktree，跟踪 origin/main
+    └── upstream-main/     # 本地 worktree，跟踪 upstream/main，不进主仓
 ```
 
 要改规则或加技能，一律动 `AGENTS.md` / `.agents/skills/`，别去改那两个符号链接。
@@ -37,6 +38,92 @@ qwen3.8/                   # 主仓（git，分支 main）
 服务器部署入口、ModelSlim 快速诊断和 A5 镜像构建方法见 [`scripts/README-qwen3.8-deployment.md`](scripts/README-qwen3.8-deployment.md)。
 
 ## 克隆
+
+### Linux 服务器一键初始化（推荐）
+
+下面这段命令可直接整段复制执行，也可在后续重复执行。它会：
+
+- 克隆或更新本仓；
+- 递归初始化根仓的 `vllm` 和 `vllm-ascend/main` submodule；
+- 让 `vllm-ascend/main` 跟踪个人 fork 的 `origin/main`；
+- 配置只读的官方 `upstream` remote；
+- 创建跟踪 `upstream/main` 的 `upstream-main` worktree；
+- 递归初始化两个 vLLM-Ascend worktree 自身的 submodule。
+
+```bash
+set -euo pipefail
+
+QWEN38_ROOT=/home/hajimi/qwen3.8
+VLLM_ASCEND_ROOT="${QWEN38_ROOT}/vllm-ascend"
+VLLM_ASCEND_MAIN="${VLLM_ASCEND_ROOT}/main"
+VLLM_ASCEND_UPSTREAM_MAIN="${VLLM_ASCEND_ROOT}/upstream-main"
+VLLM_ASCEND_UPSTREAM_URL=https://github.com/vllm-project/vllm-ascend.git
+
+mkdir -p /home/hajimi
+
+if git -C "${QWEN38_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "${QWEN38_ROOT}" switch main
+else
+  git clone https://github.com/TallMessiWu/qwen3.8.git "${QWEN38_ROOT}"
+fi
+
+git -C "${QWEN38_ROOT}" config submodule.recurse true
+git -C "${QWEN38_ROOT}" config fetch.recurseSubmodules on-demand
+git -C "${QWEN38_ROOT}" pull --ff-only --recurse-submodules
+git -C "${QWEN38_ROOT}" submodule sync --recursive
+git -C "${QWEN38_ROOT}" submodule update --init --recursive
+
+git -C "${VLLM_ASCEND_MAIN}" fetch origin
+if git -C "${VLLM_ASCEND_MAIN}" show-ref --verify --quiet refs/heads/main; then
+  git -C "${VLLM_ASCEND_MAIN}" switch main
+else
+  git -C "${VLLM_ASCEND_MAIN}" switch -c main --track origin/main
+fi
+git -C "${VLLM_ASCEND_MAIN}" branch --set-upstream-to=origin/main main
+git -C "${VLLM_ASCEND_MAIN}" config submodule.recurse true
+git -C "${VLLM_ASCEND_MAIN}" config fetch.recurseSubmodules on-demand
+git -C "${VLLM_ASCEND_MAIN}" pull --ff-only --recurse-submodules
+
+if git -C "${VLLM_ASCEND_MAIN}" remote get-url upstream >/dev/null 2>&1; then
+  git -C "${VLLM_ASCEND_MAIN}" remote set-url upstream "${VLLM_ASCEND_UPSTREAM_URL}"
+else
+  git -C "${VLLM_ASCEND_MAIN}" remote add upstream "${VLLM_ASCEND_UPSTREAM_URL}"
+fi
+git -C "${VLLM_ASCEND_MAIN}" fetch upstream --prune --recurse-submodules=on-demand
+
+if git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" switch upstream-main
+elif git -C "${VLLM_ASCEND_MAIN}" show-ref --verify --quiet refs/heads/upstream-main; then
+  git -C "${VLLM_ASCEND_MAIN}" worktree add "${VLLM_ASCEND_UPSTREAM_MAIN}" upstream-main
+else
+  git -C "${VLLM_ASCEND_MAIN}" worktree add \
+    -b upstream-main "${VLLM_ASCEND_UPSTREAM_MAIN}" upstream/main
+fi
+
+git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" branch \
+  --set-upstream-to=upstream/main upstream-main
+git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" pull --ff-only --recurse-submodules
+
+for worktree in "${VLLM_ASCEND_MAIN}" "${VLLM_ASCEND_UPSTREAM_MAIN}"; do
+  git -C "${worktree}" submodule sync --recursive
+  git -C "${worktree}" submodule update --init --recursive
+done
+
+git -C "${QWEN38_ROOT}" submodule status --recursive
+git -C "${VLLM_ASCEND_MAIN}" worktree list
+git -C "${VLLM_ASCEND_MAIN}" status -sb
+git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" status -sb
+git -C "${VLLM_ASCEND_MAIN}" submodule status --recursive
+git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" submodule status --recursive
+```
+
+最后两个 vLLM-Ascend 分支状态应分别显示
+`main...origin/main` 和 `upstream-main...upstream/main`。`upstream` 只用于
+fetch/pull，永远不要向它 push。
+
+`git submodule update --init --recursive` 会检出主仓或 vLLM-Ascend
+当前 commit 固定的子模块版本。不要改成 `git submodule update --remote`，
+否则会跳到子模块远程分支的最新 commit，可能破坏版本兼容性。
 
 ### 一步到位
 
