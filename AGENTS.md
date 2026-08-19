@@ -26,12 +26,13 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 ├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
-    └── main/              # submodule「vllm-ascend」→ 个人 fork，主 worktree，跟踪 origin/main
+    ├── main/              # submodule「vllm-ascend」→ 个人 fork，跟踪 origin/main
+    └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应路径是 `/vllm-workspace/vllm` 与 `/vllm-workspace/vllm-ascend`（见 `vllm-ascend/main/Dockerfile`），脚本里的路径按服务器布局写。
+服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout。
 
-**主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
+**主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main`）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
 submodule 指针只有在需要固定「这套脚本对应哪个版本的 vllm / vllm-ascend」时才更新，日常在子仓里提交不必顺手 bump：
 
@@ -43,11 +44,18 @@ git submodule update --init --recursive   # 新机器克隆后拉起子仓
 
 ## Worktree 工作流
 
-每个任务一个分支一个目录，并行开发互不干扰。主 worktree 在 `vllm-ascend/main`，从那里派生：
+两个常驻 worktree 分开维护 fork 与官方主线；先各自快进到对应远端：
 
 ```bash
-cd vllm-ascend/main
-git worktree add ../feat-xxx -b feat/xxx origin/main   # 新分支
+git -C vllm-ascend/main pull --ff-only                 # origin/main
+git -C vllm-ascend/upstream-main pull --ff-only        # upstream/main
+```
+
+每个任务仍使用独立分支和目录。面向上游的新改动通常从 `upstream-main` 派生：
+
+```bash
+cd vllm-ascend/upstream-main
+git worktree add ../feat-xxx -b feat/xxx upstream/main # 新分支
 git worktree add ../bugfix-yyy origin/bugfix/yyy       # 检出已有远程分支
 git worktree list
 git worktree remove ../feat-xxx                        # 收尾清理
@@ -55,7 +63,7 @@ git worktree remove ../feat-xxx                        # 收尾清理
 
 目录名用分支名去掉斜杠（`feat/mxfp8-quant-group-tp` → `feat-mxfp8-quant-group-tp`）。
 
-同步上游：`git fetch upstream && git merge upstream/main`（在 `main` 里做，再 rebase/merge 到特性分支）。
+同步上游：在 `upstream-main` 执行 `git fetch upstream && git pull --ff-only`。不要顺手把官方主线合入 `main`；`main` 保持跟踪个人 fork 的 `origin/main`，需要同步 fork 时再明确执行合并与推送。
 
 ## 常用命令（全部在某个 vllm-ascend worktree 目录内执行）
 
@@ -115,6 +123,6 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-**vLLM-Ascend 适配代码尚未开始。** `origin` 上只有 `main`（与 `upstream/main` 同步），没有在途特性分支。`scripts/` 已包含 Qwen3.8 服务启动、ModelSlim 诊断和服务器验证资产；不要把这些脚本误判成插件侧适配实现。
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。功能分支按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、ModelSlim 诊断和服务器验证资产，不要把这些脚本误判成插件侧适配实现。
 
-所以别去猜「已有实现」——开新任务时直接按上面的 Worktree 工作流从 `main` 派生分支即可。等分支多起来后，动某个区域前先 `git branch -r` 看看有没有相关的在途分支。
+所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。

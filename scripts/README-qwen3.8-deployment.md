@@ -51,12 +51,13 @@ DOCKER_BUILDKIT=1 docker build \
 ```
 
 If the build host already has direct network access, omit `--secret`. The
-Dockerfile pins vLLM to `0.27.1` and vLLM-Ascend to
-`efc2dd9e997fa99483f09f09a5cbc2d101b89c71`. Override the latter only when all
-four nodes will use the same tested commit:
+Dockerfile pins vLLM to `0.27.1` but does not clone vLLM-Ascend. Before creating
+the container, make sure every node has the intended checkout at the mounted
+runtime path and that all four nodes report the same commit:
 
 ```bash
-docker build --build-arg VLLM_ASCEND_REF=<commit> ...
+git -C /home/hajimi/qwen3.8/vllm-ascend/main pull --ff-only
+git -C /home/hajimi/qwen3.8/vllm-ascend/main rev-parse HEAD
 ```
 
 Dockerfile cannot declare host runtime mounts or namespace options. The
@@ -68,11 +69,14 @@ bash scripts/create-container.sh
 ```
 
 Override `IMAGE` or `CONTAINER_NAME` when needed. The script refuses to replace
-an existing container with the same name.
+an existing container with the same name. After `/home` is mounted, it removes
+only `csrc/output` and `csrc/build_out`, then installs the editable checkout
+from `/home/hajimi/qwen3.8/vllm-ascend/main`. If installation fails, the new
+container is left running so its build environment can be inspected.
 
 At runtime, keep the original `/home:/home` mount. Root's interactive
 `.bashrc` conditionally sources `/home/hajimi/proxy.sh` and changes into
-`/home/hajimi/qwen3.8`, which is the robust equivalent of appending the
+`/home/hajimi/qwen3.8/scripts`, which is the robust equivalent of appending the
 unconditional command by hand.
 
 The host-side custom-op security settings still must be applied outside the

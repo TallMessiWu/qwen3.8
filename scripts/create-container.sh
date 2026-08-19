@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Create the privileged A5 serving container from the image built by the root
-# Dockerfile. Run this script on the host, not inside a container.
+# Dockerfile, then install the host-mounted vLLM-Ascend checkout. Run this
+# script on the host, not inside a container.
 
 set -euo pipefail
 
@@ -20,7 +21,7 @@ if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     exit 2
 fi
 
-exec docker run --name "$CONTAINER_NAME" \
+docker run --name "$CONTAINER_NAME" \
     --runtime=runc \
     --user root \
     --interactive \
@@ -56,3 +57,10 @@ exec docker run --name "$CONTAINER_NAME" \
     --volume=/etc/hixlep:/etc/hixlep \
     --volume=/usr/lib64:/usr/lib64 \
     "$IMAGE" bash
+
+if ! docker exec --user root "$CONTAINER_NAME" /usr/local/bin/install-vllm-ascend; then
+    echo "ERROR: vLLM-Ascend installation failed; container '$CONTAINER_NAME' was left running for inspection." >&2
+    exit 1
+fi
+
+echo "Container '$CONTAINER_NAME' is running with the mounted vLLM-Ascend checkout installed."
