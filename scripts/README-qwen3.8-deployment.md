@@ -59,10 +59,12 @@ four nodes will use the same tested commit:
 docker build --build-arg VLLM_ASCEND_REF=<commit> ...
 ```
 
-Create the container with the original device and volume layout by running:
+Dockerfile cannot declare host runtime mounts or namespace options. The
+companion launcher contains the original device/volume layout together with
+`--net=host`, `--pid=host`, and `--privileged=true`. Create the container with:
 
 ```bash
-bash scripts/run_qwen38_a5_container.sh
+bash scripts/create-container.sh
 ```
 
 Override `IMAGE` or `CONTAINER_NAME` when needed. The script refuses to replace

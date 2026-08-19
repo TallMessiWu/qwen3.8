@@ -27,6 +27,7 @@ exec docker run --name "$CONTAINER_NAME" \
     --tty \
     --detach \
     --net=host \
+    --pid=host \
     --privileged=true \
     --shm-size=2g \
     --device=/dev/davinci_manager \
