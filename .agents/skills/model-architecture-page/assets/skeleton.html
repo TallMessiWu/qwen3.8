@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="可切换、可下钻的模型架构图：观察请求、token、tensor 在模块内部的连续变化。">
+  <title>模型架构交互图</title>
+  <style>
+
+    :root{
+      --bg:#e9efed;--paper:#f8faf9;--white:#fff;--ink:#10201c;--muted:#60706b;--faint:#879590;
+      --line:#c5d1cd;--line2:#9fafaa;--blue:#075ff7;--blue2:#dce9ff;--cyan:#008991;--cyan2:#d9eff0;
+      --purple:#6749d8;--purple2:#eae5fb;--orange:#e55f24;--orange2:#fbe4d9;--gold:#ae7400;--gold2:#f6eac8;
+      --green:#27764e;--green2:#dcece3;--red:#bf3f4c;--mono:"Cascadia Code",Consolas,monospace;
+      --display:"Bahnschrift SemiCondensed","Arial Narrow","Microsoft YaHei UI",sans-serif;
+      --body:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI",sans-serif;
+      --header:64px;--inspector:352px;
+    }
+    /* 用 clip 而非 hidden：hidden 会把 body 变成滚动容器，破坏所有 position:sticky */
+    *{box-sizing:border-box}html{max-width:100%}body{margin:0;max-width:100%;overflow-x:clip;background:var(--bg);color:var(--ink);font-family:var(--body);line-height:1.5}
+    button,input{font:inherit}button{color:inherit}a{color:var(--blue);text-underline-offset:3px}code,.mono{font-family:var(--mono)}:focus-visible{outline:3px solid #f1a400;outline-offset:2px}
+    .sr{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+
+    .topbar{height:var(--header);display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:18px;padding:0 16px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40;backdrop-filter:blur(12px)}
+    .brand{display:flex;align-items:center;gap:8px;white-space:nowrap}.brand b{font:800 21px/1 var(--display);letter-spacing:-.03em;white-space:nowrap}.brand span{font:800 11.5px var(--mono);letter-spacing:.08em;color:var(--cyan);text-transform:uppercase}.model-select{height:34px;max-width:216px;border:1px solid var(--line2);border-radius:4px;background:#fff;padding:0 24px 0 8px;color:var(--ink);font:800 11.5px var(--mono);cursor:pointer}.model-status{padding:3px 5px!important;border:1px solid #8ebba1;background:var(--green2);color:var(--green)!important;font-size:9.5px!important;letter-spacing:.06em!important}    .crumbs{min-width:0;flex-shrink:1;display:flex;align-items:center;gap:6px;overflow:hidden;font:700 12px var(--mono);color:var(--faint)}.crumbs button{border:0;background:none;padding:4px;color:var(--blue);cursor:pointer;font:inherit;white-space:nowrap}.crumbs button:disabled{color:var(--faint);cursor:default}.crumbs i{font-style:normal}.crumbs b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+    .top-actions{display:flex;gap:5px;align-items:center;min-width:0;overflow-x:auto;scrollbar-width:none}.ui-btn{border:1px solid var(--line2);border-radius:4px;background:#fff;padding:7px 10px;cursor:pointer;font:750 11.5px var(--mono);white-space:nowrap}.ui-btn:hover{border-color:var(--blue);color:var(--blue)}.ui-btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}.ui-btn[hidden]{display:none}.ui-btn:disabled{opacity:.36;cursor:not-allowed;border-color:var(--line2);color:var(--muted)}.nav-sep{width:1px;height:24px;background:var(--line);margin:0 2px}.nav-sep[hidden]{display:none}
+
+    .app{height:calc(100dvh - var(--header));min-height:660px;display:grid;grid-template-columns:minmax(0,1fr) var(--inspector)}
+    .canvas{position:relative;min-width:0;min-height:0;overflow:auto;background-color:#f4f7f6;background-image:radial-gradient(#c8d3cf 1px,transparent 1px);background-size:18px 18px;scrollbar-width:thin}
+    .canvas-inner{min-height:100%;padding:24px;display:flex;flex-direction:column}.view-head{display:flex;align-items:end;gap:24px;justify-content:space-between;margin-bottom:17px;max-width:1260px;width:100%;margin-left:auto;margin-right:auto}
+    .view-kicker{font:800 12.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--blue)}.view-head h1{margin:4px 0 0;font:790 clamp(30px,3.4vw,46px)/1 var(--display);letter-spacing:-.035em}.view-head p{margin:7px 0 0;max-width:710px;color:var(--muted);font-size:14.5px}
+    .view-note{max-width:250px;text-align:right;color:var(--faint);font:700 12.5px/1.6 var(--mono)}.view-note b{display:block;color:var(--orange)}
+    .view-root{position:relative;flex:1;min-height:500px;display:flex;align-items:center;justify-content:center}.view-root.is-changing{animation:viewIn .22s ease-out}@keyframes viewIn{from{opacity:.2;transform:scale(.985)}to{opacity:1;transform:none}}
+
+    .inspector{min-height:0;overflow:auto;border-left:1px solid var(--line);background:#fbfcfc;scrollbar-width:thin}.ins-head{height:62px;display:flex;justify-content:space-between;align-items:center;padding:0 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(251,252,252,.96);z-index:3}.ins-head b{font:800 13px var(--mono);letter-spacing:.1em;text-transform:uppercase}.ins-head span{font:800 11.5px var(--mono);color:var(--blue)}
+    .ins-section{padding:14px;border-bottom:1px solid var(--line)}.ins-label{margin-bottom:8px;font:800 11.5px var(--mono);letter-spacing:.11em;color:var(--faint);text-transform:uppercase}.ins-title{font:770 21px/1.1 var(--display)}.ins-copy{margin:7px 0 0;color:var(--muted);font-size:13.5px}.io-list{display:grid;gap:7px}.io-row{display:grid;grid-template-columns:1fr auto;gap:8px;font-size:13px}.io-row span{color:var(--muted)}.io-row code{text-align:right;font-size:12.5px;color:var(--ink)}
+    .formula{padding:10px;border:1px solid var(--line);background:#fff;font:12.5px/1.65 var(--mono);color:#16443c;overflow-x:auto}.badges{display:flex;gap:5px;flex-wrap:wrap}.badge{padding:4px 6px;border-radius:3px;font:800 11.5px var(--mono)}.badge.fact{color:#175936;background:var(--green2)}.badge.impl{color:#07555c;background:var(--cyan2)}.badge.demo{color:#7c5100;background:var(--gold2)}.badge.engine{color:#55615d;background:#e4e9e7}.badge.tbd{color:#8d2630;background:#f6dfe2}
+    .ins-links{display:grid;gap:6px}.ins-links a{padding:8px;border:1px solid var(--line);background:#fff;text-decoration:none;font-size:13px}.legend{display:grid;gap:7px}.legend div{display:grid;grid-template-columns:12px 1fr;gap:7px;align-items:start;color:var(--muted);font-size:12.5px}.legend i{width:10px;height:10px;border-radius:2px;background:var(--c)}
+    .warning{padding:9px;border-left:3px solid var(--gold);background:var(--gold2);color:#59420d;font-size:12.5px}
+
+    /* overview */
+    .overview-wrap{width:min(1500px,100%);padding:2px 4px 24px}
+    .trace-console{position:sticky;top:0;z-index:20;padding:2px 0 9px;background:linear-gradient(#f4f7f6 82%,rgba(244,247,246,0))}
+    .overview-trace-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;padding:9px 12px;border:1px solid var(--line);border-bottom:0;background:rgba(255,255,255,.97);backdrop-filter:blur(8px)}
+    .trace-status{display:flex;align-items:center;gap:11px;min-width:0;flex:1 1 320px}.trace-status span{flex:0 0 auto;font:800 11.5px var(--mono);letter-spacing:.11em;color:var(--blue)}.trace-status strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:760 13.5px var(--body)}.trace-shape{flex:0 0 auto;padding:3px 6px;background:var(--blue2);color:var(--blue);font:800 10.5px var(--mono)}.trace-controls{display:flex;flex-wrap:wrap;gap:5px}
+    .overview-map{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(224px,1fr));gap:112px 30px;align-items:start;padding:22px 26px 96px 6px;isolation:isolate}
+    .map-node{position:relative;z-index:1;min-width:0;min-height:212px;display:flex;flex-direction:column;border:1px solid var(--line2);background:rgba(255,255,255,.92);padding:0 0 10px;text-align:left;cursor:pointer;transition:border-color .2s,box-shadow .2s,background .2s,transform .2s;font:inherit;color:inherit}
+    .map-node:hover{border-color:var(--blue);background:#fff;box-shadow:0 7px 18px rgba(16,32,28,.10)}
+    .map-node.trace-active{border-color:var(--blue);border-width:2px;background:#fff;box-shadow:0 0 0 4px rgba(7,95,247,.13),0 10px 24px rgba(16,32,28,.14);transform:translateY(-2px)}
+    .map-node.trace-active .stage-bar{height:6px;opacity:1}
+    .map-node>.stage-bar{display:block;height:4px;background:var(--stage-c,var(--blue));opacity:.85}
+    .map-node::after{content:"→";position:absolute;right:-20px;top:50%;transform:translateY(-50%);color:var(--line2);font:900 17.5px var(--mono);z-index:2}
+    .map-node.trace-active::after{color:var(--blue)}
+    .map-node.at-row-end::after{content:"↵";color:var(--blue)}
+    .map-node.is-last::after{display:none}
+    .module-head{display:block;padding:9px 10px 0}
+    .module-index{display:flex;align-items:center;gap:5px;color:var(--faint);font:800 10px var(--mono);letter-spacing:.09em}
+    .module-index i{font-style:normal;display:grid;place-items:center;width:15px;height:15px;border-radius:50%;background:var(--stage-c,var(--blue));color:#fff;font:800 10.5px var(--mono)}
+    .module-head b{display:block;margin-top:5px;font:760 15px/1.1 var(--display)}
+    /* 纯定位锚点：不可见，位于卡片下方通道中央，载荷停靠于此而不遮挡卡片 */
+    .module-port{position:absolute;left:50%;bottom:-64px;width:0;height:0;opacity:0;pointer-events:none}
+    .module-desc{padding:7px 10px 0;color:var(--muted);font-size:12px;line-height:1.5}
+    .module-foot{margin-top:auto;padding:9px 10px 0}
+    .node-line{display:grid;grid-template-columns:36px minmax(0,1fr);gap:8px;align-items:baseline;padding-top:6px;border-top:1px dashed var(--line)}
+    .node-line+.node-line{border-top:0;padding-top:3px}
+    .node-line b{color:var(--faint);font:800 9.5px var(--mono);letter-spacing:.06em}
+    .node-line code{min-width:0;font:750 10.5px/1.45 var(--mono);color:var(--cyan);word-break:break-word}
+    .node-line.op code{color:var(--orange)}
+    .decoder-node{grid-column:span 2;min-height:300px;border-color:#9db8e8;background:rgba(248,251,255,.96)}
+    .decoder-node .decoder-recipe{margin-top:auto}.decoder-node .module-foot{margin-top:9px}
+    .decoder-node::before{content:"点击色块下钻";position:absolute;top:11px;right:8px;color:var(--faint);font:800 9px var(--mono)}
+    .decoder-recipe{display:flex;flex-wrap:wrap;align-items:stretch;gap:6px;margin:11px 10px 10px}
+    .layer-stack{flex:1 1 112px;display:grid;grid-template-rows:46px 32px;gap:3px;min-width:0}
+    .decoder-recipe .decoder-times{flex:0 0 68px}
+    .mixer-chip,.moe-chip,.ffn-chip{min-width:0;overflow:hidden;border:0;cursor:pointer;display:grid;place-content:center;padding:0 4px;text-align:center;font-family:var(--mono);font-weight:850;line-height:1.25}
+    .mixer-chip{background:var(--cyan2);color:#07575c;font-size:13px;border-left:4px solid var(--cyan)}
+    .mixer-chip.attn{background:var(--purple2);color:#4a35a0;border-left-color:var(--purple)}
+    .moe-chip{background:var(--orange2);color:#99401d;font-size:11px;border-left:4px solid var(--orange)}
+    .ffn-chip{background:var(--green2);color:#175936;font-size:11px;border-left:4px solid var(--green)}
+    .mixer-chip:hover,.moe-chip:hover,.ffn-chip:hover{filter:saturate(1.25);outline:2px solid var(--blue)}.decoder-times{display:grid;place-content:center;border-left:4px solid var(--blue);background:var(--blue2);color:var(--blue);font:900 23px/1 var(--display);text-align:center}.decoder-times small{display:block;margin-top:4px;color:#315b9a;font:800 10px var(--mono)}
+    /* 移动载荷：停在卡片下方的通道里，用尖角指回当前模块，绝不遮挡卡片内容 */
+    .travelling-payload{position:absolute;z-index:6;left:0;top:0;width:304px;padding:8px 10px 9px;border:2px solid var(--blue);background:#fff;box-shadow:0 8px 20px rgba(7,95,247,.18);pointer-events:none;transform:translate3d(0,0,0);transition:transform .88s cubic-bezier(.4,0,.15,1),opacity .22s}
+    .travelling-payload.is-travelling{border-style:dashed;box-shadow:0 6px 14px rgba(7,95,247,.13)}
+    .travelling-payload.is-computing{animation:computePulse .62s ease-in-out infinite alternate}
+    .travelling-payload.is-resetting{opacity:0}
+    .travelling-payload::before{content:"";position:absolute;left:var(--arrow-x,50%);top:-9px;width:14px;height:14px;background:#fff;border-left:2px solid var(--blue);border-top:2px solid var(--blue);transform:translateX(-50%) rotate(45deg);transition:left .88s cubic-bezier(.4,0,.15,1)}
+    .travelling-payload.is-travelling::before{border-style:dashed}
+    .payload-swap{display:grid;grid-template-columns:minmax(0,112px) minmax(0,1fr);gap:10px;align-items:center}
+    .payload-meta{min-width:0}
+    .payload-tag{display:inline-block;margin-bottom:3px;padding:1px 4px;background:#9b6700;color:#fff;font:800 9px var(--mono);letter-spacing:.05em}
+    .payload-title{color:var(--ink);font:800 10px/1.3 var(--mono);letter-spacing:.03em;word-break:break-word}
+    .payload-shape{display:block;margin-top:2px;color:var(--blue);font:800 9.5px var(--mono);word-break:break-all}
+    .payload-body{min-width:0}
+    .payload-json{padding:6px;border-left:3px solid var(--green);background:var(--green2);font:700 10px/1.35 var(--mono);word-break:break-word}
+    .payload-text{padding:6px;background:var(--purple2);color:#4c3995;font:700 10px/1.35 var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .payload-body .payload-text{margin-top:4px}
+    .payload-grid{display:grid;grid-template-columns:repeat(var(--cols),1fr);gap:2px}.probe-cell{display:grid;place-items:center;min-height:20px;background:var(--cell);color:var(--cell-ink);font:800 9px var(--mono);transition:background .55s,color .55s,transform .55s}.probe-cell.changed{animation:cellChanged .6s both;animation-delay:calc(var(--i)*45ms)}.payload-result{padding:7px;background:var(--green2);color:var(--green);font:800 11.5px var(--body);text-align:center}.payload-swap{animation:payloadSwap .5s both}.module-compute{position:absolute;z-index:5;width:18px;height:18px;border:2px solid var(--orange);border-radius:50%;opacity:0;pointer-events:none;transform:translate(-50%,-50%)}.module-compute.on{animation:computeBurst .75s both}@keyframes computePulse{to{box-shadow:0 0 0 6px rgba(229,95,36,.14),0 12px 28px rgba(7,95,247,.18)}}@keyframes computeBurst{0%{opacity:0;transform:translate(-50%,-50%) scale(.4)}40%{opacity:1}100%{opacity:0;transform:translate(-50%,-50%) scale(4)}}@keyframes payloadSwap{from{opacity:.15;transform:scale(.92)}to{opacity:1;transform:none}}@keyframes cellChanged{50%{transform:scale(1.12);outline:1px solid var(--orange)}}
+    .trace-ledger{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:1px;align-items:stretch;border:1px solid var(--line);background:var(--line)}
+    .trace-ledger>div{min-width:0;padding:7px 10px;background:rgba(255,255,255,.97)}
+    .trace-ledger>code{display:grid;place-content:center;padding:7px 11px;background:var(--gold2);text-align:center}
+    @media(max-width:640px){.trace-ledger{grid-template-columns:1fr}}.trace-ledger label{display:block;color:var(--faint);font:800 9.5px var(--mono);letter-spacing:.08em}.trace-ledger b{display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:760 12.5px var(--body)}.trace-ledger code{font:800 11.5px var(--mono);color:var(--orange)}
+    .loop-wire{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:4px 6px 0;padding:9px 12px;border:2px dashed var(--blue);background:rgba(220,233,255,.42);color:var(--blue);font:800 12px var(--mono)}
+    .loop-wire b{flex:0 0 auto;font:900 18.5px var(--mono);line-height:1}
+    .loop-wire span{min-width:0;font-weight:700;color:#1c4f9c;line-height:1.5}
+
+    /* focused scene common */
+    .focus-layout{width:min(1180px,100%);align-self:stretch;display:grid;grid-template-rows:minmax(460px,1fr) auto;gap:12px}.scene{position:relative;min-height:480px;border:1px solid var(--line2);background:rgba(255,255,255,.97);overflow:auto}.scene.run *,.scene.run *::before,.scene.run *::after{animation-play-state:running}.scene.paused *,.scene.paused *::before,.scene.paused *::after{animation-play-state:paused!important}.scene-caption{display:flex;justify-content:space-between;gap:15px;align-items:center;color:var(--muted);font-size:13px}.scene-caption .hint{font:800 12.5px var(--mono);color:var(--blue)}
+    .label{font:800 11.5px var(--mono);letter-spacing:.1em;color:var(--faint);text-transform:uppercase}.shape{font:800 11.5px var(--mono);color:var(--cyan)}.demo-mark{display:inline-block;padding:3px 5px;background:var(--gold2);color:#744e00;font:800 10.5px var(--mono)}.demo-ribbon{position:sticky;top:0;z-index:9;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 11px;border-bottom:1px solid #d4ae54;background:#fff4ce;color:#684500;font:800 11.5px var(--mono);letter-spacing:.03em}.demo-ribbon strong{padding:3px 6px;background:#9b6700;color:#fff}.demo-ribbon span:last-child{font-weight:700;color:#7d6225}
+    .data-node{position:relative;padding:12px;border:1px solid var(--line);background:#fff}.data-node b{display:block;font:760 13.5px var(--display)}.data-node code{display:block;margin-top:5px;color:var(--cyan);font-size:11.5px}.data-node p{margin:6px 0 0;color:var(--muted);font-size:12.5px}.active-border{border-color:var(--blue);box-shadow:inset 0 -3px 0 var(--blue)}
+    .arrow{display:grid;place-items:center;color:var(--blue);font:900 21px var(--mono)}.vector-strip{display:grid;grid-template-columns:repeat(var(--n,32),1fr);gap:2px;height:32px}.vector-strip i{background:hsl(var(--h) 67% var(--l));transform:scaleY(var(--s));transform-origin:center;transition:.3s}.matrix{display:grid;grid-template-columns:repeat(var(--cols,16),1fr);gap:2px}.matrix i{aspect-ratio:1;background:hsl(var(--h) 67% var(--l));transition:background .4s,transform .4s}.matrix i.hot{outline:1px solid var(--orange)}    .scalar{padding:5px 7px;border:1px solid var(--line);background:#fff;font:750 11.5px var(--mono)}.scalar b{color:var(--blue)}
+    .tensor-panel{min-width:0;max-width:100%;margin-top:8px;border:1px solid var(--line2);background:#fff}.tensor-panel.tensor-after{border-color:#8caee9}.tensor-panel.tensor-delta{border-color:#d3a443}.tensor-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center;padding:6px 7px;border-bottom:1px solid var(--line);background:#f3f6f5}.tensor-name{min-width:0;font:800 11.5px/1.35 var(--mono);color:var(--ink);white-space:normal;word-break:break-word}.tensor-demo{padding:3px 5px;background:#9b6700;color:#fff;font:800 9.5px var(--mono);white-space:nowrap}.tensor-meta{display:flex;gap:8px;flex-wrap:wrap;padding:5px 7px;border-bottom:1px solid #e2e8e5;color:var(--muted);font:700 10.5px var(--mono)}.tensor-meta b{color:var(--cyan)}.tensor-brackets{display:grid;grid-template-columns:9px minmax(0,1fr) 9px;align-items:stretch;padding:6px 5px}.tensor-bracket{border-top:2px solid var(--ink);border-bottom:2px solid var(--ink)}.tensor-bracket.left{border-left:2px solid var(--ink)}.tensor-bracket.right{border-right:2px solid var(--ink)}.tensor-grid{display:grid;grid-template-columns:repeat(var(--tc),minmax(0,1fr));gap:2px;padding:1px 4px}.tensor-grid span{min-width:0;overflow:hidden;padding:5px 2px;text-align:center;background:#edf3f1;color:#123c35;font:750 10.5px var(--mono)}.tensor-grid span.neg{background:#f9e5dc;color:#923b1a}.tensor-after .tensor-grid span{background:#e3ecff;color:#174d9b}.tensor-after .tensor-grid span.neg{background:#f7dfda;color:#963527}.tensor-delta .tensor-grid span{background:#f8ebc6;color:#6f4a00}.tensor-axis{padding:0 7px 6px;color:var(--faint);font:700 9.5px var(--mono);text-align:right}    .tensor-table{flex:0 0 auto;border:1px solid var(--line2);background:#fff;padding:7px}.tensor-table.output{border-color:var(--blue);box-shadow:inset 0 -3px 0 var(--blue)}.tensor-table.delta{border-color:var(--gold);background:#fffdf7}.tensor-table h4{display:flex;justify-content:space-between;gap:10px;margin:0 0 6px;font:800 11.5px var(--mono)}.tensor-table h4 code{color:var(--cyan);font-size:10.5px}.tensor-numbers{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,1fr));gap:2px}.tensor-cell{position:relative;min-width:0;overflow:hidden;padding:6px 3px;text-align:center;background:#edf2f0;color:#26332f;font:750 10.5px var(--mono);transition:background .25s,transform .25s,color .25s}.tensor-cell.pos{background:#e1f1ef;color:#075d63}.tensor-cell.neg{background:#f8e7df;color:#9a3e1e}.tensor-cell.zero{color:#879590}.tensor-table.output .tensor-cell{background:var(--blue2);color:#064cbd}.tensor-table.delta .tensor-cell{background:var(--gold2);color:#6d4900}.tensor-cell::after{content:attr(data-rc);position:absolute;inset:auto 2px 1px auto;color:rgba(0,0,0,.25);font:600 9px var(--mono)}
+    .tensor-row-labels{display:grid;gap:2px;margin-right:3px}.tensor-row-labels span{height:31px;display:grid;place-items:center;color:var(--faint);font:700 9.5px var(--mono)}.tensor-with-labels{display:flex}.tensor-col-labels{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,1fr));gap:2px;margin:0 0 2px 0}.tensor-col-labels span{text-align:center;color:var(--faint);font:700 9.5px var(--mono)}
+    .operation-sign{flex:0 0 auto;color:var(--orange);font:900 16.5px var(--mono)}
+    .run .tensor-table.animate .tensor-cell{animation:cellCompute .35s both;animation-delay:calc(var(--i)*35ms + var(--base,0ms))}@keyframes cellCompute{from{opacity:.15;transform:scale(.74);background:#fff}60%{outline:1px solid var(--orange)}to{opacity:1;transform:none}}
+    .run .tensor-table.row-scan .tensor-cell{animation:rowScan .6s both;animation-delay:calc(var(--row)*170ms + var(--base,0ms))}@keyframes rowScan{from{opacity:.22}50%{background:#ffe5a8;transform:translateY(-2px)}to{opacity:1}}
+    /* block-internal operation pipeline (GDN / GQA / MoE / Dense FFN) */
+    .block-scene{min-width:0;padding:22px}
+    .op-pipeline{display:grid;gap:11px;width:100%;min-width:0}
+    .op-step{position:relative;min-width:0;border:1px solid var(--line);background:#fbfcfc;padding:13px 16px 14px 52px}
+    .op-step::before{content:attr(data-n);position:absolute;left:10px;top:13px;width:28px;height:28px;display:grid;place-items:center;border-radius:50%;background:var(--accent,var(--blue));color:#fff;font:800 13.5px var(--mono);z-index:1}
+    .op-step::after{content:"";position:absolute;left:24px;top:44px;bottom:-11px;width:2px;background:var(--line)}
+    .op-step:last-child::after{display:none}
+    .op-step.op-gdn{--accent:var(--cyan)}.op-step.op-gqa{--accent:var(--purple)}.op-step.op-moe{--accent:var(--orange)}.op-step.op-ffn{--accent:var(--green)}.op-step.op-main{--accent:var(--blue)}
+    .op-step-head{display:flex;flex-wrap:wrap;gap:5px 9px;align-items:baseline}
+    .op-step-head .op-kind{padding:2px 5px;background:var(--accent,var(--blue));color:#fff;font:800 9.5px var(--mono);letter-spacing:.07em;text-transform:uppercase;border-radius:2px}
+    .op-step-head b{font:800 15.5px var(--display)}.op-step-head>code{font:750 11.5px var(--mono);color:var(--cyan)}
+    .op-step-desc{margin:5px 0 9px;color:var(--muted);font:13px/1.55 var(--body)}.op-step-desc code{font-size:12.5px;color:var(--blue);background:#eaf0ff;padding:0 3px;border-radius:2px}
+    .op-body{display:flex;flex-wrap:wrap;align-items:center;gap:10px 9px;padding:2px 1px 4px}
+    .op-body>*{flex:0 1 auto;min-width:0;max-width:100%}.op-body .tensor-panel{margin-top:0;min-width:120px}.op-body .arrow{width:30px}
+    .op-op{flex:0 0 auto;display:grid;justify-items:center;gap:1px;color:var(--blue);font:800 17.5px var(--mono);padding:0 2px}.op-op small{font:800 10px var(--mono);color:var(--muted);white-space:nowrap;letter-spacing:.02em}
+    .op-block{padding-top:3px}.op-block+.op-body{margin-top:8px}
+    .op-note{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:2px}
+    .op-step .experts{grid-template-columns:repeat(5,1fr);margin-top:0}.op-step .shared-expert{margin-top:0}
+    .op-step .router-field{margin-top:2px}.op-step .score-bars{width:100%}
+    /* 非操作元素：编号只给真操作，这些一律不编号 */
+    .op-source{position:relative;min-width:0;border:1px dashed var(--line2);background:#f4f7f6;padding:12px 15px 13px 52px;margin-bottom:11px}
+    .op-source::before{content:"IN";position:absolute;left:10px;top:13px;width:28px;height:28px;display:grid;place-items:center;border-radius:50%;border:1px dashed var(--line2);background:#fff;color:var(--faint);font:800 10.5px var(--mono)}
+    .op-source .op-step-head b{font:800 14.5px var(--display)}.op-source .op-step-head .op-kind{background:var(--faint)}
+    .op-sub{margin-top:10px;padding:9px 11px;border-left:3px solid var(--line2);background:#f4f7f6}
+    .op-sub-head{display:flex;gap:7px;align-items:baseline;margin-bottom:6px;color:var(--muted);font:800 11.5px var(--mono);letter-spacing:.05em}
+    .op-sub-head i{font-style:normal;padding:2px 4px;background:#e4e9e7;color:var(--faint);font-size:10px;letter-spacing:.06em}
+    .op-sub .op-body{padding-bottom:2px}
+    .op-par{display:flex;flex-wrap:wrap;gap:10px}
+    .op-par-lane{flex:1 1 280px;min-width:0;max-width:100%;border:1px solid var(--line);background:#fff;padding:9px 10px}
+    .op-par-lane>b{display:block;margin-bottom:2px;font:800 12.5px var(--mono);color:var(--accent,var(--blue))}
+    .op-par-lane>small{display:block;margin-bottom:7px;color:var(--muted);font-size:12.5px;line-height:1.5}
+    /* 并行分支宽度只有整行一半，张量数值降一档避免被裁 */
+    .op-par-lane .tensor-grid span{font-size:9.5px;padding:5px 1px}
+    .op-par-lane .tensor-meta,.op-par-lane .tensor-axis{font-size:9px}
+    .op-par-tag{display:inline-block;margin-bottom:8px;padding:3px 6px;background:var(--blue2);color:var(--blue);font:800 10.5px var(--mono);letter-spacing:.05em}
+    /* decoder structural overview reflow */
+    .dec-band{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between}
+    .dec-copy{flex:1 1 320px;min-width:0}
+    /* 只有直接子级的 b 是标题；段落内的 b 保持行内强调 */
+    .dec-copy>b{display:block;font:800 17.5px var(--display);margin-top:2px}
+    .dec-copy p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.6}
+    .dec-copy p b{color:var(--ink);font-weight:800}
+    .dec-recipe{flex:0 0 auto;display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px;align-items:stretch;padding:8px;border:1px solid var(--line2);background:#f8faf9;min-width:min(520px,100%)}
+    .dec-probe{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;margin-top:22px}.dec-probe .data-node{flex:1 1 300px;min-width:250px}
+
+    /* request */
+    .json-box{background:#12201c;color:#d4e5df;padding:18px;font:12.5px/1.7 var(--mono);white-space:pre-wrap}.json-box .key{color:#8eb6ff}.json-box .val{color:#70d5bd}.template-lines{display:grid;gap:6px}.template-line{padding:9px 11px;border-left:3px solid var(--purple);background:var(--purple2);font:12.5px var(--mono);opacity:0;transform:translateX(-12px)}.run .template-line{animation:lineAppear .4s forwards}.run .template-line:nth-child(2){animation-delay:.5s}.run .template-line:nth-child(3){animation-delay:1s}.run .template-line:nth-child(4){animation-delay:1.5s}@keyframes lineAppear{to{opacity:1;transform:none}}
+
+    /* tokenizer */
+    .sentence{align-self:center;padding:13px 17px;border:1px solid var(--green);background:var(--green2);font:750 17.5px var(--display);animation:none}.token-bench{margin-top:42px;display:flex;justify-content:center;gap:7px;flex-wrap:wrap}.token-piece{position:relative;min-width:46px;padding:9px 8px 21px;border:1px solid var(--cyan);background:var(--cyan2);text-align:center;font:800 13px var(--mono);opacity:0;transform:translateY(-28px) scale(.72)}.token-piece.special{border-color:var(--purple);background:var(--purple2)}.token-piece small{position:absolute;left:0;right:0;bottom:5px;color:var(--faint);font:10.5px var(--mono);opacity:0}.run .token-piece{animation:tokenDrop .5s forwards}.run .token-piece:nth-child(2){animation-delay:.12s}.run .token-piece:nth-child(3){animation-delay:.24s}.run .token-piece:nth-child(4){animation-delay:.36s}.run .token-piece:nth-child(5){animation-delay:.48s}.run .token-piece:nth-child(6){animation-delay:.6s}.run .token-piece:nth-child(7){animation-delay:.72s}.run .token-piece:nth-child(8){animation-delay:.84s}.run .token-piece:nth-child(9){animation-delay:.96s}.run .token-piece:nth-child(10){animation-delay:1.08s}.run .token-piece:nth-child(11){animation-delay:1.2s}.run .token-piece small{animation:idAppear .35s 1.55s forwards}@keyframes tokenDrop{to{opacity:1;transform:none}}@keyframes idAppear{to{opacity:1}}
+    /* embedding */
+    .flying-id{padding:13px;border:1px solid var(--cyan);background:var(--cyan2);text-align:center;font:800 13px var(--mono)}.embed-matrix{position:relative;padding:12px;border:1px solid var(--line);background:#f8faf9}.embed-matrix .row{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;height:15px;margin:2px 0;opacity:.55}.embed-matrix .row i{background:#cbd8d4}.embed-matrix .row.target{opacity:1}.embed-matrix .row.target i{background:var(--cyan)}.run .embed-matrix .row.target{animation:rowPulse 1s .7s 2}@keyframes rowPulse{50%{transform:scale(1.025);box-shadow:0 0 0 3px var(--blue2)}}
+
+    /* decoder */
+    .decoder-focus-recipe{display:flex;flex-wrap:wrap;gap:6px}.decoder-repeat-badge{display:grid;place-items:center;border-left:3px solid var(--blue);background:var(--blue2);color:var(--blue);font:900 34px/1 var(--display);text-align:center}.decoder-repeat-badge small{display:block;margin-top:3px;color:#315b9a;font:800 9.5px var(--mono)}.macro-progress{position:relative;margin:24px 0 8px;height:42px;border:1px solid var(--line);background:#f6f9f8;overflow:hidden}.macro-progress::before{content:attr(data-start);position:absolute;left:8px;top:7px;color:var(--blue);font:900 13px var(--mono)}.macro-progress::after{content:attr(data-end);position:absolute;right:8px;top:7px;color:var(--blue);font:900 13px var(--mono)}.macro-progress i{position:absolute;left:47px;right:47px;top:15px;height:6px;background:repeating-linear-gradient(90deg,var(--line2) 0 2px,transparent 2px calc(100% / var(--blocks,23)))}.macro-progress b{position:absolute;left:47px;top:10px;width:12px;height:16px;background:var(--orange);animation:macroCounter 3s ease-in-out infinite alternate}@keyframes macroCounter{to{left:calc(100% - 59px)}}.click-hint{margin-top:14px;text-align:center;color:var(--blue);font:800 12.5px var(--mono)}
+
+    /* norm */
+    .bar-vector{height:220px;display:flex;align-items:center;gap:5px;border-bottom:1px solid var(--line);padding:0 7px}.bar-vector i{flex:1;min-width:4px;height:var(--h);background:var(--c);transform-origin:center;transition:height .4s}@keyframes fadeIn{to{opacity:1}}.norm-formula{margin-top:14px;padding:9px;background:var(--blue2);color:var(--blue);font:800 12.5px var(--mono)}
+
+    /* GDN */
+    .branch-box{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.branch{padding:8px 5px;border:1px solid var(--line);text-align:center;background:#fff;font:800 11.5px var(--mono);opacity:.25}.run .branch{animation:branchOn .45s forwards}.run .branch:nth-child(2){animation-delay:.12s}.run .branch:nth-child(3){animation-delay:.24s}.run .branch:nth-child(4){animation-delay:.36s}.run .branch:nth-child(5){animation-delay:.48s}.run .branch:nth-child(6){animation-delay:.6s}@keyframes branchOn{to{opacity:1;border-color:var(--cyan);background:var(--cyan2)}}
+    /* attention */
+    .qkv-stack{display:grid;gap:5px}.qkv-stack div{padding:8px;border:1px solid var(--line);font:800 11.5px var(--mono);background:#fff}.qkv-stack div:first-child{border-color:var(--purple);background:var(--purple2)}.rope-disc{position:relative;width:106px;height:106px;border:1px solid var(--line);border-radius:50%;margin:auto;background:linear-gradient(90deg,transparent 49%,var(--line) 50%,transparent 51%),linear-gradient(0deg,transparent 49%,var(--line) 50%,transparent 51%)}.rope-disc i{position:absolute;left:50%;top:50%;width:37px;height:3px;background:var(--purple);transform-origin:left center;transform:rotate(-25deg)}.rope-disc i::after{content:"";position:absolute;right:-1px;top:-3px;border-left:7px solid var(--purple);border-top:4px solid transparent;border-bottom:4px solid transparent}.run .rope-disc i{animation:rotateQ 1s .7s forwards}@keyframes rotateQ{to{transform:rotate(43deg)}}
+    .kv-cache{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;margin-top:7px}.kv-cache i{height:52px;background:var(--cyan2);border:1px solid #acd2d3}.kv-cache i:last-child{opacity:0;transform:translateY(-12px)}.run .kv-cache i:last-child{animation:cacheAppend .45s 1.5s forwards}@keyframes cacheAppend{to{opacity:1;transform:none;background:var(--cyan)}}
+    .score-bars{display:grid;gap:5px}.score-bars div{display:grid;grid-template-columns:56px 1fr 44px;gap:5px;align-items:center;font:700 10.5px var(--mono)}.score-bars i{display:block;height:9px;width:0;background:var(--purple)}.score-bars code{font-size:10.5px;color:var(--purple);text-align:right}.run .score-bars i{animation:growScore .8s 1.9s forwards}@keyframes growScore{to{width:var(--w)}}
+
+    /* MoE */
+    .router-field{height:150px;display:grid;grid-template-columns:repeat(32,1fr);gap:3px;align-items:end;border-bottom:1px solid var(--line);padding:8px}.router-field i{display:block;height:var(--h);background:#d5dfdb}.router-field i.on{background:var(--orange);transform-origin:bottom}.run .router-field i.on{animation:routerWin .55s .8s both}@keyframes routerWin{50%{transform:scaleY(1.2);filter:saturate(1.6)}}
+    .experts{display:grid;grid-template-columns:repeat(10,1fr);gap:6px;margin-top:30px}.expert{padding:10px 4px;border:1px solid var(--line);text-align:center;background:#fff;opacity:.3}.expert b{display:block;font:800 12.5px var(--mono)}.expert code{font-size:10.5px}.run .expert{animation:expertFire .55s 1.5s forwards}.run .expert:nth-child(2){animation-delay:1.58s}.run .expert:nth-child(3){animation-delay:1.66s}.run .expert:nth-child(4){animation-delay:1.74s}.run .expert:nth-child(5){animation-delay:1.82s}.run .expert:nth-child(6){animation-delay:1.9s}.run .expert:nth-child(7){animation-delay:1.98s}.run .expert:nth-child(8){animation-delay:2.06s}.run .expert:nth-child(9){animation-delay:2.14s}.run .expert:nth-child(10){animation-delay:2.22s}@keyframes expertFire{to{opacity:1;border-color:var(--orange);background:var(--orange2);transform:translateY(-4px)}}.shared-expert{margin-top:7px;padding:9px;border:1px solid var(--gold);background:var(--gold2);text-align:center;font:800 11.5px var(--mono)}
+    /* Qwen3.8-27B dense / vision */
+    .image-card{height:150px;display:grid;place-items:center;border:1px solid var(--green);background:linear-gradient(135deg,#dcece3,#d9eff0);font:900 31px var(--display);color:var(--green)}.patch-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:8px}.patch-grid i{aspect-ratio:1;border:1px solid var(--line2);background:var(--cyan2)}.run .patch-grid i{animation:cellChanged .45s both;animation-delay:calc(var(--i)*60ms)}.vit-stack{display:grid;gap:5px}.vit-stack div{padding:8px;border-left:3px solid var(--purple);background:var(--purple2);font:800 10.5px var(--mono)}
+    /* lm head */
+    .logits{display:grid;gap:7px}.logit{display:grid;grid-template-columns:68px 1fr 44px;gap:6px;align-items:center;font:700 10.5px var(--mono)}.logit i{height:10px;width:0;background:var(--blue)}.run .logit i{animation:logitGrow .7s 1.35s forwards}@keyframes logitGrow{to{width:var(--w)}}.logit.selected{color:var(--orange)}.logit.selected i{background:var(--orange)}
+
+    /* sampler */
+    .distribution{display:grid;gap:8px}.dist-row{display:grid;grid-template-columns:78px minmax(0,1fr) 78px;gap:7px;align-items:center;font:700 11.5px var(--mono)}.dist-row code{text-align:right;white-space:nowrap}.dist-row .track{height:13px;background:#e4eae8}.dist-row .track i{display:block;height:100%;width:var(--w);background:var(--blue)}.dist-row.cut{opacity:.25}.dist-row.pick{color:var(--orange)}.dist-row.pick .track i{background:var(--orange)}.sample-pointer{position:relative;height:66px;margin-top:20px;display:flex;border:1px solid var(--line);overflow:hidden}.sample-pointer i{height:100%;width:var(--w);background:var(--c)}.sample-pointer::after{content:"u=.61";position:absolute;left:61%;top:0;bottom:0;border-left:2px solid var(--ink);padding-left:3px;font:800 11.5px var(--mono);animation:pointerDrop .5s 1.3s both}@keyframes pointerDrop{from{transform:translateY(-60px)}to{transform:none}}
+
+    /* output */
+    .output-tokens{display:flex;justify-content:center;gap:7px;flex-wrap:wrap}.out-token{padding:9px;border:1px solid var(--purple);background:var(--purple2);font:800 12.5px var(--mono);transform:translateY(0)}.run .out-token{animation:tokensJoin 1.1s .7s forwards}@keyframes tokensJoin{to{margin-left:-7px;border-color:transparent;background:transparent;padding-left:2px;padding-right:2px}}.sentence-out{margin:38px auto 0;padding:15px 20px;border-left:4px solid var(--gold);background:var(--gold2);font:760 21px var(--display);opacity:0}.run .sentence-out{animation:fadeIn .5s 1.75s forwards}.stream-lines{margin:24px auto 0;width:min(690px,100%);padding:14px;background:#12201c;color:#bed3cc;font:12.5px/1.65 var(--mono);opacity:0}.run .stream-lines{animation:fadeIn .45s 2.25s forwards}.stream-lines .reason{color:#a99afb}.stream-lines .answer{color:#f1b86c}
+
+    @media(max-width:1300px){.app{height:auto;min-height:0;grid-template-columns:1fr}.canvas{min-height:calc(100dvh - var(--header));overflow:visible}.canvas-inner{min-height:calc(100dvh - var(--header))}.trace-console{top:var(--header)}.inspector{border-left:0;border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(3,1fr);overflow:visible}.ins-head{grid-column:1/-1;position:static}.ins-section{border-right:1px solid var(--line)}}
+    @media(max-width:1000px){:root{--inspector:280px}.view-note{display:none}.canvas-inner{padding:16px}}
+    @media(max-width:1040px){.crumbs{display:none}}
+    @media(max-width:760px){
+      .topbar{grid-template-columns:1fr auto;padding:0 10px}.brand>span{display:none}.model-select{max-width:170px}.canvas-inner{padding:12px}.view-head{align-items:start}.view-head h1{font-size:32px}.view-head p{font-size:13.5px}.view-root{justify-content:flex-start;overflow:auto}
+      .inspector{border-left:0;border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(2,1fr);overflow:visible}.ins-head{grid-column:1/-1;position:static}.ins-section{border-right:1px solid var(--line)}.focus-layout{min-width:780px}.scene-caption{min-width:760px}.top-actions{gap:3px;max-width:calc(100vw - 128px);overflow-x:auto;scrollbar-width:none}.top-actions .ui-btn{padding:6px 7px;font-size:11.5px}.nav-sep{flex:0 0 1px}
+    }
+    @media(max-width:500px){.inspector{grid-template-columns:1fr}.ins-section{border-right:0}.view-head h1{font-size:28px}.focus-layout{min-width:760px}.brand b{display:none}.model-select{max-width:164px}.top-actions{max-width:calc(100vw - 180px)}}
+    @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><b id="brandModel">Model</b><select class="model-select" id="modelSelect" aria-label="切换模型"><option value="m1">示例模型 A</option></select><span class="model-status" id="modelStatus">官方配置</span></div>
+    <div class="crumbs"><button type="button" id="homeCrumb" disabled>模型总图</button><i>/</i><b id="crumbCurrent">请求到输出</b></div>
+    <div class="top-actions"><button type="button" class="ui-btn" id="parentBtn" hidden>返回 Decoder</button><button type="button" class="ui-btn" id="prevModuleBtn" hidden>← 上一模块</button><button type="button" class="ui-btn primary" id="nextModuleBtn" hidden>下一模块 →</button><i class="nav-sep" id="navSep" hidden></i><button type="button" class="ui-btn" id="pauseBtn" hidden>暂停变换</button><button type="button" class="ui-btn" id="replayBtn" hidden>重播当前变换</button><button type="button" class="ui-btn" id="overviewBtn" hidden>返回总图</button></div>
+  </header>
+
+  <main class="app">
+    <section class="canvas" aria-label="交互式模型架构画布">
+      <div class="canvas-inner">
+        <div class="view-head"><div><div class="view-kicker" id="viewKicker">MODEL OVERVIEW · CLICK TO DRILL DOWN</div><h1 id="viewTitle">一个请求怎样穿过模型</h1><p id="viewSubtitle">点击任意模块进入内部。</p></div><div class="view-note" id="viewNote"></div></div>
+        <div class="view-root" id="viewRoot"></div>
+      </div>
+    </section>
+
+    <aside class="inspector" aria-label="模块技术检查器">
+      <div class="ins-head"><b>Module inspector</b><span id="insScope">WHOLE MODEL</span></div>
+      <section class="ins-section"><div class="ins-label">当前聚焦</div><div class="ins-title" id="insTitle"></div><p class="ins-copy" id="insCopy"></p></section>
+      <section class="ins-section"><div class="ins-label">输入 → 输出</div><div class="io-list" id="insIO"></div></section>
+      <section class="ins-section"><div class="ins-label">核心操作</div><div class="formula" id="insFormula"></div></section>
+      <section class="ins-section"><div class="ins-label">数值可信度</div><div class="badges" id="insBadges"></div><p class="ins-copy" id="insEvidence"></p></section>
+      <section class="ins-section"><div class="ins-label">一手依据</div><div class="ins-links" id="sourceLinks"></div></section>
+      <section class="ins-section"><div class="warning" id="boundaryWarning"></div></section>
+    </aside>
+  </main>
+
+  <script>
+    (()=>{
+      /* ==========================================================
+         1. 模型数据 —— 换模型时基本只改这一段
+         shape / 层数 / 头数必须来自官方 config.json，下面是占位示例
+         ========================================================== */
+      const mainFlow=['request','tokenizer','embedding','decoder','lmhead','output'];
+      const decoderFlow=['attn','ffn'];              // Decoder 内部可下钻的块
+      const shortLabel={request:'请求',tokenizer:'Tokenizer',embedding:'Embedding',
+        decoder:'Decoder',attn:'Attention',ffn:'FFN',lmhead:'LM Head',output:'Output'};
+
+      const moduleSpecs=[
+        {key:'request',  label:'Request + Template', sub:'请求进入并套用 chat template', shape:'messages → control text', op:'apply_chat_template'},
+        {key:'tokenizer',label:'Tokenizer',          sub:'字符串切分并映射为整数 ID',    shape:'text → input_ids [B,T]', op:'tokenize + vocab lookup'},
+        {key:'embedding',label:'Embedding',          sub:'整数索引查表，得到连续向量',   shape:'[B,T] → [B,T,H]',        op:'E[input_ids]'},
+        {key:'decoder',  label:'N-layer Decoder',    sub:'配方重复，不展开全部层',       shape:'L layers × R',           op:'R × [ mixer → FFN ]'},
+        {key:'lmhead',   label:'LM Head',            sub:'hidden 投影到全部词表位置',    shape:'H → V',                  op:'Wlm · hidden'},
+        {key:'output',   label:'Output loop',        sub:'token 拼成文本；未停止则回环', shape:'ID → UTF-8',             op:'detokenize + stream'}
+      ];
+
+      // 载荷在每一站的形态。长度必须 = moduleSpecs.length + 1
+      // （最后一项是离开末模块之后的形态，ledger 的"离开"列要用）
+      const payloadStates=[
+        {title:'请求输入',    kind:'json',  shape:'messages[]',   text:'{"role":"user","content":"…"}'},
+        {title:'模板化文本',  kind:'text',  shape:'UTF-8 string', text:'<|im_start|>user · … · <|im_end|>'},
+        {title:'input_ids',   kind:'ids',   shape:'[B,T] int64',  values:[391,72,114,205,98,7],cols:3},
+        {title:'embedding x₀',kind:'tensor',shape:'[B,T,H]',      values:[-.42,.18,.07,-.31,.56,-.09],cols:3},
+        {title:'hidden x_L',  kind:'tensor',shape:'[B,T,H]',      values:[.73,-.16,.41,.08,-.52,.29],cols:3},
+        {title:'logits',      kind:'logits',shape:'[B,V]',        values:[13.40,12.89,12.38],cols:3},
+        {title:'输出文字',    kind:'result',shape:'UTF-8 text',   text:'生成的一句话'}
+      ];
+
+      const meta={
+        overview:{title:'示例模型 A',scope:'WHOLE MODEL',copy:'一句话概括整条路径。',
+          io:[['请求','messages / text'],['Embedding','[B,T,H]'],['骨干','L decoder layers'],['输出','token stream']],
+          formula:'Request → Tokenizer → Embedding → L×Decoder → LM Head → Sample → loop',
+          badges:['fact','impl','demo'],evidence:'层结构与 shape 来自官方 config；页面内所有小数为模拟示例。'},
+        request:{title:'请求与 Chat Template',scope:'SERVICE',copy:'服务层把 messages 序列化为模型约定的控制文本。',
+          io:[['输入','messages[]'],['输出','templated text']],formula:'apply_chat_template(messages)',
+          badges:['impl','demo'],evidence:'chat template 属 checkpoint artifact；示例文字为教学用。'},
+        tokenizer:{title:'Tokenizer',scope:'TOKENIZER',copy:'切成 token pieces 再查词表得到整数 ID。',
+          io:[['输入','UTF-8 text'],['输出','input_ids [B,T]'],['词表','V entries']],
+          formula:'text → pieces → vocab lookup → ids',badges:['fact','demo'],evidence:'vocab_size 是配置事实；切分结果为模拟示例。'},
+        embedding:{title:'Token Embedding',scope:'MODEL INPUT',copy:'用 ID 取词嵌入矩阵的一行，离散索引变连续向量。',
+          io:[['输入','ID [B,T]'],['权重','[V,H]'],['输出','x₀ [B,T,H]']],formula:'x₀ = E[input_id]',
+          badges:['fact','demo'],evidence:'矩阵 shape 是配置事实；数值为模拟示例。'},
+        decoder:{title:'Decoder 骨干',scope:'MODEL BACKBONE',copy:'一组配方重复 R 次；点击内部色块继续下钻。',
+          io:[['输入','x₀ [B,T,H]'],['每层','mixer → FFN'],['输出','x_L [B,T,H]']],formula:'R × [ mixer → FFN ]',
+          badges:['fact','impl','demo'],evidence:'层型与数量是配置事实；进度条只表示顺序。'},
+        attn:{title:'Attention',scope:'EVERY LAYER',copy:'这一块做了哪几步操作。',
+          io:[['输入','[B,T,H]'],['输出','[B,T,H]']],formula:'softmax(QKᵀ/√d)·V',
+          badges:['fact','impl','demo'],evidence:'头数与维度来自 config；分数为模拟示例。'},
+        ffn:{title:'FFN',scope:'EVERY LAYER',copy:'这一块做了哪几步操作。',
+          io:[['输入','[N,H]'],['输出','[N,H]']],formula:'Wdown[SiLU(Wgate x) ⊙ Wup x]',
+          badges:['fact','impl','demo'],evidence:'intermediate_size 来自 config；激活值为模拟示例。'},
+        lmhead:{title:'LM Head',scope:'MODEL OUTPUT',copy:'Final Norm 后投影到词表得到 logits。',
+          io:[['输入','x_L,last [B,H]'],['权重','[V,H]'],['输出','logits [B,V]']],formula:'logits = Wlm · RMSNorm(x_L,last)',
+          badges:['fact','demo'],evidence:'shape 是配置事实；候选词为模拟示例。'},
+        output:{title:'Detokenize 与回环',scope:'SERVICE BOUNDARY',copy:'token 增量解码成文本；未停止则回到 Decoder。',
+          io:[['输入','token IDs'],['输出','UTF-8 / SSE']],formula:'ids → incremental_decode → stream',
+          badges:['impl','demo'],evidence:'回环是一拍关系：发出 y₁ 时 cache 仍覆盖 P。'}
+      };
+
+      const profiles={
+        m1:{brand:'Model',shortName:'示例模型 A',status:'官方配置',hidden:4096,layers:32,repeats:16,
+          mainFlow,decoderFlow,moduleSpecs,payloadStates,meta,
+          title:'一个请求怎样穿过示例模型 A',
+          subtitle:'点击任意模块进入内部；Decoder 可继续下钻。',
+          sources:[['官方模型卡','https://huggingface.co/…'],['官方 config.json','https://huggingface.co/…/config.json']]}
+        // 多模型：再加一个 profile，并在上面的 <select> 里加一个 <option>
+      };
+
+      const state={model:'m1',focus:'overview',paused:false,prevKey:null,nextKey:null,
+        overviewPaused:false,overviewTimer:null,traceModule:0,tracePhase:'before',overviewResizeBound:false};
+      const root=document.getElementById('viewRoot');
+      const title=document.getElementById('viewTitle'),subtitle=document.getElementById('viewSubtitle');
+      const kicker=document.getElementById('viewKicker'),note=document.getElementById('viewNote');
+      const replay=document.getElementById('replayBtn'),pause=document.getElementById('pauseBtn');
+      const overviewBtn=document.getElementById('overviewBtn'),parentBtn=document.getElementById('parentBtn');
+      const prevModuleBtn=document.getElementById('prevModuleBtn'),nextModuleBtn=document.getElementById('nextModuleBtn');
+      const navSep=document.getElementById('navSep'),homeCrumb=document.getElementById('homeCrumb');
+      const crumb=document.getElementById('crumbCurrent'),modelSelect=document.getElementById('modelSelect');
+      const modelStatus=document.getElementById('modelStatus'),brandModel=document.getElementById('brandModel');
+      const profile=()=>profiles[state.model];
+      const activeSpecs=()=>profile().moduleSpecs;
+      const activePayloads=()=>profile().payloadStates;
+      const activeMeta=()=>profile().meta;
+
+      /* ==========================================================
+         2. 基础工具
+         ========================================================== */
+      const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+      const round=(v,d=2)=>Number(v.toFixed(d));
+      // 确定性伪随机：同一 seed 永远得到同一组"数据"，避免刷新一次数值就变一批
+      const vals=(n,seed=1)=>Array.from({length:n},(_,i)=>{const x=Math.sin((i+1)*(seed+4)*12.9898)*43758.5453;return (x-Math.floor(x))*2-1});
+      const vector=(n=32,seed=1)=>`<div class="vector-strip" style="--n:${n}">${vals(n,seed).map(v=>`<i style="--h:${v>0?211:180};--l:${Math.round(84-Math.abs(v)*30)}%;--s:${(.55+Math.abs(v)*.45).toFixed(2)}"></i>`).join('')}</div>`;
+      const matrix=(r=8,c=12,seed=1,hot=false)=>`<div class="matrix" style="--cols:${c}">${vals(r*c,seed).map((v,i)=>`<i class="${hot&&i%17===0?'hot':''}" style="--h:${v>0?211:180};--l:${Math.round(87-Math.abs(v)*28)}%"></i>`).join('')}</div>`;
+      const bars=(n=12,seed=1,color='var(--cyan)')=>vals(n,seed).map(v=>`<i style="--h:${Math.round(Math.abs(v)*84)+12}%;--c:${v>0?color:'var(--orange)'}"></i>`).join('');
+      const badge=t=>`<span class="badge ${t}">${t==='fact'?'配置事实':t==='impl'?'参考实现':t==='engine'?'引擎相关':t==='tbd'?'尚未公开':'模拟数据'}</span>`;
+      const io=rows=>rows.map(([a,b])=>`<div class="io-row"><span>${a}</span><code>${b}</code></div>`).join('');
+
+      // 张量面板：永远同时给出完整逻辑 shape 和当前切片坐标，
+      // 否则读者看到一排数字并不知道自己在看哪一块
+      const tensorPanel=({name,shape,slice,values,cols=4,kind='',axis='',format='float'})=>
+        `<div class="tensor-panel ${kind?'tensor-'+kind:''}"><div class="tensor-head"><span class="tensor-name">${esc(name)}</span><span class="tensor-demo">模拟数据｜非 ${esc(profile().shortName)} 实测</span></div><div class="tensor-meta"><span>完整 shape <b>${esc(shape)}</b></span><span>当前显示 <b>${esc(slice)}</b></span></div><div class="tensor-brackets"><i class="tensor-bracket left"></i><div class="tensor-grid" style="--tc:${cols}">${values.map(v=>`<span class="${Number(v)<0?'neg':''}">${format==='int'?String(Math.trunc(Number(v))):`${Number(v)>=0?'+':''}${Number(v).toFixed(2)}`}</span>`).join('')}</div><i class="tensor-bracket right"></i></div>${axis?`<div class="tensor-axis">${esc(axis)}</div>`:''}</div>`;
+
+      /* ==========================================================
+         3. 操作流水线 helper —— 编号只发给"真正的操作"
+         读者会把每个编号圆圈数成"这一层做的一件事"，所以结果展示、
+         输入数据、并行分支都不能占用编号，否则步数就被夸大了。
+         ========================================================== */
+      // 一个真操作 = 一个编号圆圈。accent 决定配色：main/gdn/gqa/moe/ffn
+      const opStep=(n,accent,kind,title,shape,desc,body)=>`<div class="op-step op-${accent}" data-n="${n}"><div class="op-step-head"><span class="op-kind">${kind}</span><b>${title}</b>${shape?`<code>${shape}</code>`:''}</div>${desc?`<p class="op-step-desc">${desc}</p>`:''}${body||''}</div>`;
+      const opPipe=steps=>`<div class="op-pipeline">${steps.join('')}</div>`;
+      // 输入数据：虚线 IN 块，不编号
+      const opSource=(kind,title,shape,desc,body)=>`<div class="op-source"><div class="op-step-head"><span class="op-kind">${kind}</span><b>${title}</b>${shape?`<code>${shape}</code>`:''}</div>${desc?`<p class="op-step-desc">${desc}</p>`:''}${body||''}</div>`;
+      // 结果展示 / 数值对照：步骤内部的灰色次级区，不编号
+      const opSub=(title,body,tag='示例数值')=>`<div class="op-sub"><div class="op-sub-head">${esc(title)}<i>${esc(tag)}</i></div>${body}</div>`;
+      // 并行分支：并列在同一个编号里，绝不能拆成 1→2 让人以为有先后
+      const opParallel=(note,lanes)=>`<div class="op-par-tag">${esc(note)}</div><div class="op-par">${lanes.map(([b,s,inner])=>`<div class="op-par-lane"><b>${b}</b><small>${s}</small>${inner}</div>`).join('')}</div>`;
+      // 布局件
+      const opRow=(...p)=>`<div class="op-body">${p.join('')}</div>`;
+      const opBlock=inner=>`<div class="op-block">${inner}</div>`;
+      const opArrow=(g='→')=>`<div class="arrow">${g}</div>`;
+      const opOp=(label,glyph='→')=>`<div class="op-op">${glyph}<small>${esc(label)}</small></div>`;
+      const opSign=g=>`<div class="operation-sign">${g}</div>`;
+      const opScalars=(label,items)=>`<div class="op-note"><span class="demo-mark">${label}</span>${items.map(([k,v])=>`<span class="scalar">${k}=<b>${v}</b></span>`).join('')}</div>`;
+      const opWidget=(w,inner)=>`<div style="flex:0 0 auto;width:${w}px">${inner}</div>`;
+
+      /* ==========================================================
+         4. 场景渲染 —— 每个模块一个函数，返回 focusWrap(...)
+         ========================================================== */
+      function focusWrap(inner,caption='数值为模拟示例；shape 与操作顺序按右侧证据等级理解。'){
+        return `<div class="focus-layout"><div class="scene run" id="activeScene"><div class="demo-ribbon"><strong>数值模式：模拟数据｜非 ${esc(profile().shortName)} 权重实测</strong><span>shape / 操作顺序来自官方配置与参考实现</span></div>${inner}</div><div class="scene-caption"><span>${caption}</span><span class="hint">顶部"重播当前变换"可重新观察。</span></div></div>`;
+      }
+
+      function requestHTML(){
+        const source=opSource('输入数据','messages[] 请求','服务层入口',
+          '这是输入本身，<b>不是一个操作</b>。',
+          opRow(`<div class="json-box" style="flex:0 0 auto;max-width:430px">{ "role":"user", "content":"…" }</div>`));
+        const steps=[
+          opStep(1,'main','模板化','apply_chat_template','JSON → 控制文本',
+            '<b>这一层只有一个操作。</b>把每条消息包进角色特殊 token。',
+            opRow(opWidget(320,`<div class="template-lines"><div class="template-line">&lt;|im_start|&gt;user · … · &lt;|im_end|&gt;</div><div class="template-line">&lt;|im_start|&gt;assistant</div></div>`)))
+        ];
+        return focusWrap(`<div class="block-scene">${source}${opPipe(steps)}</div>`,'虚线 IN 块是输入数据；真正的操作只有一个。');
+      }
+
+      function tokenizerHTML(){
+        const toks=['<|im_start|>','user','示例','文本','<|im_end|>'];
+        const ids=toks.map((t,i)=>Math.abs((t.length*7919+i*1709)%100000));
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'main','切分','文本 → token pieces',null,
+            '按 BPE 合并规则切成子词与特殊控制 token。',
+            opRow(`<div style="flex:1 1 100%;min-width:0"><div class="token-bench" style="margin:0;justify-content:flex-start">${toks.map((t,i)=>`<span class="token-piece ${t.startsWith('<')?'special':''}">${esc(t)}<small>示例 ID ${ids[i]}</small></span>`).join('')}</div></div>`)),
+          opStep(2,'main','查表','vocab lookup → input_ids','→ [B,T] int64',
+            '每个 piece 查词表得到唯一整数索引。',
+            opRow(tensorPanel({name:'input_ids',shape:'[B,T] int64',slice:'[0,0:5]',values:ids,cols:5,format:'int'})))
+        ])}</div>`,'两个操作：切分 → 查表。');
+      }
+
+      function embeddingHTML(){
+        const row=[-0.42,0.18,0.07,-0.31,0.56,-0.09,0.24,0.11];
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'main','查行','E[input_id] 取一行','[B,T] → [B,T,H]',
+            '<b>这一层只有一个操作：查表。</b>没有矩阵乘法；位置信息也不在这里加。',
+            opRow(
+              `<div class="flying-id" style="flex:0 0 auto">token ID<br><code>示例 ID 166588</code></div>`,
+              opOp('lookup row'),
+              opWidget(280,`<span class="label">Embedding weight · [V,H]</span><div class="embed-matrix" style="margin-top:5px">${Array.from({length:9},(_,r)=>`<div class="row ${r===4?'target':''}">${'<i></i>'.repeat(24)}</div>`).join('')}</div>`),
+              opArrow(),
+              tensorPanel({name:'x₀',shape:'[B,T,H]',slice:'[0,0,0:8]',values:row,cols:8,kind:'after'})
+            )+opSub('取出的这一行画成条带',`<div style="max-width:280px">${vector(32,4)}</div>`))
+        ])}</div>`,'Embedding 只有一个操作：按 ID 查一行。');
+      }
+
+      function decoderHTML(){
+        const before=[-0.42,0.18,0.07,-0.31],after=[0.73,-0.16,0.41,0.08];
+        const p=profile();
+        return focusWrap(`<div class="block-scene"><div class="dec-band"><div class="dec-copy"><span class="label">配方 × ${p.repeats} = ${p.layers} 层</span><b>只展开一份配方</b><p>骨干是一个宏块重复 <b>${p.repeats}</b> 次。每层分两半：<b>上半</b>是序列混合器，<b>下半</b>是该层自己的 FFN。点色块下钻。</p></div><div class="dec-recipe">${recipeStacks()}<div class="decoder-times">×${p.repeats}<small>${p.layers} 层</small></div></div></div><div class="macro-progress" data-start="B01" data-end="B${p.repeats}" style="--blocks:${p.repeats}"><i></i><b></b></div><div class="dec-probe"><div class="data-node"><b>x₀</b>${vector(20,7)}${tensorPanel({name:'x₀ before',shape:'[B,T,H]',slice:'[0,last,0:4]',values:before,cols:4})}</div><div class="op-op" style="font-size:12px">→<small>穿过配方 ×${p.repeats}，shape 不变、数值持续变化</small></div><div class="data-node active-border"><b>x_L</b>${vector(20,29)}${tensorPanel({name:'x_L after',shape:'[B,T,H]',slice:'[0,last,0:4]',values:after,cols:4,kind:'after'})}</div></div><div class="click-hint"><button class="ui-btn" data-open="attn">打开 Attention</button> <button class="ui-btn" data-open="ffn">打开 FFN</button></div></div>`,'只画一组配方并标注乘数；每层 = 混合器 + 该层 FFN。');
+      }
+
+      function attnHTML(){
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'gqa','投影','QKV 投影','[B,T,H] → Q/K/V',
+            '输入投影成 Q、K、V。',
+            opRow(tensorPanel({name:'输入 x̂',shape:'[B,T,H]',slice:'[0,last,0:4]',values:[.28,-.33,.14,.51],cols:4}),
+                  opOp('3× Linear'),
+                  opWidget(150,`<div class="qkv-stack"><div>Q</div><div>K</div><div>V</div></div>`))),
+          opStep(2,'gqa','打分','QKᵀ/√d + mask → softmax',null,
+            '当前 Q 对全部历史 K 打分，加因果 mask 后 softmax。',
+            opRow(tensorPanel({name:'softmax 后概率',shape:'[B,heads,Tq,L]',slice:'[0,h0,last,0:5]',values:[.08,.12,.29,.34,.17],cols:5,kind:'after',axis:'Σ = 1.00'}))),
+          opStep(3,'gqa','聚合输出','A·V → Wo → 残差','→ [B,T,H]',
+            '用注意力权重对 V 加权求和，经输出投影后加回残差。',
+            opRow(tensorPanel({name:'注意力输出',shape:'[B,T,H]',slice:'[0,last,0:4]',values:[.32,-.06,.47,.18],cols:4,kind:'after'})))
+        ])}</div>`);
+      }
+
+      function ffnHTML(){
+        const gate=[-.8,.3,1.1,-.2],up=[.4,-.7,.2,.8];
+        const silu=gate.map(v=>round(v/(1+Math.exp(-v)))),prod=silu.map((v,i)=>round(v*up[i]));
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'ffn','上投影','gate_proj ∥ up_proj','[N,H] → 2×[N,I]',
+            '两个并行线性层把 H 扩展到中间维 I。',
+            opRow(tensorPanel({name:'gate',shape:'[N,I]',slice:'[0,0:4]',values:gate,cols:4}),
+                  tensorPanel({name:'up',shape:'[N,I]',slice:'[0,0:4]',values:up,cols:4}))),
+          opStep(2,'ffn','门控','SiLU(gate) ⊙ up','[N,I]',
+            'gate 分支过 SiLU 再与 up 逐元素相乘 —— 这就是 SwiGLU 门控。',
+            opRow(tensorPanel({name:'SiLU(gate)',shape:'[N,I]',slice:'[0,0:4]',values:silu,cols:4,kind:'after'}),
+                  opSign('⊙'),
+                  tensorPanel({name:'up',shape:'[N,I]',slice:'[0,0:4]',values:up,cols:4}),
+                  opSign('='),
+                  tensorPanel({name:'乘积',shape:'[N,I]',slice:'[0,0:4]',values:prod,cols:4,kind:'delta'}))),
+          opStep(3,'ffn','下投影','down_proj + 残差','[N,I] → [N,H]',
+            '压回 H 维得到 FFN(x)，最后加回残差流。',
+            opRow(tensorPanel({name:'x + FFN(x)',shape:'[N,H]',slice:'[0,0:4]',values:[.45,-.31,.76,.14],cols:4,kind:'after'})))
+        ])}</div>`);
+      }
+
+      function lmheadHTML(){
+        const rows=[['首先',13.40,96],['其次',12.89,88],['然后',12.38,79]];
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'main','归一','Final RMSNorm','[B,H] → 同 shape','最后一个位置的 hidden 先做最终归一化。',
+            opRow(tensorPanel({name:'final hidden',shape:'[B,H]',slice:'[0,0:4]',values:[.73,-.16,.41,.08],cols:4}))),
+          opStep(2,'main','投影','Wlm · ĥ → logits','[B,H] → [B,V]','乘 LM Head 权重，为词表每个 token 各算一个得分。挑哪个属于采样器。',
+            opRow(opWidget(280,`<span class="label">LM Head weight · [V,H]</span><div style="margin-top:5px">${matrix(10,24,22)}</div>`),
+                  opOp('× Wlmᵀ'),
+                  tensorPanel({name:'logits',shape:'[B,V]',slice:'[0, 三个示例候选]',values:rows.map(r=>r[1]),cols:3,kind:'after'}))
+            +opSub('输出结果排序展示',`<div class="logits">${rows.map((r,i)=>`<div class="logit ${i===0?'selected':''}"><b>${r[0]}</b><span style="height:10px;background:#e4eae8"><i style="--w:${r[2]}%"></i></span><code>${r[1].toFixed(2)}</code></div>`).join('')}</div>`,'示例候选'))
+        ])}</div>`,'两个操作：Final Norm → 投影得 logits。灰色区块只是结果展示，不是第三步。');
+      }
+
+      function outputHTML(){
+        const toks=['生成','的',' 一句','话'];
+        return focusWrap(`<div class="block-scene">${opPipe([
+          opStep(1,'main','拼接','incremental_decode','ids → UTF-8','token pieces 增量解码拼回文本。',
+            opBlock(`<div class="output-tokens" style="justify-content:flex-start">${toks.map(t=>`<span class="out-token">${esc(t)}</span>`).join('')}</div><div class="sentence-out" style="margin:18px 0 0">生成的一句话</div>`)),
+          opStep(2,'main','回环','emitted token → 下一次 Decode',null,
+            '未停止则作为下一次 Decode 的输入。回环是一拍关系：发出 y₁ 时 cache 仍覆盖 P。',
+            opBlock(`<div class="stream-lines" style="margin:0;background:#0f1b18">cache=P → emit y₁ → Decode(input=y₁, cache=P) → cache=P+y₁ → sample y₂</div>`))
+        ])}</div>`);
+      }
+
+      const renders={request:requestHTML,tokenizer:tokenizerHTML,embedding:embeddingHTML,
+        decoder:decoderHTML,attn:attnHTML,ffn:ffnHTML,lmhead:lmheadHTML,output:outputHTML};
+      const activeRenders=()=>renders;
+
+      /* ==========================================================
+         5. 总图 —— 自动换行网格 + 卡片 + 载荷
+         ========================================================== */
+      // 一组配方只画一次，重复次数交给徽章，不铺开几十层
+      function recipeStacks(){
+        return `<div class="layer-stack"><button class="mixer-chip" data-open="attn">L1 · Attn</button><button class="ffn-chip" data-open="ffn">FFN</button></div><div class="layer-stack"><button class="mixer-chip" data-open="attn">L2 · Attn</button><button class="ffn-chip" data-open="ffn">FFN</button></div>`;
+      }
+      const stageColor=(i,n)=>{const p=['var(--green)','var(--cyan)','var(--blue)','var(--purple)','var(--orange)','var(--gold)'];return p[Math.min(p.length-1,Math.round(i/Math.max(1,n-1)*(p.length-1)))]};
+
+      function moduleNode(spec,index){
+        const total=activeSpecs().length,c=stageColor(index,total);
+        // 每张卡片都要有实质内容（说明 + 操作 + 形态），
+        // 否则总图就是一排空盒子，读者只能靠点进去才知道每站在干嘛
+        const head=`<span class="stage-bar"></span><span class="module-head"><span class="module-index"><i>${index+1}</i>MODULE ${String(index+1).padStart(2,'0')} / ${total}</span><b>${spec.label}</b></span><span class="module-desc">${spec.sub}</span><i class="module-port" aria-hidden="true"></i>`;
+        const foot=`<span class="module-foot"><span class="node-line op"><b>操作</b><code>${esc(spec.op)}</code></span><span class="node-line"><b>形态</b><code>${esc(spec.shape)}</code></span></span>`;
+        if(spec.key==='decoder')return `<div class="map-node decoder-node" role="button" tabindex="0" data-open="decoder" data-stage="${index}" style="--stage-c:${c}">${head}<div class="decoder-recipe">${recipeStacks()}<div class="decoder-times">×${profile().repeats}<small>${profile().layers} 层</small></div></div>${foot}</div>`;
+        return `<button class="map-node" data-open="${spec.key}" data-stage="${index}" style="--stage-c:${c}">${head}${foot}</button>`;
+      }
+
+      function payloadCells(p,changed=false){
+        const isIds=p.kind==='ids',scale=p.kind==='logits'?14:(p.kind==='prob'?0.3:1),cols=p.cols||3;
+        return `<div class="payload-grid" style="--cols:${cols}">${p.values.map((raw,i)=>{const v=Number(raw),strength=Math.min(1,Math.abs(v)/(scale||1)),h=isIds?184:(v<0?18:184),light=isIds?86:Math.round(95-strength*34),ink=isIds?'#07585e':(v<0?'#873815':'#07585e'),shown=isIds?Math.trunc(v):`${v>=0?'+':''}${v.toFixed(p.kind==='prob'?3:2)}`;return `<i class="probe-cell ${changed?'changed':''}" style="--i:${i};--cell:hsl(${h} 64% ${light}%);--cell-ink:${ink}">${shown}</i>`}).join('')}</div>`;
+      }
+      function payloadMarkup(p,changed=false){
+        let body='';
+        if(p.kind==='json')body=`<div class="payload-json">{ }&nbsp; ${esc(p.text)}</div>`;
+        else if(p.kind==='text')body=`<div class="payload-text">${esc(p.text)}</div>`;
+        else if(['ids','tensor','logits','prob'].includes(p.kind))body=payloadCells(p,changed)+(p.text?`<div class="payload-text">${esc(p.text)}</div>`:'');
+        else body=`<div class="payload-result">${esc(p.text)}</div>`;
+        // 「模拟数据」标签常驻：读者任何时候都清楚这些数字不是实测的
+        return `<div class="payload-swap"><div class="payload-meta"><span class="payload-tag">模拟数据</span><div class="payload-title">${esc(p.title)}</div><span class="payload-shape">${esc(p.shape)}</span></div><div class="payload-body">${body}</div></div>`;
+      }
+
+      function overviewHTML(){
+        const specs=activeSpecs(),payloads=activePayloads();
+        const decIdx=specs.findIndex(s=>s.key==='decoder');
+        // 控制台 sticky 在顶部：读者不用来回滚动就能对照"进入 / 操作 / 离开"
+        return `<div class="overview-wrap"><div class="trace-console"><div class="overview-trace-head"><div class="trace-status"><span id="traceCounter">MODULE 1 / ${specs.length}</span><strong id="overviewTraceLabel">数据准备进入 ${specs[0].label}</strong><code class="trace-shape" id="traceShape">${payloads[0].shape}</code></div><div class="trace-controls"><button class="ui-btn" id="traceToggleBtn">暂停旅程</button><button class="ui-btn" id="traceStepBtn">下一变化</button><button class="ui-btn" id="traceRestartBtn">从头重播</button></div></div><div class="trace-ledger"><div><label>进入当前模块</label><b id="traceBefore">${payloads[0].title} · ${payloads[0].shape}</b></div><code id="traceOperation">${specs[0].op}</code><div><label>离开当前模块</label><b id="traceAfter">${payloads[1].title} · ${payloads[1].shape}</b></div></div></div><div class="overview-map" id="overviewMap">${specs.map(moduleNode).join('')}<div class="module-compute" id="moduleCompute"></div><div class="travelling-payload" id="travellingPayload">${payloadMarkup(payloads[0])}</div></div>${decIdx>=0?`<div class="loop-wire"><b>↺</b><span>自回归回环：模块 ${specs.length} 采样出的 token 会作为下一次 Decode 的输入，重新从模块 ${decIdx+1} 开始 —— 每生成一个 token 就绕一圈。</span></div>`:''}</div>`;
+      }
+
+      /* ==========================================================
+         6. 载荷动画核心 —— 定位钳制 / 行末标记 / 状态机
+         这段从实测页面原样提取。改动前请读 references/layout-pitfalls.md：
+         载荷比卡片宽时要钳制在边界内、尖角单独对准卡片中心；
+         行末标记依赖 offsetTop 比较，resize 后必须重算。
+         ========================================================== */
+      function stopOverviewTrace(){if(state.overviewTimer){clearTimeout(state.overviewTimer);state.overviewTimer=null}}
+      function payloadPosition(index){
+              const map=document.getElementById('overviewMap'),node=root.querySelector(`[data-stage="${index}"]`),payload=document.getElementById('travellingPayload'),port=node?.querySelector('.module-port');if(!map||!node||!payload||!port)return null;
+              const mr=map.getBoundingClientRect(),pr=port.getBoundingClientRect();
+              const pw=payload.offsetWidth,ph=payload.offsetHeight,pad=6;
+              const anchorX=pr.left-mr.left+pr.width/2;
+              // 载荷比卡片略宽，边列会顶出总图；钳制在边界内，尖角再单独对准卡片中心
+              const x=Math.min(Math.max(pad,anchorX-pw/2),Math.max(pad,map.clientWidth-pw-pad));
+              return {x,y:pr.top-mr.top+pr.height/2-ph/2,arrow:anchorX-x};
+            }
+      function markRowEnds(){
+              const nodes=[...root.querySelectorAll('.map-node')];if(!nodes.length)return;
+              nodes.forEach((n,i)=>{
+                n.classList.remove('at-row-end','is-last');
+                if(i===nodes.length-1){n.classList.add('is-last');return}
+                const next=nodes[i+1];
+                if(next.offsetTop>n.offsetTop+4)n.classList.add('at-row-end');
+              });
+            }
+      function renderTraceState(){
+              const i=state.traceModule,phase=state.tracePhase,payload=document.getElementById('travellingPayload'),nodes=[...root.querySelectorAll('[data-stage]')];if(!payload||!nodes.length)return;
+              const specs=activeSpecs(),payloads=activePayloads();
+              nodes.forEach((n,idx)=>n.classList.toggle('trace-active',idx===i));
+              const before=payloads[i],after=payloads[i+1],spec=specs[i],isAfter=phase==='after';
+              payload.classList.toggle('is-computing',isAfter);payload.classList.toggle('is-travelling',phase==='moving');
+              payload.innerHTML=payloadMarkup(isAfter?after:before,isAfter);
+              const pos=payloadPosition(i);if(pos){payload.style.transform=`translate3d(${pos.x}px,${pos.y}px,0)`;payload.style.setProperty('--arrow-x',`${pos.arrow}px`)}
+              const label=document.getElementById('overviewTraceLabel'),shape=document.getElementById('traceShape'),counter=document.getElementById('traceCounter'),op=document.getElementById('traceOperation'),b=document.getElementById('traceBefore'),a=document.getElementById('traceAfter');
+              if(counter)counter.textContent=`MODULE ${i+1} / ${specs.length}`;
+              if(label)label.textContent=isAfter?`${spec.label} 已完成计算：数据变为 ${after.title}`:(phase==='moving'?`数据正在移动到 ${spec.label}`:`数据进入 ${spec.label}`);
+              if(shape)shape.textContent=(isAfter?after:before).shape;
+              if(op)op.textContent=spec.op;if(b)b.textContent=`${before.title} · ${before.shape}`;if(a)a.textContent=`${after.title} · ${after.shape}`;
+              const burst=document.getElementById('moduleCompute'),port=nodes[i].querySelector('.module-port');if(burst&&port){const map=document.getElementById('overviewMap'),mr=map.getBoundingClientRect(),pr=port.getBoundingClientRect();burst.style.left=`${pr.left-mr.left+pr.width/2}px`;burst.style.top=`${pr.top-mr.top+pr.height/2}px`;burst.classList.remove('on');if(isAfter){void burst.offsetWidth;burst.classList.add('on')}}
+            }
+      function traceNext(manual=false){
+              stopOverviewTrace();
+              if(state.tracePhase==='before')state.tracePhase='after';
+              else if(state.tracePhase==='after'&&state.traceModule<activeSpecs().length-1){state.traceModule+=1;state.tracePhase='moving'}
+              else if(state.tracePhase==='moving')state.tracePhase='before';
+              else{
+                const p=document.getElementById('travellingPayload');if(p)p.classList.add('is-resetting');
+                if(manual){state.traceModule=0;state.tracePhase='before';if(p)p.classList.remove('is-resetting');renderTraceState();return}
+                state.overviewTimer=setTimeout(()=>{state.traceModule=0;state.tracePhase='before';if(p)p.classList.remove('is-resetting');renderTraceState();if(!state.overviewPaused)scheduleTrace()},650);return
+              }
+              renderTraceState();if(!manual&&!state.overviewPaused)scheduleTrace();
+            }
+      function scheduleTrace(){stopOverviewTrace();if(!state.overviewPaused){const delay=state.tracePhase==='moving'?900:(state.tracePhase==='after'?1300:1550);state.overviewTimer=setTimeout(()=>traceNext(false),delay)}}
+      function startOverviewTrace(reset=true){
+              stopOverviewTrace();state.overviewPaused=false;if(reset){state.traceModule=0;state.tracePhase='before'};requestAnimationFrame(()=>{markRowEnds();renderTraceState();scheduleTrace()});
+              const toggle=document.getElementById('traceToggleBtn');if(toggle)toggle.textContent='暂停旅程';
+            }
+      function bindOverviewTrace(){
+              const toggle=document.getElementById('traceToggleBtn'),restart=document.getElementById('traceRestartBtn'),step=document.getElementById('traceStepBtn');
+              if(toggle)toggle.addEventListener('click',e=>{e.stopPropagation();state.overviewPaused=!state.overviewPaused;if(state.overviewPaused){stopOverviewTrace();toggle.textContent='继续旅程'}else{toggle.textContent='暂停旅程';scheduleTrace()}});
+              if(restart)restart.addEventListener('click',e=>{e.stopPropagation();startOverviewTrace(true)});
+              if(step)step.addEventListener('click',e=>{e.stopPropagation();state.overviewPaused=true;stopOverviewTrace();if(toggle)toggle.textContent='继续旅程';traceNext(true)});
+              if(!state.overviewResizeBound){
+                state.overviewResizeBound=true;
+                let t=null;
+                window.addEventListener('resize',()=>{
+                  if(state.focus!=='overview')return;
+                  clearTimeout(t);t=setTimeout(()=>{markRowEnds();renderTraceState()},140);
+                });
+              }
+            }
+
+      /* ==========================================================
+         7. 导航与装配
+         ========================================================== */
+      function updateInspector(key){const m=activeMeta()[key];
+        document.getElementById('insScope').textContent=m.scope;
+        document.getElementById('insTitle').textContent=m.title;
+        document.getElementById('insCopy').textContent=m.copy;
+        document.getElementById('insIO').innerHTML=io(m.io);
+        document.getElementById('insFormula').textContent=m.formula;
+        document.getElementById('insBadges').innerHTML=m.badges.map(badge).join('');
+        document.getElementById('insEvidence').textContent=m.evidence;}
+      function navContext(key){
+        const internal=profile().decoderFlow.includes(key),seq=internal?profile().decoderFlow:profile().mainFlow,idx=seq.indexOf(key);
+        return {internal,prev:idx>0?seq[idx-1]:null,next:idx>=0&&idx<seq.length-1?seq[idx+1]:null};}
+      function updateNavigation(key,isOverview){
+        parentBtn.hidden=isOverview||!profile().decoderFlow.includes(key);navSep.hidden=isOverview;
+        prevModuleBtn.hidden=isOverview;nextModuleBtn.hidden=isOverview;
+        if(isOverview){state.prevKey=null;state.nextKey=null;return}
+        const nav=navContext(key);state.prevKey=nav.prev;state.nextKey=nav.next;
+        prevModuleBtn.disabled=!nav.prev;nextModuleBtn.disabled=!nav.next;
+        prevModuleBtn.textContent=nav.prev?`← ${shortLabel[nav.prev]}`:'← 已到起点';
+        nextModuleBtn.textContent=nav.next?`${shortLabel[nav.next]} →`:'已到终点 →';
+        parentBtn.textContent='返回 Decoder';}
+      function bindOpen(){
+        root.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',e=>{e.stopPropagation();open(el.dataset.open)}));
+        root.querySelectorAll('[data-model-switch]').forEach(el=>el.addEventListener('click',e=>{e.stopPropagation();switchModel(el.dataset.modelSwitch)}));}
+      function open(key){
+        stopOverviewTrace();state.focus=key;state.paused=false;
+        const isOverview=key==='overview',m=activeMeta()[key];
+        title.textContent=isOverview?profile().title:m.title;
+        subtitle.textContent=isOverview?profile().subtitle:m.copy;
+        kicker.textContent=isOverview?'MODEL OVERVIEW · CLICK TO DRILL DOWN':`${m.scope} · INTERNAL DATA TRANSFORMATION`;
+        note.innerHTML=isOverview?'<b>数据在模块间连续移动</b>下方的载荷条停在哪个模块，就表示数据正在被它处理；每经过一个模块，它的形态、shape、数值和颜色都会就地改变。所有数值均为模拟示例。':'<b>无需返回总图</b>使用顶部"上一模块 / 下一模块"继续浏览。';
+        root.innerHTML=isOverview?overviewHTML():activeRenders()[key]();
+        root.classList.remove('is-changing');void root.offsetWidth;root.classList.add('is-changing');
+        updateInspector(key);bindOpen();
+        if(isOverview){bindOverviewTrace();startOverviewTrace(true)}
+        replay.hidden=isOverview;pause.hidden=isOverview;overviewBtn.hidden=isOverview;
+        homeCrumb.disabled=isOverview;crumb.textContent=isOverview?'请求到输出':m.title;pause.textContent='暂停变换';
+        updateNavigation(key,isOverview);}
+      function replayScene(){const s=document.getElementById('activeScene');if(!s)return;
+        state.paused=false;pause.textContent='暂停变换';s.classList.remove('run','paused');void s.offsetWidth;s.classList.add('run');}
+      function updateModelChrome(){
+        const p=profile();brandModel.textContent=p.brand;modelSelect.value=state.model;
+        modelStatus.textContent=p.status;document.title=`${p.shortName} · 可下钻模型架构图`;
+        document.getElementById('sourceLinks').innerHTML=p.sources.map(([l,u])=>`<a href="${u}" target="_blank" rel="noreferrer">${esc(l)}</a>`).join('');
+        document.getElementById('hiddenLegend')&&(document.getElementById('hiddenLegend').textContent=`${p.hidden} 维残差流`);
+        document.getElementById('boundaryWarning').innerHTML=`<strong>边界：</strong>页面未加载 ${esc(p.shortName)} 权重。架构、shape 和操作顺序来自配置/实现；热力图、attention、logits、token ID 与所有小数都是明确标注的模拟数据。`;}
+      function switchModel(id){if(!profiles[id])return;stopOverviewTrace();state.model=id;
+        state.traceModule=0;state.tracePhase='before';state.overviewPaused=false;updateModelChrome();open('overview');}
+
+      modelSelect.addEventListener('change',()=>switchModel(modelSelect.value));
+      replay.addEventListener('click',replayScene);
+      pause.addEventListener('click',()=>{const s=document.getElementById('activeScene');if(!s)return;
+        state.paused=!state.paused;s.classList.toggle('paused',state.paused);pause.textContent=state.paused?'继续变换':'暂停变换';});
+      overviewBtn.addEventListener('click',()=>open('overview'));
+      homeCrumb.addEventListener('click',()=>open('overview'));
+      parentBtn.addEventListener('click',()=>open('decoder'));
+      prevModuleBtn.addEventListener('click',()=>{if(state.prevKey)open(state.prevKey)});
+      nextModuleBtn.addEventListener('click',()=>{if(state.nextKey)open(state.nextKey)});
+
+      // 让 audit-browser.js 能直接枚举模块，省得它去 DOM 里猜
+      window.__MAP_SPECS__=['overview',...mainFlow,...decoderFlow];
+
+      updateModelChrome();open('overview');
+    })();
+  </script>
+</body>
+</html>
