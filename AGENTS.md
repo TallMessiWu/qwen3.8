@@ -115,6 +115,6 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-**仓库刚建起来，适配工作尚未开始。** `origin` 上只有 `main`（与 `upstream/main` 同步），没有在途特性分支，`scripts/` 也还是空的。
+**vLLM-Ascend 适配代码尚未开始。** `origin` 上只有 `main`（与 `upstream/main` 同步），没有在途特性分支。`scripts/` 已包含 Qwen3.8 服务启动、ModelSlim 诊断和服务器验证资产；不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时直接按上面的 Worktree 工作流从 `main` 派生分支即可。等分支多起来后，动某个区域前先 `git branch -r` 看看有没有相关的在途分支。

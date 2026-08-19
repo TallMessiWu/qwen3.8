@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Single-node Qwen3.8-27B-MXFP8 baseline, retaining the user's host tuning and
+# optional npu-cleaner workflow while fixing the empty default device list.
+
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cleaner_path="$script_dir/npu-cleaner.sh"
+
+if [[ "$#" -gt 0 ]]; then
+    old_ifs="$IFS"
+    IFS=','
+    visible_devices="$*"
+    IFS="$old_ifs"
+else
+    visible_devices="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+fi
+export ASCEND_RT_VISIBLE_DEVICES="$visible_devices"
+IFS=',' read -r -a device_args <<< "$ASCEND_RT_VISIBLE_DEVICES"
+
+if [[ -x "$cleaner_path" ]]; then
+    echo "Cleaning NPU devices: $ASCEND_RT_VISIBLE_DEVICES"
+    "$cleaner_path" "${device_args[@]}"
+    sleep 1
+else
+    echo "WARNING: executable cleaner not found at $cleaner_path; continuing without cleanup." >&2
+fi
+
+export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/lib64"
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
+export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
+export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+
+if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
+    for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -w "$governor" ]] && printf 'performance\n' > "$governor"
+    done
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -w vm.swappiness=0 || true
+        sysctl -w kernel.numa_balancing=0 || true
+        sysctl -w kernel.sched_migration_cost_ns=50000 || true
+    fi
+fi
+
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+
+exec vllm serve "$MODEL_PATH" \
+    --served-model-name qwen3.8 \
+    --host 0.0.0.0 \
+    --port "$VLLM_PORT" \
+    --data-parallel-size 1 \
+    --tensor-parallel-size 1 \
+    --max-model-len 133120 \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 32 \
+    --gpu-memory-utilization 0.95 \
+    --reasoning-parser qwen3 \
+    --compilation-config '{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' \
+    --trust-remote-code \
+    --async-scheduling \
+    --allowed-local-media-path / \
+    --mm-processor-cache-gb 0 \
+    --mm-encoder-tp-mode data \
+    --mm-processor-cache-type shm \
+    --additional-config '{"enable_cpu_binding":true}'
