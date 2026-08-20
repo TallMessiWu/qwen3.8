@@ -36,32 +36,23 @@ bash scripts/debug/collect_qwen38_modelslim_debug.sh \
 
 See `scripts/debug/README.md` for the output and return-code contract.
 
-## Build the A5 image
+## Create the A5 container
 
-Docker build cannot see a bind mount that will exist only after `docker run`.
-Pass `/home/hajimi/proxy.sh` as a BuildKit secret instead; it is sourced for
-the networked build step and is not copied into the image:
+The launcher defaults to the vendor A5 image:
 
-```bash
-cd /home/hajimi/qwen3.8
-DOCKER_BUILDKIT=1 docker build \
-  --network=host \
-  --secret id=hajimi_proxy,src=/home/hajimi/proxy.sh \
-  -t qwen3.8-vllm-ascend:a5-20260819 .
+```text
+vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64
 ```
 
-If the build host already has direct network access, omit `--secret`. The
-Dockerfile pins vLLM to `0.27.1` but does not clone vLLM-Ascend. Before creating
-the container, make sure every node has the intended checkout at the mounted
-runtime path and that all four nodes report the same commit:
+Before creating the container, make sure every node has the intended checkout
+at the mounted runtime path and that all four nodes report the same commit:
 
 ```bash
 git -C /home/hajimi/qwen3.8/vllm-ascend/main pull --ff-only
 git -C /home/hajimi/qwen3.8/vllm-ascend/main rev-parse HEAD
 ```
 
-Dockerfile cannot declare host runtime mounts or namespace options. The
-companion launcher contains the original device/volume layout together with
+The launcher contains the original device/volume layout together with
 `--net=host`, `--pid=host`, and `--privileged=true`. Create the container with:
 
 ```bash
@@ -69,10 +60,12 @@ bash scripts/create-container.sh
 ```
 
 Override `IMAGE` or `CONTAINER_NAME` when needed. The script refuses to replace
-an existing container with the same name. After `/home` is mounted, it removes
-only `csrc/output` and `csrc/build_out`, then installs the editable checkout
-from `/home/hajimi/qwen3.8/vllm-ascend/main`. If installation fails, the new
-container is left running so its build environment can be inspected.
+an existing container with the same name. After `/home` is mounted, it runs
+`/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh` from that mount. The
+installer removes only `csrc/output` and `csrc/build_out`, then installs the
+editable checkout from `/home/hajimi/qwen3.8/vllm-ascend/main`. If installation
+fails, the new container is left running so its build environment can be
+inspected.
 
 At runtime, keep the original `/home:/home` mount. Root's interactive
 `.bashrc` conditionally sources `/home/hajimi/proxy.sh` and changes into

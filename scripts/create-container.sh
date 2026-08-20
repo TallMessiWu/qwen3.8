@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Create the privileged A5 serving container from the image built by the root
-# Dockerfile, then install the host-mounted vLLM-Ascend checkout. Run this
-# script on the host, not inside a container.
+# Create the privileged A5 serving container from the vendor image, then
+# install the host-mounted vLLM-Ascend checkout. Run this script on the host,
+# not inside a container.
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-qwen3.8-vllm-ascend:a5-20260819}"
+IMAGE="${IMAGE:-vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64}"
 CONTAINER_NAME="${CONTAINER_NAME:-hajimi-vllm}"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -58,7 +58,8 @@ docker run --name "$CONTAINER_NAME" \
     --volume=/usr/lib64:/usr/lib64 \
     "$IMAGE" bash
 
-if ! docker exec --user root "$CONTAINER_NAME" /usr/local/bin/install-vllm-ascend; then
+if ! docker exec --user root "$CONTAINER_NAME" \
+    bash /home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh; then
     echo "ERROR: vLLM-Ascend installation failed; container '$CONTAINER_NAME' was left running for inspection." >&2
     exit 1
 fi
