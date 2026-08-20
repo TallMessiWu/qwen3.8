@@ -11,14 +11,16 @@
 ```bash
 set -euo pipefail
 
-# 可将 /home/hajimi 替换为自己的工作目录，后续路径会自动跟随。
+###############################################################################
+# 请按需将 /home/hajimi 替换为自己的工作目录，后续路径会自动跟随。          #
+###############################################################################
 QWEN38_ROOT=/home/hajimi/qwen3.8
 VLLM_ASCEND_ROOT="${QWEN38_ROOT}/vllm-ascend"
 VLLM_ASCEND_MAIN="${VLLM_ASCEND_ROOT}/main"
 VLLM_ASCEND_UPSTREAM_MAIN="${VLLM_ASCEND_ROOT}/upstream-main"
 VLLM_ASCEND_UPSTREAM_URL=https://github.com/vllm-project/vllm-ascend.git
 
-mkdir -p /home/hajimi
+mkdir -p "$(dirname "${QWEN38_ROOT}")"
 
 if git -C "${QWEN38_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "${QWEN38_ROOT}" switch main
