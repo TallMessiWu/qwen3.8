@@ -23,7 +23,6 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── .agents/skills/        # 技能目录真身
 ├── .claude/skills         # → .agents/skills/（符号链接）
 ├── skills-lock.json       # 外部技能来源与哈希，由技能自身维护，勿手改
-├── Dockerfile             # A5 日包之上的可复建 vLLM/vLLM-Ascend 环境
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 ├── vllm/                  # submodule → 上游 vLLM（只读参考）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
@@ -35,7 +34,7 @@ qwen3.8/                   # 主仓（git，分支 main）
 
 主仓只跟踪 **两个 submodule 指针 + 部署/验证资产 + agent 配置**。`vllm-ascend/main` 之外的 worktree 目录被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
-服务器部署入口、ModelSlim 快速诊断和 A5 镜像构建方法见 [`scripts/README-qwen3.8-deployment.md`](scripts/README-qwen3.8-deployment.md)。
+服务器部署入口、ModelSlim 快速诊断和 A5 容器创建方法见 [`scripts/README-qwen3.8-deployment.md`](scripts/README-qwen3.8-deployment.md)。
 
 ## 克隆
 

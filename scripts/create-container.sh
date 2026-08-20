@@ -13,7 +13,7 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 2
 fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "ERROR: image '$IMAGE' does not exist; build the root Dockerfile first." >&2
+    echo "ERROR: image '$IMAGE' does not exist; pull or load it first." >&2
     exit 2
 fi
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
@@ -57,6 +57,15 @@ docker run --name "$CONTAINER_NAME" \
     --volume=/etc/hixlep:/etc/hixlep \
     --volume=/usr/lib64:/usr/lib64 \
     "$IMAGE" bash
+
+if ! docker exec --user root "$CONTAINER_NAME" bash -c \
+    "printf '%s\n' \
+        'if [[ -f /home/hajimi/proxy.sh ]]; then source /home/hajimi/proxy.sh; fi' \
+        'if [[ -d /home/hajimi/qwen3.8/scripts ]]; then cd /home/hajimi/qwen3.8/scripts; else cd /home/hajimi; fi' \
+        >> /root/.bashrc"; then
+    echo "ERROR: failed to configure root's interactive shell in container '$CONTAINER_NAME'." >&2
+    exit 1
+fi
 
 if ! docker exec --user root "$CONTAINER_NAME" \
     bash /home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh; then

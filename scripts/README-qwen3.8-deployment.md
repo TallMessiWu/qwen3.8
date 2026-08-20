@@ -73,4 +73,5 @@ At runtime, keep the original `/home:/home` mount. Root's interactive
 unconditional command by hand.
 
 The host-side custom-op security settings still must be applied outside the
-container; a Dockerfile cannot modify the host NPU driver's persistent state.
+container because container creation cannot modify the host NPU driver's
+persistent state.
