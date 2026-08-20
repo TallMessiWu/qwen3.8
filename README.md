@@ -1,57 +1,17 @@
 # qwen3.8
 
-在昇腾 NPU 上调试与测试 **Qwen3.8** 的工作区。服务栈是 `vllm` + `vllm-ascend`，所有适配改动只落在 `vllm-ascend`。
+在昇腾 NPU 上调试和测试 Qwen3.8 的工作区，服务栈为 `vllm` + `vllm-ascend`。
 
-## 这个仓库为什么存在
+## 一键初始化仓库
 
-它本身不含推理代码，是一个**给 AI coding agent 用的工作区壳子**——把「让 agent 高效开发 vllm-ascend 上的 Qwen3.8」需要的东西聚到一处：
-
-- **上下文完整**：`vllm/`（上游只读参考）和 `vllm-ascend/`（实际开发的个人 fork）以 submodule 挂在同一棵树下，agent 一次 clone 就能同时读到「被 patch 的上游函数长什么样」和「patch 怎么写的」，不用在两个互不可见的仓库之间猜。
-- **规则前置**：`AGENTS.md` 写清硬性约束（`vllm/` 只读、本机无 NPU、patch 分阶段、性能红线等），Claude Code 与 Codex CLI 通过符号链接读同一份，不会各说各话。
-- **技能复用**：`.agents/skills/` 收着提交规范（`gitmoji-commit`）、调试（`diagnosing-bugs`）、review、TDD、研究等技能，两家 agent 共用。
-- **验证闭环**：本机没有 NPU，跑不了推理。需要真机验证时把可复现脚本写进 `scripts/`，推到主仓，由人在服务器上执行并回传输出。`scripts/` 就是这条回路的交接点。
-
-想直接动手写代码，先读 [`AGENTS.md`](AGENTS.md)——那里是给 agent 的完整规则，本文件只负责讲清楚仓库怎么搭起来、怎么拉下来。
-
-## 目录结构
-
-```
-qwen3.8/                   # 主仓（git，分支 main）
-├── README.md              # 本文件
-├── AGENTS.md              # agent 规则真身（约束 / 架构要点 / 提交规范）
-├── CLAUDE.md              # → AGENTS.md（符号链接）
-├── .agents/skills/        # 技能目录真身
-├── .claude/skills         # → .agents/skills/（符号链接）
-├── skills-lock.json       # 外部技能来源与哈希，由技能自身维护，勿手改
-├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
-├── vllm/                  # submodule → 上游 vLLM（只读参考）
-└── vllm-ascend/           # git worktree 根，一个分支一个目录
-    ├── main/              # submodule → 个人 fork，主 worktree，跟踪 origin/main
-    └── upstream-main/     # 本地 worktree，跟踪 upstream/main，不进主仓
-```
-
-要改规则或加技能，一律动 `AGENTS.md` / `.agents/skills/`，别去改那两个符号链接。
-
-主仓只跟踪 **两个 submodule 指针 + 部署/验证资产 + agent 配置**。`vllm-ascend/main` 之外的 worktree 目录被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
-
-服务器部署入口、ModelSlim 快速诊断和 A5 容器创建方法见 [`scripts/README-qwen3.8-deployment.md`](scripts/README-qwen3.8-deployment.md)。
-
-## 克隆
-
-### Linux 服务器一键初始化（推荐）
-
-下面这段命令可直接整段复制执行，也可在后续重复执行。它会：
-
-- 克隆或更新本仓；
-- 递归初始化根仓的 `vllm` 和 `vllm-ascend/main` submodule；
-- 让 `vllm-ascend/main` 跟踪个人 fork 的 `origin/main`；
-- 配置只读的官方 `upstream` remote；
-- 创建跟踪 `upstream/main` 的 `upstream-main` worktree；
-- 递归初始化两个 vLLM-Ascend worktree 自身的 submodule。
+在 Linux 服务器执行下面整段命令。它会克隆或更新主仓，初始化 `vllm` 和
+`vllm-ascend/main`，配置只读的官方 `upstream`，并创建常驻的
+`vllm-ascend/upstream-main` worktree。
 
 ```bash
 set -euo pipefail
 
+# 可将 /home/hajimi 替换为自己的工作目录，后续路径会自动跟随。
 QWEN38_ROOT=/home/hajimi/qwen3.8
 VLLM_ASCEND_ROOT="${QWEN38_ROOT}/vllm-ascend"
 VLLM_ASCEND_MAIN="${VLLM_ASCEND_ROOT}/main"
@@ -116,158 +76,191 @@ git -C "${VLLM_ASCEND_MAIN}" submodule status --recursive
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" submodule status --recursive
 ```
 
-最后两个 vLLM-Ascend 分支状态应分别显示
-`main...origin/main` 和 `upstream-main...upstream/main`。`upstream` 只用于
-fetch/pull，永远不要向它 push。
+最后两个分支状态应分别显示 `main...origin/main` 和
+`upstream-main...upstream/main`。`upstream` 只用于 fetch/pull，不要向它
+push。
 
-`git submodule update --init --recursive` 会检出主仓或 vLLM-Ascend
-当前 commit 固定的子模块版本。不要改成 `git submodule update --remote`，
-否则会跳到子模块远程分支的最新 commit，可能破坏版本兼容性。
+## 创建 A5 容器
 
-### 一步到位
+### 前置条件
 
-```bash
-git clone --recurse-submodules https://github.com/TallMessiWu/qwen3.8.git
-cd qwen3.8
-```
+- 在宿主机执行脚本，不要在已有容器内执行。
+- 已安装 Docker，并确保最终选择的镜像在本机存在。未指定 `--image` 或
+  `IMAGE` 环境变量时，才要求加载默认镜像
+  `vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64`；
+  也可以通过这两种方式使用其他镜像。
+- 宿主机有 `/dev/davinci0` 至 `/dev/davinci7`、`/dev/davinci_manager`、
+  `/dev/hisi_hdc`、`/dev/ummu` 和 `/dev/uburma`。
+- 宿主机已准备 `/usr/local/Ascend/driver`、`/usr/local/Ascend/firmware`、
+  `/usr/local/sbin/npu-smi`、`/usr/local/dcmi`、`/etc/hccl_rootinfo.json`、
+  `/etc/hixlep` 和 `/usr/lib64`。
+- `/home`、`/mnt`、`/data` 会按相同绝对路径挂载进容器。自定义项目路径、
+  checkout、代理或安装脚本时，路径必须位于容器可见的挂载目录中。
+- 安装脚本默认位于
+  `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh`，可通过
+  `--install-script` 覆盖。
+- editable 安装使用的 checkout 默认为
+  `/home/hajimi/qwen3.8/vllm-ascend/main`，可通过 `--vllm-ascend-repo`
+  覆盖。如果传入 `--vllm-ascend-version` 从镜像源安装指定包版本，则不要求
+  本地 checkout 存在。
+- 代理脚本默认为 `/home/hajimi/proxy.sh`，可通过 `--proxy-file` 覆盖；选定
+  的代理文件不存在时会直接跳过。
+- 交互 shell 的默认目录和回退目录可分别通过 `--shell-workdir` 和
+  `--shell-fallback-dir` 覆盖；Python 路径可通过 `--python-bin` 覆盖。
+- 默认容器名为 `hajimi-vllm`，可通过 `--container-name` 或
+  `CONTAINER_NAME` 环境变量覆盖。脚本不会替换最终选定的同名容器。
 
-> 主仓地址按实际替换。`vllm` 指向上游 `vllm-project/vllm`，历史很大，完整克隆需要几分钟到十几分钟——想省时间看下面的浅克隆方案。
-
-### 已经 clone 过、但 submodule 是空目录
-
-克隆时忘了 `--recurse-submodules`，补一条即可：
-
-```bash
-git submodule update --init --recursive
-```
-
-### 省时方案：只对 vllm 浅克隆
-
-`vllm/` 只用来查源码，不需要历史；`vllm-ascend/` 要开分支、做 worktree、跟 upstream 合并，**必须完整克隆**。所以分开拉：
-
-```bash
-git clone https://github.com/TallMessiWu/qwen3.8.git
-cd qwen3.8
-git submodule update --init --depth 1 vllm        # 上游参考，浅克隆
-git submodule update --init vllm-ascend/main      # 开发主仓，完整历史
-```
-
-### 克隆后必做的两件事
-
-**1. 给 vllm-ascend 补上 `upstream` remote。** `.gitmodules` 只记 `origin`（个人 fork），upstream 需要手动加：
+使用默认镜像时，可用下面的命令确认镜像和设备：
 
 ```bash
-cd vllm-ascend/main
-git remote add upstream https://github.com/vllm-project/vllm-ascend.git
-git fetch upstream
+docker image inspect \
+  vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64
+ls /dev/davinci{0..7}
 ```
 
-> ⚠️ **upstream 只 fetch，永远不 push。** 推送一律走 `origin`（自己的 fork）。
-
-**2. 把 vllm-ascend 从游离头指针切回 main 分支。** submodule 默认检出到 detached HEAD，这样没法提交：
+### 使用默认配置
 
 ```bash
-cd vllm-ascend/main
-git checkout main
-git branch --set-upstream-to=origin/main main   # 若尚未关联
+cd /home/hajimi/qwen3.8
+bash scripts/create-container.sh
 ```
 
-`vllm/` 保持 detached HEAD 就好——它是只读参考，不要修改、不要提交、不要推送。
+脚本会创建 privileged、host network、host PID 的 8 卡容器，挂载宿主机
+目录，配置 root 的 `.bashrc`，然后调用 `install-vllm-ascend.sh`。默认不会
+替换镜像已有的 vLLM；vLLM-Ascend 从默认 checkout 以 editable 模式安装。
 
-### Windows 额外注意：符号链接
-
-`CLAUDE.md` 和 `.claude/skills` 是符号链接。Windows 上如果没开 symlink 支持，clone 出来它们会变成装着路径字符串的普通文本文件，Claude Code 就读不到规则和技能了。
-
-先确认：
+创建完成后进入容器：
 
 ```bash
-git config --get core.symlinks     # 期望输出 true
+docker exec -it hajimi-vllm bash
 ```
 
-不是 `true` 的话，开启后重新 clone：
+### 自定义路径和包版本
+
+两个脚本同时支持 `--参数 值` 和 `--参数=值`。完整列表：
 
 ```bash
-git config --global core.symlinks true
-git clone -c core.symlinks=true --recurse-submodules https://github.com/TallMessiWu/qwen3.8.git
+bash scripts/create-container.sh --help
+bash scripts/install-vllm-ascend.sh --help
 ```
 
-还需要 Windows 允许创建符号链接——**打开「设置 → 系统 → 开发者选项 → 开发人员模式」**，或者用管理员权限的终端执行 clone。
+常用参数：
 
-### 验证克隆结果
+| 参数 | 默认值或行为 |
+| --- | --- |
+| `--image` | 默认 vendor A5 镜像 |
+| `--container-name` | `hajimi-vllm` |
+| `--install-script` | `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh` |
+| `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/main` |
+| `--proxy-file` | `/home/hajimi/proxy.sh`，不存在时跳过 |
+| `--shell-workdir` | `/home/hajimi/qwen3.8/scripts` |
+| `--python-bin` | `python3` |
+| `--vllm-version` | 不传时保留镜像现有版本 |
+| `--vllm-ascend-version` | 不传时 editable 安装 checkout；传入时安装指定包版本 |
+| `--pip-index-url` | `https://mirrors.aliyun.com/pypi/simple` |
+| `--pytorch-index-url` | `https://download.pytorch.org/whl/cpu` |
+
+示例：
 
 ```bash
-git submodule status        # 两行，均无 - 前缀（有 - 说明未初始化）
-cat CLAUDE.md | head -3     # 应输出 AGENTS.md 的正文，而不是 "AGENTS.md" 一行
-ls .claude/skills/          # 应列出技能目录
+bash scripts/create-container.sh \
+  --image vllm-ascend:custom-a5 \
+  --container-name qwen38-test \
+  --install-script /mnt/qwen3.8/scripts/install-vllm-ascend.sh \
+  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/main \
+  --proxy-file /mnt/proxy.sh \
+  --shell-workdir /mnt/qwen3.8/scripts \
+  --shell-fallback-dir /mnt \
+  --python-bin /usr/bin/python3 \
+  --vllm-version 0.27.1
 ```
 
-## 日常同步
+如果传入 `--vllm-ascend-version VERSION`，安装器会从指定 Python 镜像源
+安装该版本，不再 editable 安装 checkout。原有的 `IMAGE` 和
+`CONTAINER_NAME` 环境变量覆盖方式仍然可用，显式命令行参数优先。
 
-```bash
-git pull                                  # 拉主仓（含 submodule 指针变化）
-git submodule update --init --recursive   # 让子仓跟上新指针
+## 完成后的结构与操作说明
+
+### 宿主机目录结构
+
+使用默认路径完成一键初始化后，关键目录结构如下。任务过程中额外创建的
+功能 worktree 不属于这个基础结构。
+
+```text
+/home/hajimi/
+├── proxy.sh                         # 可选的宿主机代理脚本，不属于本仓
+└── qwen3.8/
+    ├── .git/                        # 主仓 Git 元数据
+    ├── .gitmodules                  # vllm 与 vllm-ascend/main 的 submodule 配置
+    ├── AGENTS.md                    # agent 开发与仓库约束
+    ├── CLAUDE.md -> AGENTS.md       # 共享规则的符号链接
+    ├── README.md
+    ├── .agents/skills/              # agent 技能真身
+    ├── .claude/skills -> .agents/skills/
+    ├── skills-lock.json
+    ├── pics/                        # 架构页面使用的图片
+    ├── qwen3.8-architecture.html
+    ├── scripts/
+    │   ├── create-container.sh      # 宿主机容器创建入口
+    │   ├── install-vllm-ascend.sh   # 容器内 Python 包安装入口
+    │   ├── 27B.sh                   # 单机服务入口
+    │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
+    │   ├── serve_qwen3.8_*.sh       # 实际服务启动脚本
+    │   └── debug/                   # ModelSlim 等诊断脚本
+    ├── vllm/                        # 上游 vLLM submodule，只读参考
+    └── vllm-ascend/
+        ├── main/                    # 个人 fork submodule，跟踪 origin/main
+        └── upstream-main/           # 本地 worktree，跟踪 upstream/main
 ```
 
-submodule 指针只有在需要固定「这套脚本对应哪个版本的 vllm / vllm-ascend」时才更新，日常在子仓里提交**不必**顺手 bump：
+完成容器创建后，容器不会再复制一份源码，而是通过 bind mount 看到宿主机
+目录。默认关键结构如下：
 
-```bash
-git submodule status                      # 看两个子仓当前指向的 commit
-git add vllm-ascend/main && git commit     # 需要时才推进指针
+```text
+hajimi-vllm 容器
+├── /home/                            # bind mount：宿主机 /home
+│   └── hajimi/qwen3.8/               # 与上面的宿主机 checkout 是同一份文件
+├── /mnt/                             # bind mount：宿主机 /mnt
+├── /data/                            # bind mount：宿主机 /data
+├── /usr/local/Ascend/driver/         # bind mount：宿主机驱动
+├── /usr/local/Ascend/firmware/       # bind mount：宿主机固件
+├── /root/.bashrc                     # 追加代理加载和默认工作目录配置
+└── Python 环境
+    ├── vllm                          # 默认保留镜像版本，或安装指定版本
+    └── vllm-ascend                   # editable checkout，或指定的包版本
 ```
 
-同步 vllm-ascend 上游（在 `vllm-ascend/main` 里做，再 rebase/merge 到特性分支）：
+### 一键初始化仓库做了什么
 
-```bash
-cd vllm-ascend/main
-git fetch upstream && git merge upstream/main
-```
+1. 创建 `/home/hajimi`，在 `/home/hajimi/qwen3.8` 不存在时克隆本仓；已存在
+   时切换到 `main` 并执行 fast-forward 更新。
+2. 开启主仓的递归 submodule 配置，随后同步并初始化 `vllm` 和
+   `vllm-ascend/main` 及其递归 submodule。
+3. 将 `vllm-ascend/main` 切到本地 `main` 分支，并确保它跟踪个人 fork 的
+   `origin/main`。
+4. 为 vLLM-Ascend 配置官方只读远端 `upstream`，获取最新的
+   `upstream/main`。该远端只用于 fetch/pull。
+5. 创建或更新 `vllm-ascend/upstream-main` worktree，让它跟踪
+   `upstream/main`，与个人 fork 的 `main` checkout 分开维护。
+6. 在两个 vLLM-Ascend worktree 中同步递归 submodule，最后打印 submodule、
+   worktree 和分支状态，供人工确认初始化结果。
 
-## Worktree 工作流
+### 创建容器和安装包做了什么
 
-每个任务一个分支一个目录，并行开发互不干扰。主 worktree 在 `vllm-ascend/main`，从那里派生：
-
-```bash
-cd vllm-ascend/main
-git worktree add ../feat-xxx -b feat/xxx origin/main   # 新分支
-git worktree add ../bugfix-yyy origin/bugfix/yyy       # 检出已有远程分支
-git worktree list
-git worktree remove ../feat-xxx                        # 收尾清理
-```
-
-目录名用分支名去掉斜杠（`feat/mxfp8-quant-group-tp` → `feat-mxfp8-quant-group-tp`）。分支命名沿用现有习惯：`feat/*`、`fix/*`、`bugfix/*`。
-
-## 常用命令
-
-在某个 vllm-ascend worktree 目录内执行：
-
-```bash
-# Lint / 格式化：提交前必跑，覆盖所有文件类型（含 markdown）
-bash format.sh                           # 等价 pre-commit run --all-files
-bash format.sh ci                        # CI 口径，含 manual stage 的钩子
-pre-commit run ruff-check --all-files    # 只跑单个钩子
-
-# 单元测试
-pytest -sv tests/ut/ops/test_prepare_finalize.py
-
-# e2e（需要 NPU 硬件，只能在服务器上跑）
-pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
-```
-
-`tests/ut` 里大量用例 `import torch_npu`，本机跑不了；本机改动靠 lint + 静态阅读把关，真实验证交给服务器。
-
-## 动手前先确认的硬性约束
-
-1. **`vllm/` 是只读参考。** 需要改上游行为时，在 `vllm-ascend` 里写 patch。
-2. **本机没有 NPU，跑不了推理。** 有一块 5080 GPU，可以跑纯 PyTorch 小脚本做数值等价性验证（不能 `import torch_npu`）。
-3. **验证闭环靠脚本。** 可复现脚本写进 `scripts/`，自带打印/断言，输出能直接贴回来判读，不依赖交互式输入。
-4. **推送只走自己的 fork。** `origin` 是本人的 fork，可自由推送；`upstream` 是上游官方仓，只 fetch，永远不 push。
-5. **不要主动 push。** 提交后停下，由人决定推送时机。
-6. **提交走 `/gitmoji-commit` 技能。** 中文 subject，`<emoji-code> <type>(<scope>): <subject>` 格式。vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，提交必须带 `-s`：
-
-   ```bash
-   git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
-   ```
-
-完整规则（patch 分阶段机制、改动优先级、设备差异抽象、环境变量约定、NPU 性能红线）见 [`AGENTS.md`](AGENTS.md)；vllm-ascend 仓内规范见 `vllm-ascend/main/AGENTS.md`。
-
-> vLLM-Ascend 适配代码尚未在本仓开工；当前新增内容是 Qwen3.8 服务启动、ModelSlim 诊断和容器复建资产，没有修改两个上游代码目录。
+1. `create-container.sh` 解析默认值和命令行覆盖，检查 Docker、目标镜像，
+   并拒绝覆盖已有的同名容器。
+2. 使用 root 用户创建 detached 容器，启用 host network、host PID、
+   privileged 模式和 2 GiB shared memory。
+3. 将 8 张 NPU、NPU 管理设备、驱动、固件、HCCL 配置以及 `/home`、
+   `/mnt`、`/data` 等宿主机路径挂载进容器。
+4. 向容器的 `/root/.bashrc` 写入代理加载和工作目录逻辑。代理文件不存在时
+   跳过；工作目录不存在时进入配置的回退目录。
+5. 在容器内运行选定的 `install-vllm-ascend.sh`，并转发 checkout、代理、
+   Python、包版本和 Python 镜像源参数。
+6. 如果传入 `--vllm-version`，安装器先以 `--no-deps` 强制安装指定的
+   vLLM 版本；未传时保留镜像已有版本。
+7. 如果传入 `--vllm-ascend-version`，从 Python 镜像源安装指定版本；否则
+   只清理选定 checkout 的 `csrc/output` 和 `csrc/build_out`，再执行 editable
+   安装。
+8. 安装结束后打印 vLLM、vLLM-Ascend 版本和 `vllm_ascend` 的实际导入路径。
+   安装失败时容器保留运行状态，便于进入容器检查构建环境。
