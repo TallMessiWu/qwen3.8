@@ -59,18 +59,40 @@ The launcher contains the original device/volume layout together with
 bash scripts/create-container.sh
 ```
 
-Override `IMAGE` or `CONTAINER_NAME` when needed. The script refuses to replace
-an existing container with the same name. After `/home` is mounted, it runs
-`/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh` from that mount. The
-installer removes only `csrc/output` and `csrc/build_out`, then installs the
-editable checkout from `/home/hajimi/qwen3.8/vllm-ascend/main`. If installation
-fails, the new container is left running so its build environment can be
-inspected.
+Both scripts accept named overrides; run either one with `--help` for the full
+list. With no arguments, all image, container, path, package, and index defaults
+remain unchanged. For example:
 
-At runtime, keep the original `/home:/home` mount. Root's interactive
-`.bashrc` conditionally sources `/home/hajimi/proxy.sh` and changes into
-`/home/hajimi/qwen3.8/scripts`, which is the robust equivalent of appending the
-unconditional command by hand.
+```bash
+bash scripts/create-container.sh \
+  --image vllm-ascend:custom-a5 \
+  --container-name qwen38-test \
+  --install-script /mnt/qwen3.8/scripts/install-vllm-ascend.sh \
+  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/main \
+  --proxy-file /mnt/proxy.sh \
+  --shell-workdir /mnt/qwen3.8/scripts \
+  --shell-fallback-dir /mnt \
+  --python-bin /usr/bin/python3 \
+  --vllm-version 0.27.1
+```
+
+`--vllm-version` is optional; omitting it keeps the vLLM package already in the
+image. By default, vLLM-Ascend is installed editable from the selected checkout.
+Passing `--vllm-ascend-version VERSION` installs that package version from the
+configured index instead. The existing `IMAGE` and `CONTAINER_NAME` environment
+variable overrides remain supported; explicit command-line options take
+precedence.
+
+The script refuses to replace an existing container with the same name. After
+the configured mounts are active, it runs the selected installer path. The
+default editable installer removes only `csrc/output` and `csrc/build_out` from
+the selected checkout before installation. If installation fails, the new
+container is left running so its build environment can be inspected.
+
+At runtime, keep the mounts required by the selected paths. Root's interactive
+`.bashrc` conditionally sources the selected proxy file and changes into the
+selected shell workdir. Their defaults remain `/home/hajimi/proxy.sh` and
+`/home/hajimi/qwen3.8/scripts`.
 
 The host-side custom-op security settings still must be applied outside the
 container because container creation cannot modify the host NPU driver's
