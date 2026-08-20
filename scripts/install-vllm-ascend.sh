@@ -98,6 +98,9 @@ if [[ -n "$vllm_ascend_version" ]]; then
     "$python_bin" -m pip install -v --no-build-isolation \
         "vllm-ascend==$vllm_ascend_version" "${pip_source_args[@]}"
 else
+    echo "Synchronizing vLLM-Ascend submodules..."
+    git -C "$repo" submodule sync --recursive
+    git -C "$repo" submodule update --init --recursive
     echo "Removing stale vLLM-Ascend C++ build outputs..."
     rm -rf -- "$repo/csrc/output" "$repo/csrc/build_out"
     cd "$repo"

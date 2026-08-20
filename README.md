@@ -262,8 +262,8 @@ hajimi-vllm 容器
    Python、包版本和 Python 镜像源参数。
 6. 安装器先以 `--no-deps` 强制安装 vLLM。默认版本为 `0.27.1`，可通过
    `--vllm-version` 覆盖。
-7. 如果传入 `--vllm-ascend-version`，从 Python 镜像源安装指定版本；否则
-   只清理选定 checkout 的 `csrc/output` 和 `csrc/build_out`，再执行 editable
-   安装。
+7. 如果传入 `--vllm-ascend-version`，从 Python 镜像源安装指定版本；否则先
+   同步并初始化选定 checkout 的递归 submodule，再清理 `csrc/output` 和
+   `csrc/build_out`，最后执行 editable 安装。
 8. 安装结束后打印 vLLM、vLLM-Ascend 版本和 `vllm_ascend` 的实际导入路径。
    安装失败时容器保留运行状态，便于进入容器检查构建环境。
