@@ -13,7 +13,7 @@ PROXY_FILE=/home/hajimi/proxy.sh
 SHELL_WORKDIR=/home/hajimi/qwen3.8/scripts
 SHELL_FALLBACK_DIR=/home/hajimi
 PYTHON_BIN=python3
-VLLM_VERSION=
+VLLM_VERSION=0.27.1
 VLLM_ASCEND_VERSION=
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
@@ -31,7 +31,7 @@ usage() {
         "  --shell-workdir PATH             Initial directory for interactive root shells" \
         "  --shell-fallback-dir PATH        Directory used when shell workdir is absent" \
         "  --python-bin PATH                Python executable used by the installer" \
-        "  --vllm-version VERSION           Reinstall this vLLM version; omitted keeps the image version" \
+        "  --vllm-version VERSION           vLLM version to reinstall (default: 0.27.1)" \
         "  --vllm-ascend-version VERSION    Install this package version instead of the checkout" \
         "  --pip-index-url URL              Primary Python package index" \
         "  --pytorch-index-url URL          Extra PyTorch package index" \

@@ -129,7 +129,8 @@ bash scripts/create-container.sh
 
 脚本会创建 privileged、host network、host PID 的 8 卡容器，挂载宿主机
 目录，配置 root 的 `.bashrc`，然后调用 `install-vllm-ascend.sh`。默认不会
-替换镜像已有的 vLLM；vLLM-Ascend 从默认 checkout 以 editable 模式安装。
+解析 vLLM 依赖，而是以 `--no-deps` 强制安装 `vllm==0.27.1`；vLLM-Ascend
+从默认 checkout 以 editable 模式安装。
 
 创建完成后进入容器：
 
@@ -157,7 +158,7 @@ bash scripts/install-vllm-ascend.sh --help
 | `--proxy-file` | `/home/hajimi/proxy.sh`，不存在时跳过 |
 | `--shell-workdir` | `/home/hajimi/qwen3.8/scripts` |
 | `--python-bin` | `python3` |
-| `--vllm-version` | 不传时保留镜像现有版本 |
+| `--vllm-version` | `0.27.1`，可覆盖为其他版本 |
 | `--vllm-ascend-version` | 不传时 editable 安装 checkout；传入时安装指定包版本 |
 | `--pip-index-url` | `https://mirrors.aliyun.com/pypi/simple` |
 | `--pytorch-index-url` | `https://download.pytorch.org/whl/cpu` |
@@ -207,7 +208,7 @@ bash scripts/create-container.sh \
     │   ├── install-vllm-ascend.sh   # 容器内 Python 包安装入口
     │   ├── 27B.sh                   # 单机服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
-    │   ├── serve_qwen3.8_*.sh       # 实际服务启动脚本
+    │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
     │   └── debug/                   # ModelSlim 等诊断脚本
     ├── vllm/                        # 上游 vLLM submodule，只读参考
     └── vllm-ascend/
@@ -228,7 +229,7 @@ hajimi-vllm 容器
 ├── /usr/local/Ascend/firmware/       # bind mount：宿主机固件
 ├── /root/.bashrc                     # 追加代理加载和默认工作目录配置
 └── Python 环境
-    ├── vllm                          # 默认保留镜像版本，或安装指定版本
+    ├── vllm                          # 默认安装 0.27.1，或安装指定版本
     └── vllm-ascend                   # editable checkout，或指定的包版本
 ```
 
@@ -259,8 +260,8 @@ hajimi-vllm 容器
    跳过；工作目录不存在时进入配置的回退目录。
 5. 在容器内运行选定的 `install-vllm-ascend.sh`，并转发 checkout、代理、
    Python、包版本和 Python 镜像源参数。
-6. 如果传入 `--vllm-version`，安装器先以 `--no-deps` 强制安装指定的
-   vLLM 版本；未传时保留镜像已有版本。
+6. 安装器先以 `--no-deps` 强制安装 vLLM。默认版本为 `0.27.1`，可通过
+   `--vllm-version` 覆盖。
 7. 如果传入 `--vllm-ascend-version`，从 Python 镜像源安装指定版本；否则
    只清理选定 checkout 的 `csrc/output` 和 `csrc/build_out`，再执行 editable
    安装。

@@ -7,6 +7,8 @@
 
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 : "${NODE_RANK:?NODE_RANK must be set to 0, 1, 2, or 3}"
 : "${LOCAL_IP:?LOCAL_IP must be set to the IP owned by NIC_NAME}"
 : "${NODE0_IP:?NODE0_IP must be set to the node-0 IP}"
@@ -118,6 +120,8 @@ elif [[ "$ENABLE_MTP" != "0" ]]; then
     echo "ERROR: ENABLE_MTP must be 0 or 1; got '$ENABLE_MTP'." >&2
     exit 2
 fi
+
+bash "$script_dir/npu-cleaner.sh" all
 
 printf 'Launching node %s:' "$NODE_RANK"
 printf ' %q' "${cmd[@]}"

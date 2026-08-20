@@ -7,7 +7,7 @@ set -euo pipefail
 repo=/home/hajimi/qwen3.8/vllm-ascend/main
 proxy_file=/home/hajimi/proxy.sh
 python_bin=python3
-vllm_version=
+vllm_version=0.27.1
 vllm_ascend_version=
 pip_index_url=https://mirrors.aliyun.com/pypi/simple
 pytorch_index_url=https://download.pytorch.org/whl/cpu
@@ -20,7 +20,7 @@ usage() {
         "  --vllm-ascend-repo PATH          Checkout to install in editable mode" \
         "  --proxy-file PATH                Optional proxy script" \
         "  --python-bin PATH                Python executable" \
-        "  --vllm-version VERSION           Reinstall this vLLM version; omitted keeps the installed version" \
+        "  --vllm-version VERSION           vLLM version to reinstall (default: 0.27.1)" \
         "  --vllm-ascend-version VERSION    Install this package version instead of the checkout" \
         "  --pip-index-url URL              Primary Python package index" \
         "  --pytorch-index-url URL          Extra PyTorch package index" \
