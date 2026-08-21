@@ -78,6 +78,10 @@ class CheckpointLayerFilterTest(unittest.TestCase):
         self.assertIn("QWEN38_CHECKPOINT_LAYER_LIMIT=4", text)
         self.assertIn("qwen38_checkpoint_layer_filter", text)
         self.assertIn('"num_hidden_layers":4', text)
+        self.assertIn("QWEN38_ROPE_DISPATCH=GREEN", text)
+        self.assertIn(
+            "if isinstance(self.rotary_emb, AscendMRotaryEmbedding):", text
+        )
 
 
 if __name__ == "__main__":
