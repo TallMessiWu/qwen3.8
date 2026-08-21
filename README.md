@@ -6,7 +6,8 @@
 
 在 Linux 服务器执行下面整段命令。它会克隆或更新主仓，初始化 `vllm` 和
 `vllm-ascend/main`，配置只读的官方 `upstream`，并创建常驻的
-`vllm-ascend/upstream-main` worktree。
+`vllm-ascend/upstream-main` 与
+`vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text` worktree。
 
 ```bash
 set -euo pipefail
@@ -18,6 +19,8 @@ QWEN38_ROOT=/home/hajimi/qwen3.8
 VLLM_ASCEND_ROOT="${QWEN38_ROOT}/vllm-ascend"
 VLLM_ASCEND_MAIN="${VLLM_ASCEND_ROOT}/main"
 VLLM_ASCEND_UPSTREAM_MAIN="${VLLM_ASCEND_ROOT}/upstream-main"
+VLLM_ASCEND_JUNLIN_BRANCH=junlin-bugfix-modelslim-qwen35-moe-text
+VLLM_ASCEND_JUNLIN="${VLLM_ASCEND_ROOT}/${VLLM_ASCEND_JUNLIN_BRANCH}"
 VLLM_ASCEND_UPSTREAM_URL=https://github.com/vllm-project/vllm-ascend.git
 
 mkdir -p "$(dirname "${QWEN38_ROOT}")"
@@ -65,7 +68,27 @@ git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" branch \
   --set-upstream-to=upstream/main upstream-main
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" pull --ff-only --recurse-submodules
 
-for worktree in "${VLLM_ASCEND_MAIN}" "${VLLM_ASCEND_UPSTREAM_MAIN}"; do
+if git -C "${VLLM_ASCEND_JUNLIN}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "${VLLM_ASCEND_JUNLIN}" switch "${VLLM_ASCEND_JUNLIN_BRANCH}"
+elif git -C "${VLLM_ASCEND_MAIN}" show-ref --verify --quiet \
+  "refs/heads/${VLLM_ASCEND_JUNLIN_BRANCH}"; then
+  git -C "${VLLM_ASCEND_MAIN}" worktree add \
+    "${VLLM_ASCEND_JUNLIN}" "${VLLM_ASCEND_JUNLIN_BRANCH}"
+else
+  git -C "${VLLM_ASCEND_MAIN}" worktree add --track \
+    -b "${VLLM_ASCEND_JUNLIN_BRANCH}" "${VLLM_ASCEND_JUNLIN}" \
+    "origin/${VLLM_ASCEND_JUNLIN_BRANCH}"
+fi
+
+git -C "${VLLM_ASCEND_JUNLIN}" branch \
+  --set-upstream-to="origin/${VLLM_ASCEND_JUNLIN_BRANCH}" \
+  "${VLLM_ASCEND_JUNLIN_BRANCH}"
+git -C "${VLLM_ASCEND_JUNLIN}" pull --ff-only --recurse-submodules
+
+for worktree in \
+  "${VLLM_ASCEND_MAIN}" \
+  "${VLLM_ASCEND_UPSTREAM_MAIN}" \
+  "${VLLM_ASCEND_JUNLIN}"; do
   git -C "${worktree}" submodule sync --recursive
   git -C "${worktree}" submodule update --init --recursive
 done
@@ -74,13 +97,16 @@ git -C "${QWEN38_ROOT}" submodule status --recursive
 git -C "${VLLM_ASCEND_MAIN}" worktree list
 git -C "${VLLM_ASCEND_MAIN}" status -sb
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" status -sb
+git -C "${VLLM_ASCEND_JUNLIN}" status -sb
 git -C "${VLLM_ASCEND_MAIN}" submodule status --recursive
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" submodule status --recursive
+git -C "${VLLM_ASCEND_JUNLIN}" submodule status --recursive
 ```
 
-最后两个分支状态应分别显示 `main...origin/main` 和
-`upstream-main...upstream/main`。`upstream` 只用于 fetch/pull，不要向它
-push。
+三个分支状态应分别显示 `main...origin/main`、
+`upstream-main...upstream/main` 和
+`junlin-bugfix-modelslim-qwen35-moe-text...origin/junlin-bugfix-modelslim-qwen35-moe-text`。
+`upstream` 只用于 fetch/pull，不要向它 push。
 
 ## 创建 A5 容器
 
@@ -102,9 +128,10 @@ push。
   `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh`，可通过
   `--install-script` 覆盖。
 - editable 安装使用的 checkout 默认为
-  `/home/hajimi/qwen3.8/vllm-ascend/main`，可通过 `--vllm-ascend-repo`
-  覆盖。如果传入 `--vllm-ascend-version` 从镜像源安装指定包版本，则不要求
-  本地 checkout 存在。
+  `/home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text`，
+  可通过 `--vllm-ascend-repo` 覆盖。如果传入
+  `--vllm-ascend-version` 从镜像源安装指定包版本，则不要求本地 checkout
+  存在。
 - 代理脚本默认为 `/home/hajimi/proxy.sh`，可通过 `--proxy-file` 覆盖；选定
   的代理文件不存在时会直接跳过。
 - 交互 shell 的默认目录和回退目录可分别通过 `--shell-workdir` 和
@@ -154,7 +181,7 @@ bash scripts/install-vllm-ascend.sh --help
 | `--image` | 默认 vendor A5 镜像 |
 | `--container-name` | `hajimi-vllm` |
 | `--install-script` | `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh` |
-| `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/main` |
+| `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text` |
 | `--proxy-file` | `/home/hajimi/proxy.sh`，不存在时跳过 |
 | `--shell-workdir` | `/home/hajimi/qwen3.8/scripts` |
 | `--python-bin` | `python3` |
@@ -170,7 +197,7 @@ bash scripts/create-container.sh \
   --image vllm-ascend:custom-a5 \
   --container-name qwen38-test \
   --install-script /mnt/qwen3.8/scripts/install-vllm-ascend.sh \
-  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/main \
+  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text \
   --proxy-file /mnt/proxy.sh \
   --shell-workdir /mnt/qwen3.8/scripts \
   --shell-fallback-dir /mnt \
@@ -187,7 +214,7 @@ bash scripts/create-container.sh \
 ### 宿主机目录结构
 
 使用默认路径完成一键初始化后，关键目录结构如下。任务过程中额外创建的
-功能 worktree 不属于这个基础结构。
+其他功能 worktree 不属于这个基础结构。
 
 ```text
 /home/hajimi/
@@ -213,7 +240,9 @@ bash scripts/create-container.sh \
     ├── vllm/                        # 上游 vLLM submodule，只读参考
     └── vllm-ascend/
         ├── main/                    # 个人 fork submodule，跟踪 origin/main
-        └── upstream-main/           # 本地 worktree，跟踪 upstream/main
+        ├── upstream-main/           # 本地 worktree，跟踪 upstream/main
+        └── junlin-bugfix-modelslim-qwen35-moe-text/
+                                     # 默认容器使用，跟踪 origin 同名分支
 ```
 
 完成容器创建后，容器不会再复制一份源码，而是通过 bind mount 看到宿主机
@@ -245,7 +274,9 @@ hajimi-vllm 容器
    `upstream/main`。该远端只用于 fetch/pull。
 5. 创建或更新 `vllm-ascend/upstream-main` worktree，让它跟踪
    `upstream/main`，与个人 fork 的 `main` checkout 分开维护。
-6. 在两个 vLLM-Ascend worktree 中同步递归 submodule，最后打印 submodule、
+6. 创建或更新 `vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text`
+   worktree，让它跟踪个人 fork 的同名修复分支。
+7. 在三个 vLLM-Ascend worktree 中同步递归 submodule，最后打印 submodule、
    worktree 和分支状态，供人工确认初始化结果。
 
 ### 创建容器和安装包做了什么
