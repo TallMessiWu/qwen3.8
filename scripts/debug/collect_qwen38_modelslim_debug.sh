@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Collect only the data needed to distinguish the Qwen3.8 ModelSlim KeyError
-# hypotheses.  It deliberately avoids dumping the full environment because it
-# may contain proxy credentials or other secrets.
+# Collect only the data needed to diagnose Qwen3.8 ModelSlim startup failures.
+# It deliberately avoids dumping the full environment because it may contain
+# proxy credentials or other secrets.
 
 set -uo pipefail
 
@@ -29,14 +29,43 @@ echo "[package versions]"
 python3 -m pip show vllm vllm-ascend torch torch-npu 2>&1 || true
 
 echo "[active Python package paths]"
-python3 -c 'import importlib.util; [print(name + "=" + str(getattr(importlib.util.find_spec(name), "origin", None))) for name in ("vllm", "vllm_ascend")]' 2>&1 || true
+python3 -c '
+import importlib.util
 
-active_modelslim_source="$(python3 -c 'import importlib.util, pathlib; spec=importlib.util.find_spec("vllm_ascend"); print(pathlib.Path(spec.origin).parent / "quantization" / "modelslim_config.py" if spec and spec.origin else "")' 2>/dev/null || true)"
+for name in ("vllm", "vllm_ascend"):
+    spec = importlib.util.find_spec(name)
+    print(name + "=" + str(getattr(spec, "origin", None)))
+' 2>&1 || true
+
+active_vllm_ascend_root="$(python3 -c '
+import importlib.util
+import pathlib
+
+spec = importlib.util.find_spec("vllm_ascend")
+print(pathlib.Path(spec.origin).parent.parent if spec and spec.origin else "")
+' 2>/dev/null || true)"
+active_package_root="${active_vllm_ascend_root:+$active_vllm_ascend_root/vllm_ascend}"
+active_modelslim_source="${active_package_root:+$active_package_root/quantization/modelslim_config.py}"
+active_patch_source="${active_package_root:+$active_package_root/patch/worker/patch_qwen3_5.py}"
+echo "active_vllm_ascend_root=$active_vllm_ascend_root"
 echo "active_modelslim_source=$active_modelslim_source"
+echo "active_qwen3_5_patch_source=$active_patch_source"
+
+if [[ -n "$active_vllm_ascend_root" ]] && \
+    [[ -d "$active_vllm_ascend_root/.git" || -f "$active_vllm_ascend_root/.git" ]]; then
+    active_vllm_ascend_commit="$(git -C "$active_vllm_ascend_root" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
+    echo "active_vllm_ascend_commit=$active_vllm_ascend_commit"
+fi
 
 if [[ -z "$checkout_path" ]]; then
-    for candidate in /opt/vllm-ascend /home/hajimi/vllm-ascend /home/hajimi/vLLm-ascend; do
-        if [[ -d "$candidate/.git" || -f "$candidate/.git" ]]; then
+    for candidate in \
+        "$active_vllm_ascend_root" \
+        /home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text \
+        /home/hajimi/qwen3.8/vllm-ascend/main \
+        /opt/vllm-ascend \
+        /home/hajimi/vllm-ascend \
+        /home/hajimi/vLLm-ascend; do
+        if [[ -n "$candidate" && ( -d "$candidate/.git" || -f "$candidate/.git" ) ]]; then
             checkout_path="$candidate"
             break
         fi
@@ -48,6 +77,20 @@ if [[ -n "$checkout_path" && ( -d "$checkout_path/.git" || -f "$checkout_path/.g
     echo "checkout_path=$checkout_path"
     git -C "$checkout_path" rev-parse HEAD 2>&1 || true
     git -C "$checkout_path" status --short 2>&1 || true
+    for pin in .github/vllm-main-verified.commit .github/vllm-release-tag.commit; do
+        if [[ -r "$checkout_path/$pin" ]]; then
+            printf '%s=' "$pin"
+            tr -d '[:space:]' < "$checkout_path/$pin"
+            printf '\n'
+        fi
+    done
+    if [[ -n "$active_vllm_ascend_root" ]]; then
+        active_matches_checkout=false
+        if [[ "$(readlink -f "$active_vllm_ascend_root")" == "$(readlink -f "$checkout_path")" ]]; then
+            active_matches_checkout=true
+        fi
+        echo "active_matches_checkout=$active_matches_checkout"
+    fi
 else
     echo "checkout_path=NOT_FOUND"
 fi
@@ -79,14 +122,19 @@ checker_args=("$model_path")
 if [[ -n "$active_modelslim_source" && -r "$active_modelslim_source" ]]; then
     checker_args+=(--modelslim-source "$active_modelslim_source")
 fi
+if [[ -n "$active_patch_source" && -r "$active_patch_source" ]]; then
+    checker_args+=(--patch-source "$active_patch_source")
+fi
 python3 "$script_dir/check_qwen38_modelslim_metadata.py" "${checker_args[@]}"
 preflight_status=$?
 
 echo "preflight_exit_code=$preflight_status"
 if [[ "$preflight_status" -eq 0 ]]; then
-    echo "RESULT: static metadata contract passed. Return this report plus the complete first worker traceback."
+    echo "RESULT: static metadata and RoPE source contracts passed. " \
+        "Return this report plus the complete first worker traceback."
 else
-    echo "RESULT: static metadata contract failed. This report should identify the mismatched source or checkpoint key."
+    echo "RESULT: static contract failed. " \
+        "The report identifies the mismatched source, RoPE guard, or checkpoint key."
 fi
 echo "REPORT_SAVED=$report_path"
 exit "$preflight_status"

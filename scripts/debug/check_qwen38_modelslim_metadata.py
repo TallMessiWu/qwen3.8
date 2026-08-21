@@ -10,13 +10,18 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 
-EXPECTED_MODEL_TYPE = "qwen3_5_moe"
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5_moe", "qwen3_5_moe_text"})
 EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+MODEL_TYPE_GUARD = re.compile(r'if\s+"qwen3_5"\s+in\s+self\.config\.model_type\s*:')
+MROPE_TYPE_GUARD = re.compile(
+    r"isinstance\(\s*self\.rotary_emb\s*,\s*AscendMRotaryEmbedding\s*\)"
+)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -31,7 +36,7 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def read_packed_mapping(source_path: Path) -> dict[str, Any]:
+def read_packed_mapping(source_path: Path, model_types: set[str]) -> dict[str, Any]:
     try:
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     except (FileNotFoundError, SyntaxError) as exc:
@@ -49,7 +54,8 @@ def read_packed_mapping(source_path: Path) -> dict[str, Any]:
                 raise ValueError("packed_modules_model_mapping is not a dictionary literal")
             # The full mapping contains a few entries that reference shared
             # constants. Evaluate literal entries independently so those
-            # unrelated names do not prevent inspection of qwen3_5_moe.
+            # unrelated names do not prevent inspection of the active Qwen3.5
+            # architecture alias.
             mapping: dict[str, Any] = {}
             for key_node, value_node in zip(value.keys, value.values):
                 if key_node is None:
@@ -58,16 +64,48 @@ def read_packed_mapping(source_path: Path) -> dict[str, Any]:
                     key = ast.literal_eval(key_node)
                 except (ValueError, TypeError):
                     continue
-                if key != EXPECTED_MODEL_TYPE:
+                if key not in model_types:
                     continue
                 try:
                     mapping[key] = ast.literal_eval(value_node)
                 except (ValueError, TypeError) as exc:
-                    raise ValueError(
-                        f"{EXPECTED_MODEL_TYPE} packed mapping is not a literal in {source_path}"
-                    ) from exc
+                    raise ValueError(f"{key} packed mapping is not a literal in {source_path}") from exc
             return mapping
     raise ValueError(f"packed_modules_model_mapping not found in {source_path}")
+
+
+def read_rope_patch_contract(source_path: Path) -> tuple[bool, bool, bool]:
+    try:
+        source = source_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(f"missing active Qwen3.5 patch source: {source_path}") from exc
+
+    return (
+        bool(MODEL_TYPE_GUARD.search(source)),
+        bool(MROPE_TYPE_GUARD.search(source)),
+        "self.rotary_emb.mrope_section" in source,
+    )
+
+
+def rope_contract_error(
+    model_type: object,
+    rope_parameters: dict[str, Any],
+    patch_contract: tuple[bool, bool, bool],
+) -> str | None:
+    if not isinstance(model_type, str) or "qwen3_5" not in model_type:
+        return None
+    if "mrope_section" in rope_parameters:
+        return None
+
+    uses_model_type_guard, uses_mrope_type_guard, dereferences_mrope_section = patch_contract
+    if dereferences_mrope_section and uses_model_type_guard and not uses_mrope_type_guard:
+        return (
+            "Qwen3.5 patch selects the M-RoPE fused path from model_type, but this model's "
+            "rope_parameters has no mrope_section; runtime AscendRotaryEmbedding will raise AttributeError"
+        )
+    if dereferences_mrope_section and not uses_mrope_type_guard:
+        return "cannot find an AscendMRotaryEmbedding type guard around the mrope_section access"
+    return None
 
 
 def find_layer_zero_expert_triplets(keys: set[str]) -> list[tuple[str, ...]]:
@@ -109,7 +147,7 @@ def check_weight_index(model_path: Path, failures: list[str]) -> None:
             failures.append(f"{index_path.name} references {len(missing)} missing shards; first={missing[0]}")
 
 
-def run_check(model_path: Path, modelslim_source: Path | None) -> int:
+def run_check(model_path: Path, modelslim_source: Path | None, patch_source: Path | None) -> int:
     failures: list[str] = []
     print(f"model_path={model_path.resolve()}")
 
@@ -123,15 +161,28 @@ def run_check(model_path: Path, modelslim_source: Path | None) -> int:
     text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
     text_model_type = text_config.get("model_type")
     architectures = config.get("architectures")
+    effective_text_config = text_config or config
+    rope_parameters = effective_text_config.get("rope_parameters")
+    if not isinstance(rope_parameters, dict):
+        rope_parameters = {}
     print(f"config.model_type={top_model_type!r}")
     print(f"config.text_config.model_type={text_model_type!r}")
     print(f"config.architectures={architectures!r}")
     print(f"config.quantization_config={config.get('quantization_config')!r}")
+    print(f"effective_text_config.rope_parameters={json.dumps(rope_parameters, sort_keys=True)}")
+    print(
+        "predicted_rotary_embedding="
+        + ("AscendMRotaryEmbedding" if "mrope_section" in rope_parameters else "AscendRotaryEmbedding")
+    )
 
-    if EXPECTED_MODEL_TYPE not in {top_model_type, text_model_type}:
+    observed_model_types = {
+        model_type for model_type in (top_model_type, text_model_type) if model_type in SUPPORTED_MODEL_TYPES
+    }
+    selected_model_type = top_model_type if top_model_type in SUPPORTED_MODEL_TYPES else text_model_type
+    if not observed_model_types:
         failures.append(
-            f"neither top-level nor text_config model_type is {EXPECTED_MODEL_TYPE!r}; "
-            "the Qwen3.5 MoE packed mapping may not be selected"
+            "neither top-level nor text_config model_type is a supported Qwen3.5 MoE alias; "
+            f"expected one of {sorted(SUPPORTED_MODEL_TYPES)!r}"
         )
 
     try:
@@ -163,15 +214,31 @@ def run_check(model_path: Path, modelslim_source: Path | None) -> int:
     else:
         print(f"active_modelslim_source={modelslim_source.resolve()}")
         try:
-            packed_mapping = read_packed_mapping(modelslim_source)
-            qwen_mapping = packed_mapping.get(EXPECTED_MODEL_TYPE)
-            print(f"active_qwen3_5_moe_mapping={qwen_mapping!r}")
+            packed_mapping = read_packed_mapping(modelslim_source, observed_model_types)
+            qwen_mapping = packed_mapping.get(selected_model_type)
+            print(f"selected_model_type={selected_model_type!r}")
+            print(f"active_selected_model_mapping={qwen_mapping!r}")
             expected_experts = [f"experts.0.{projection}" for projection in EXPERT_PROJECTIONS]
             if not isinstance(qwen_mapping, dict) or qwen_mapping.get("experts") != expected_experts:
                 failures.append(
                     "active ModelSlim source lacks the required "
-                    f"packed_modules_model_mapping[{EXPECTED_MODEL_TYPE!r}]['experts'] mapping"
+                    f"packed_modules_model_mapping[{selected_model_type!r}]['experts'] mapping"
                 )
+        except ValueError as exc:
+            failures.append(str(exc))
+
+    if patch_source is None:
+        failures.append("active vllm_ascend/patch/worker/patch_qwen3_5.py was not supplied")
+    else:
+        print(f"active_qwen3_5_patch_source={patch_source.resolve()}")
+        try:
+            patch_contract = read_rope_patch_contract(patch_source)
+            print(f"patch.uses_model_type_guard={patch_contract[0]}")
+            print(f"patch.uses_mrope_type_guard={patch_contract[1]}")
+            print(f"patch.dereferences_mrope_section={patch_contract[2]}")
+            error = rope_contract_error(selected_model_type, rope_parameters, patch_contract)
+            if error is not None:
+                failures.append(error)
         except ValueError as exc:
             failures.append(str(exc))
 
@@ -197,6 +264,18 @@ def self_test() -> int:
     bad = good - {f"{prefix}down_proj.weight"}
     assert len(find_layer_zero_expert_triplets(good)) == 1
     assert find_layer_zero_expert_triplets(bad) == []
+
+    regular_rope = {"rope_type": "default", "rope_theta": 10_000_000}
+    mrope = {**regular_rope, "mrope_section": [11, 11, 10]}
+    unsafe_patch = (True, False, True)
+    guarded_patch = (False, True, True)
+    unsafe_error = rope_contract_error("qwen3_5_moe_text", regular_rope, unsafe_patch)
+    guarded_error = rope_contract_error("qwen3_5_moe_text", regular_rope, guarded_patch)
+    assert unsafe_error is not None
+    assert guarded_error is None
+    assert rope_contract_error("qwen3_5_moe_text", mrope, unsafe_patch) is None
+    print(f"SELF_TEST_UNSAFE=RED reason={unsafe_error}")
+    print("SELF_TEST_GUARDED=GREEN")
     print("SELF_TEST=PASS")
     return 0
 
@@ -205,6 +284,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path", nargs="?", type=Path)
     parser.add_argument("--modelslim-source", type=Path)
+    parser.add_argument("--patch-source", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if not args.self_test and args.model_path is None:
@@ -216,7 +296,7 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         return self_test()
-    return run_check(args.model_path, args.modelslim_source)
+    return run_check(args.model_path, args.modelslim_source, args.patch_source)
 
 
 if __name__ == "__main__":

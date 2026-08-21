@@ -12,9 +12,9 @@ This file provides guidance to coding agents (Claude Code, Codex CLI, …) when 
 
 1. **`vllm/` 是只读参考。** 上游 vLLM 的克隆，用来查源码、确认被 patch 的函数签名与调用点。不要修改、不要提交、不要推送。需要改上游行为时，在 `vllm-ascend` 里写 patch。
 2. **本机没有 NPU，跑不了推理。** 本机只能写代码、读代码、做静态分析。有一块 5080 GPU，可以跑纯 PyTorch 的小脚本做数值等价性 / 算法逻辑的模拟验证（不能 import `torch_npu`）。
-3. **验证闭环靠脚本。** 需要在真机验证时，把可复现的脚本写进 `scripts/`，推送到主仓，由用户在服务器上拉取执行并把结果回传。脚本要自带打印/断言，输出要能直接贴回来判读，不要依赖交互式输入。
+3. **验证闭环靠脚本。** 需要在真机确认权重、代码、环境或其他本机拿不到的信息时，优先把聚焦、非交互式的诊断脚本写进 `scripts/debug/`；其他真机验证脚本写进 `scripts/`。脚本要自带打印/断言和明确的 RED/GREEN 判据，输出能直接回传判读，并避免打印凭据、加载无关权重或占用 NPU，除非该验证阶段确实需要。
 4. **推送只走自己的 fork。** `vllm-ascend` 的 `origin` 是本人的 fork（`TallMessiWu/vllm-ascend`，可自由推送），`upstream` 是上游官方仓（`vllm-project/vllm-ascend`）——upstream 只 fetch，永远不 push。注意这个 fork 是 public 的（fork 公开仓无法转为 private），推上去的内容对外可见。
-5. **不要主动 push。** 提交后停下，由用户决定推送时机。
+5. **修改完成后直接提交并推送。** 在完成范围内验证后，直接生成提交信息、提交并使用普通 `git push` 推送当前分支，无需先向用户确认提交信息；主仓和子仓有改动时分别在各自仓库提交、推送。除非用户当次明确要求，永远禁止 `--force-with-lease` 和其他强推方式；普通推送被拒绝时停下并报告，不要自行改用强推。
 
 ## 目录结构
 
@@ -85,7 +85,7 @@ pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
 
 ## 提交规范
 
-**每次提交都用 `/gitmoji-commit` 技能**（已复制到 `.agents/skills/gitmoji-commit/`）：中文 subject、`<emoji-code> <type>(<scope>): <subject>` 格式、执行前先展示命令请用户确认、只 commit 不 push。主仓和子仓的提交都走它。
+**每次提交都用 `/gitmoji-commit` 技能**（已复制到 `.agents/skills/gitmoji-commit/`）：中文 subject、`<emoji-code> <type>(<scope>): <subject>` 格式。无需展示命令或等待用户确认，生成后直接提交；完成验证后再使用普通 `git push` 推送。主仓和子仓的提交都走它。
 
 vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，**提交必须带 sign-off**——把 `-s` 加进 gitmoji 技能生成的命令里：
 
