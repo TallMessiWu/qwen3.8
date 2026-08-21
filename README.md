@@ -231,12 +231,14 @@ bash scripts/create-container.sh \
     ├── pics/                        # 架构页面使用的图片
     ├── qwen3.8-architecture.html
     ├── scripts/
+    │   ├── README.md                # 运行时辅助和本地测试说明
     │   ├── create-container.sh      # 宿主机容器创建入口
     │   ├── install-vllm-ascend.sh   # 容器内 Python 包安装入口
     │   ├── 27B.sh                   # 单机服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
     │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
-    │   └── debug/                   # 裁层加载辅助与脚本回归测试
+    │   ├── runtime/                 # 裁层 checkpoint 运行时过滤器
+    │   └── tests/                   # 脚本静态回归测试
     ├── vllm/                        # 上游 vLLM submodule，只读参考
     └── vllm-ascend/
         ├── main/                    # 个人 fork submodule，跟踪 origin/main

@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-FILTER_DIR = Path(__file__).with_name("qwen38_checkpoint_layer_filter")
+FILTER_DIR = (
+    Path(__file__).parents[1] / "runtime" / "qwen38_checkpoint_layer_filter"
+)
 sys.path.insert(0, str(FILTER_DIR))
 
 import checkpoint_layer_filter  # noqa: E402
@@ -76,7 +78,7 @@ class CheckpointLayerFilterTest(unittest.TestCase):
         text = launcher.read_text(encoding="utf-8")
 
         self.assertIn("QWEN38_CHECKPOINT_LAYER_LIMIT=4", text)
-        self.assertIn("qwen38_checkpoint_layer_filter", text)
+        self.assertIn("runtime/qwen38_checkpoint_layer_filter", text)
         self.assertIn('"num_hidden_layers":4', text)
         self.assertIn("QWEN38_ROPE_DISPATCH=GREEN", text)
         self.assertIn(

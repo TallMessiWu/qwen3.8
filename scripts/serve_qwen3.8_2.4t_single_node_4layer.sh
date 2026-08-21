@@ -7,7 +7,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-layer_filter_dir="${script_dir}/debug/qwen38_checkpoint_layer_filter"
+layer_filter_dir="${script_dir}/runtime/qwen38_checkpoint_layer_filter"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"

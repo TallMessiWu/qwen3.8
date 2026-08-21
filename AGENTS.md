@@ -123,6 +123,6 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。功能分支按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、裁层加载辅助和服务器验证资产，不要把这些脚本误判成插件侧适配实现。
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。功能分支按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。
