@@ -8,11 +8,10 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 layer_filter_dir="${script_dir}/debug/qwen38_checkpoint_layer_filter"
-# shellcheck source=hajimi-port.sh
-source "$script_dir/hajimi-port.sh"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
+VLLM_PORT="${VLLM_PORT:-6969}"
 
 if [[ ! -r "$MODEL_PATH/config.json" ]]; then
     echo "ERROR: missing or unreadable $MODEL_PATH/config.json" >&2

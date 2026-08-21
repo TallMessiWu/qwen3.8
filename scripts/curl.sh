@@ -2,14 +2,11 @@
 
 set -euo pipefail
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=hajimi-port.sh
-source "$script_dir/hajimi-port.sh"
-
 IMAGE_PROMPT='请客观描述这张图片的内容，包括场景、主要主体、主体特征、动作以及主体之间的位置关系。不要编造图片中不可见的信息。'
 
 BASE_DIR="${BASE_DIR:-/home/hajimi/qwen3.8/pics}"
 IMAGE_SERVER_PORT="${IMAGE_SERVER_PORT:-6666}"
+VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8-smoke}"
 CHAT_URL="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions"
 SERVER_PID=

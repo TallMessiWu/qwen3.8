@@ -8,8 +8,6 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=hajimi-port.sh
-source "$script_dir/hajimi-port.sh"
 
 : "${NODE_RANK:?NODE_RANK must be set to 0, 1, 2, or 3}"
 : "${LOCAL_IP:?LOCAL_IP must be set to the IP owned by NIC_NAME}"
@@ -26,6 +24,7 @@ esac
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 NIC_NAME="${NIC_NAME:-enp35s0f2}"
+VLLM_PORT="${VLLM_PORT:-6969}"
 DP_RPC_PORT="${DP_RPC_PORT:-13389}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-4}"

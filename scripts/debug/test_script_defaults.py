@@ -14,15 +14,13 @@ PORT_CONSUMERS = (
 
 
 class ScriptDefaultsTest(unittest.TestCase):
-    def test_vllm_port_consumers_use_shared_default(self):
-        port_script = (SCRIPTS_DIR / "hajimi-port.sh").read_text(encoding="utf-8")
-        self.assertIn('export VLLM_PORT="${VLLM_PORT:-6969}"', port_script)
-
+    def test_vllm_port_consumers_default_to_6969(self):
+        self.assertFalse((SCRIPTS_DIR / "hajimi-port.sh").exists())
         for name in PORT_CONSUMERS:
             with self.subTest(script=name):
                 text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
-                self.assertIn('source "$script_dir/hajimi-port.sh"', text)
-                self.assertNotIn('VLLM_PORT="${VLLM_PORT:-8000}"', text)
+                self.assertIn('VLLM_PORT="${VLLM_PORT:-6969}"', text)
+                self.assertNotIn("hajimi-port.sh", text)
 
     def test_four_node_launcher_defaults_to_original_bf16_checkpoint(self):
         launcher = SCRIPTS_DIR / "serve_qwen3.8_2.4t_4node.sh"

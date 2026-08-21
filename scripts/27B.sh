@@ -6,8 +6,6 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cleaner_path="$script_dir/npu-cleaner.sh"
-# shellcheck source=hajimi-port.sh
-source "$script_dir/hajimi-port.sh"
 
 if [[ "$#" -gt 0 ]]; then
     old_ifs="$IFS"
@@ -48,6 +46,7 @@ if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
 fi
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
+VLLM_PORT="${VLLM_PORT:-6969}"
 
 exec vllm serve "$MODEL_PATH" \
     --served-model-name qwen3.8 \
