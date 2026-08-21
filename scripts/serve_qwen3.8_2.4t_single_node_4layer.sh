@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Single-node 8-NPU launcher for a four-layer Qwen3.8-2.4T smoke test.
+# Single-node 8-NPU launcher for a four-layer Qwen3.8-2.4T weight smoke test.
 #
-# This uses random BF16 weights and does not validate the W8A8 checkpoint,
-# ModelSlim metadata, or multi-node communication.
+# This loads the original BF16 checkpoint. It does not validate the W8A8
+# checkpoint, ModelSlim metadata, or multi-node communication.
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-w8a8}"
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
@@ -33,7 +33,7 @@ cmd=(
     --served-model-name qwen3.8-smoke
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
-    --load-format dummy
+    --safetensors-load-strategy lazy
     --dtype bfloat16
     --tensor-parallel-size 8
     --enable-expert-parallel
