@@ -32,3 +32,25 @@ To test the checker itself without model weights:
 ```bash
 python3 scripts/debug/check_qwen38_modelslim_metadata.py --self-test
 ```
+
+## Recover an exception masked by NPU tensor formatting
+
+If a worker traceback ends in `torch/_tensor_str.py` with an unsupported
+`torch.cat`, the failure may have happened while Python was formatting a tensor
+contained in an earlier exception. The debug wrapper below renders every tensor
+as metadata only, without reading its payload, so the original exception can be
+logged.
+
+Run the normal four-node launch through the wrapper, changing `node_id` on each
+node as usual:
+
+```bash
+cd /home/hajimi/qwen3.8
+node_id=0
+bash scripts/debug/run_with_safe_tensor_repr.sh \
+  bash "scripts/2.4T-${node_id}.sh" \
+  2>&1 | tee "scripts/debug/output/qwen38-node${node_id}-safe-repr.log"
+```
+
+This is a diagnosis-only launcher. Running the original `2.4T-*.sh` scripts
+directly restores the normal tensor representation.
