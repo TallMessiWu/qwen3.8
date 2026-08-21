@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Common launcher for Qwen3.8-2.4T-A95B-W8A8 on four 8-NPU nodes.
+# Common launcher for the original BF16 Qwen3.8-2.4T-A95B checkpoint on four 8-NPU nodes.
 #
 # Machine-specific wrappers are 2.4T-0.sh through 2.4T-3.sh.  Keep MTP off
 # until the base model has loaded successfully; enable it later with
@@ -8,6 +8,8 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hajimi-port.sh
+source "$script_dir/hajimi-port.sh"
 
 : "${NODE_RANK:?NODE_RANK must be set to 0, 1, 2, or 3}"
 : "${LOCAL_IP:?LOCAL_IP must be set to the IP owned by NIC_NAME}"
@@ -21,10 +23,9 @@ case "$NODE_RANK" in
         ;;
 esac
 
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-w8a8}"
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 NIC_NAME="${NIC_NAME:-enp35s0f2}"
-VLLM_PORT="${VLLM_PORT:-8000}"
 DP_RPC_PORT="${DP_RPC_PORT:-13389}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-4}"
@@ -48,11 +49,6 @@ if [[ ! -r "$MODEL_PATH/config.json" ]]; then
     echo "ERROR: missing or unreadable $MODEL_PATH/config.json" >&2
     exit 2
 fi
-if [[ ! -r "$MODEL_PATH/quant_model_description.json" ]]; then
-    echo "ERROR: --quantization ascend requires $MODEL_PATH/quant_model_description.json" >&2
-    exit 2
-fi
-
 if command -v ip >/dev/null 2>&1; then
     if ! ip -o -4 addr show dev "$NIC_NAME" 2>/dev/null | grep -Fq " $LOCAL_IP/"; then
         echo "ERROR: NIC_NAME=$NIC_NAME does not own LOCAL_IP=$LOCAL_IP inside this container." >&2
@@ -92,8 +88,8 @@ cmd=(
     --served-model-name qwen3.8
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
-    --quantization ascend
     --safetensors-load-strategy lazy
+    --dtype bfloat16
     --tensor-parallel-size "$TP_SIZE"
     --data-parallel-size "$DP_SIZE"
     --data-parallel-size-local 1
