@@ -236,7 +236,7 @@ bash scripts/create-container.sh \
     │   ├── 27B.sh                   # 单机服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
     │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
-    │   └── debug/                   # ModelSlim 等诊断脚本
+    │   └── debug/                   # 裁层加载辅助与脚本回归测试
     ├── vllm/                        # 上游 vLLM submodule，只读参考
     └── vllm-ascend/
         ├── main/                    # 个人 fork submodule，跟踪 origin/main
