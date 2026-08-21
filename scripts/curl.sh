@@ -1,118 +1,125 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 IMAGE_PROMPT='请客观描述这张图片的内容，包括场景、主要主体、主体特征、动作以及主体之间的位置关系。不要编造图片中不可见的信息。'
 
-##########################################################################################
+BASE_DIR="${BASE_DIR:-/home/hajimi/qwen3.8/pics}"
+IMAGE_SERVER_PORT="${IMAGE_SERVER_PORT:-6666}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+MODEL_NAME="${MODEL_NAME:-qwen3.8-smoke}"
+CHAT_URL="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions"
+SERVER_PID=
 
-# 1. 定义本地图片路径
-IMAGE_PATH="/home/hajimi/qwen3.8/pics/outdoor-courtyard.png"
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "[System] 清理后台 HTTP 服务 (PID: $SERVER_PID)..."
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    exit "$status"
+}
 
-# 2. 将本地图片转换为 Base64 编码（去除换行符）
-# 注意冷知识：Linux 系统使用 base64 -w 0，而 macOS 系统必须使用 base64 -b 0 或 base64 -i
-IMAGE_B64=$(base64 -w 0 "$IMAGE_PATH")
+trap cleanup EXIT INT TERM
 
-# 3. 构造 PNG Data URI
-DATA_URI="data:image/png;base64,${IMAGE_B64}"
+for image_name in outdoor-courtyard.png indoor-kitchen.png; do
+    if [[ ! -r "${BASE_DIR}/${image_name}" ]]; then
+        echo "ERROR: missing or unreadable image ${BASE_DIR}/${image_name}" >&2
+        exit 2
+    fi
+done
 
-# 使用 jq 构造安全的 JSON Payload
-PAYLOAD=$(jq -n \
-  --arg prompt "$IMAGE_PROMPT" \
-  --arg uri "$DATA_URI" \
-  '{
-    temperature: 0,
-    top_p: 0.95,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: $prompt },
-          { type: "image_url", image_url: { url: $uri } }
-        ]
-      }
-    ]
-  }')
+echo "[System] 正在启动本地 HTTP 静态文件服务 (端口: $IMAGE_SERVER_PORT)..."
+python3 -m http.server "$IMAGE_SERVER_PORT" --directory "$BASE_DIR" >/dev/null 2>&1 &
+SERVER_PID=$!
 
-# 发送请求
-curl http://127.0.0.1:${VLLM_PORT}/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
+image_server_ready=0
+for _ in {1..20}; do
+    if curl -fsS "http://127.0.0.1:${IMAGE_SERVER_PORT}/outdoor-courtyard.png" -o /dev/null 2>/dev/null; then
+        image_server_ready=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ "$image_server_ready" -ne 1 ]]; then
+    echo "ERROR: local image server did not become ready on port $IMAGE_SERVER_PORT" >&2
+    exit 2
+fi
+echo "[System] 本地 HTTP 服务已就绪！"
 
-echo -e "\n"
+send_image_request() {
+    local label="$1"
+    local image_name="$2"
+    local IMAGE_URL="http://127.0.0.1:${IMAGE_SERVER_PORT}/${image_name}"
 
+    echo "[$label] 正在发送图片 ${image_name} ..."
+    jq -n \
+        --arg model "$MODEL_NAME" \
+        --arg prompt "$IMAGE_PROMPT" \
+        --arg uri "$IMAGE_URL" \
+        '{
+          model: $model,
+          temperature: 0,
+          top_p: 0.95,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: $prompt },
+                { type: "image_url", image_url: { url: $uri } }
+              ]
+            }
+          ]
+        }' | curl -sS "$CHAT_URL" \
+        -H "Content-Type: application/json" \
+        --data-binary @-
+    printf '\n\n'
+    sleep 2
+}
+
+send_image_request "Test 1" "outdoor-courtyard.png"
+send_image_request "Test 2" "indoor-kitchen.png"
+
+echo "[Test 3] 正在发送纯文本请求 1 (身份问答) ..."
+jq -n \
+    --arg model "$MODEL_NAME" \
+    '{
+      model: $model,
+      temperature: 0,
+      top_p: 0.95,
+      min_p: 0,
+      messages: [
+        {
+          role: "user",
+          content: "你好啊？你叫什么名字？"
+        }
+      ]
+    }' | curl -sS "$CHAT_URL" \
+    -H "Content-Type: application/json" \
+    --data-binary @-
+
+printf '\n\n'
 sleep 2
 
-##########################################################################################
+echo "[Test 4] 正在发送纯文本请求 2 (JoJo 知识问答) ..."
+jq -n \
+    --arg model "$MODEL_NAME" \
+    '{
+      model: $model,
+      temperature: 0,
+      max_tokens: 500,
+      top_p: 0.95,
+      min_p: 0,
+      messages: [
+        {
+          role: "user",
+          content: "解释一下JoJo的奇妙冒险里面败者食尘能力是什么。"
+        }
+      ]
+    }' | curl -sS "$CHAT_URL" \
+    -H "Content-Type: application/json" \
+    --data-binary @-
 
-# 1. 定义本地图片路径
-IMAGE_PATH="/home/hajimi/qwen3.8/pics/indoor-kitchen.png"
-
-# 2. 将本地图片转换为 Base64 编码（去除换行符）
-# 注意冷知识：Linux 系统使用 base64 -w 0，而 macOS 系统必须使用 base64 -b 0 或 base64 -i
-IMAGE_B64=$(base64 -w 0 "$IMAGE_PATH")
-
-# 3. 构造 PNG Data URI
-DATA_URI="data:image/png;base64,${IMAGE_B64}"
-
-# 使用 jq 构造安全的 JSON Payload
-PAYLOAD=$(jq -n \
-  --arg prompt "$IMAGE_PROMPT" \
-  --arg uri "$DATA_URI" \
-  '{
-    temperature: 0,
-    top_p: 0.95,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: $prompt },
-          { type: "image_url", image_url: { url: $uri } }
-        ]
-      }
-    ]
-  }')
-
-# 发送请求
-curl http://127.0.0.1:${VLLM_PORT}/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
-
-echo -e "\n"
-
-sleep 2
-
-##########################################################################################
-
-curl http://127.0.0.1:${VLLM_PORT}/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "temperature": 0,
-    "top_p": 0.95,
-    "min_p": 0,
-    "messages": [
-      {
-        "role": "user",
-        "content": "你好啊？你叫什么名字？"
-      }
-    ]
-  }'
-
-echo -e "\n"
-
-sleep 2
-
-##########################################################################################
-
-curl http://127.0.0.1:${VLLM_PORT}/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "temperature": 0,
-    "max_tokens": 500,
-    "top_p": 0.95,
-    "min_p": 0,
-    "messages": [
-      {
-        "role": "user",
-        "content": "解释一下JoJo的奇妙冒险里面败者食尘能力是什么。"
-      }
-    ]
-  }'
+printf '\n'
