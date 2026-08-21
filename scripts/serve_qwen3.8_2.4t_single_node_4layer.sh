@@ -42,7 +42,7 @@ cmd=(
     --max-num-seqs 1
     --max-num-batched-tokens 2048
     --gpu-memory-utilization 0.80
-    --enforce-eager
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
     --seed 1024
     --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":false,"enable_fused_mc2":false}'
 )
