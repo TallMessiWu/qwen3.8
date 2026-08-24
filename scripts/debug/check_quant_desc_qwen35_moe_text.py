@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Verify a ModelSlim quant description against the qwen3_5_moe_text mapping fix.
+
+Context: loading the mxfp8 2.4T checkpoint failed with
+KeyError('model.layers.0.mlp.experts.weight') because
+vllm_ascend/quantization/modelslim_config.py had no packed-module mapping for
+model_type "qwen3_5_moe_text" (fix mirrors vllm-ascend PR #14238).
+
+This script re-runs, offline, the exact lookup vLLM Ascend performs at load
+time with the fixed mapping table:
+  1. config.json model_type must be covered by the mapping table.
+  2. Every ".weight" key in quant_model_description.json must resolve through
+     the packed-shard lookup (all shards present, consistent quant type;
+     FLOAT counts as a valid "skip quantization").
+  3. Required lookups (embed_tokens, lm_head, layer-0 MoE modules) must
+     succeed even if the description omitted them entirely.
+  4. Expert coverage per layer must match config.json (num_experts and
+     num_hidden_layers).
+
+Pure stdlib, read-only, no torch/vllm import, never touches the NPU.
+Usage: python3 check_quant_desc_qwen35_moe_text.py [MODEL_PATH]
+Final line is [GREEN] (exit 0) or [RED] (exit 1).
+"""
+
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+DEFAULT_MODEL_PATH = "/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8"
+
+# Mirrors packed_modules_model_mapping["qwen3_5_moe_text"] after the fix.
+PACKED = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+}
+MAPPED_MODEL_TYPES = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+
+# register_scheme() snapshot from vllm_ascend/quantization/methods/ on the
+# junlin-bugfix-modelslim-qwen35-moe-text branch.
+MOE_SCHEMES = {
+    "W4A16", "W4A16_MXFP4", "W4A4_MXFP4", "W4A8_DYNAMIC", "W4A8_MXFP",
+    "W8A8FP8_DYNAMIC", "W8A8_DYNAMIC", "W8A8_MXFP8",
+}
+
+SHARD_TO_FUSED = {}
+for fused, shards in PACKED.items():
+    if fused == "experts":
+        continue
+    for shard in shards:
+        SHARD_TO_FUSED[shard] = fused
+
+EXPERT_SHARDS = ("gate_proj", "up_proj", "down_proj")
+
+
+def reduce_to_query_prefix(weight_key):
+    """Map one description key to the module prefix vLLM queries for it."""
+    name = weight_key[: -len(".weight")]
+    parts = name.split(".")
+    if (
+        len(parts) >= 3
+        and parts[-3] == "experts"
+        and parts[-2].isdigit()
+        and parts[-1] in EXPERT_SHARDS
+    ):
+        return ".".join(parts[:-2])
+    if parts[-1] in SHARD_TO_FUSED:
+        return ".".join(parts[:-1] + [SHARD_TO_FUSED[parts[-1]]])
+    return name
+
+
+def lookup(desc, prefix):
+    """Replicates get_linear_quant_type() with the fixed mapping.
+
+    Returns (status, detail): status in {"quant", "float", "missing", "mixed"}.
+    """
+    proj_name = prefix.split(".")[-1]
+    if proj_name in PACKED:
+        quant_type = None
+        for shard_proj_name in PACKED[proj_name]:
+            shard_key = prefix.replace(proj_name, shard_proj_name) + ".weight"
+            if shard_key not in desc:
+                return "missing", shard_key
+            shard_type = desc[shard_key]
+            if quant_type is None:
+                quant_type = shard_type
+            elif shard_type != quant_type:
+                return "mixed", f"{shard_key}={shard_type} vs {quant_type}"
+        return ("float", quant_type) if quant_type == "FLOAT" else ("quant", quant_type)
+    key = prefix + ".weight"
+    if key not in desc:
+        return "missing", key
+    value = desc[key]
+    return ("float", value) if value == "FLOAT" else ("quant", value)
+
+
+def main():
+    model_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL_PATH)
+    problems = []
+    warnings = []
+
+    config = json.loads((model_path / "config.json").read_text())
+    text_config = config.get("text_config") or {}
+    model_type = config.get("model_type")
+    print(f"config.json model_type={model_type!r} architectures={config.get('architectures')}")
+    if text_config:
+        print(f"  nested text_config.model_type={text_config.get('model_type')!r}")
+    num_layers = config.get("num_hidden_layers") or text_config.get("num_hidden_layers")
+    num_experts = config.get("num_experts") or text_config.get("num_experts")
+    print(f"  num_hidden_layers={num_layers} num_experts={num_experts}")
+    if model_type not in MAPPED_MODEL_TYPES:
+        problems.append(
+            f"model_type {model_type!r} is NOT in packed_modules_model_mapping "
+            f"({sorted(MAPPED_MODEL_TYPES)}) — the fix does not cover this checkpoint"
+        )
+
+    desc = json.loads((model_path / "quant_model_description.json").read_text())
+    weight_keys = [k for k in desc if k.endswith(".weight")]
+    print(f"\nquant_model_description.json: {len(desc)} keys, {len(weight_keys)} '.weight' keys")
+    print(f"  value distribution: {dict(Counter(desc.values()))}")
+
+    patterns = Counter()
+    for key in desc:
+        parts = []
+        for part in key.split("."):
+            parts.append("*" if part.isdigit() else part)
+        patterns[".".join(parts)] += 1
+    print(f"  {len(patterns)} distinct key patterns:")
+    for pattern, count in sorted(patterns.items()):
+        print(f"    {count:6d}  {pattern}")
+
+    # Reverse pass: every description weight key must resolve via the fixed lookup.
+    prefixes = sorted({reduce_to_query_prefix(k) for k in weight_keys})
+    by_status = defaultdict(list)
+    quant_types_seen = Counter()
+    for prefix in prefixes:
+        status, detail = lookup(desc, prefix)
+        by_status[status].append((prefix, detail))
+        if status == "quant":
+            quant_types_seen[detail] += 1
+    print(
+        f"\nlookup over {len(prefixes)} module prefixes: "
+        f"{len(by_status['quant'])} quantized, {len(by_status['float'])} FLOAT-skipped, "
+        f"{len(by_status['missing'])} missing shards, {len(by_status['mixed'])} mixed types"
+    )
+    print(f"  quant types resolved: {dict(quant_types_seen)}")
+    for status in ("missing", "mixed"):
+        for prefix, detail in by_status[status][:20]:
+            problems.append(f"{status}: prefix {prefix!r} -> {detail}")
+        if len(by_status[status]) > 20:
+            problems.append(f"... {len(by_status[status]) - 20} more {status} prefixes")
+
+    non_model = [p for p in prefixes if not p.startswith("model.") and p != "lm_head"]
+    if non_model:
+        print(f"  note: {len(non_model)} prefixes outside model./lm_head (MTP etc.):")
+        for prefix in non_model[:10]:
+            print(f"    {prefix}  -> {lookup(desc, prefix)}")
+
+    # Forward pass: lookups the model performs even if the description omits them.
+    required = ["model.embed_tokens", "lm_head", "model.layers.0.mlp.experts",
+                "model.layers.0.mlp.gate"]
+    for candidate in ("model.layers.0.mlp.shared_expert.gate_up_proj",
+                      "model.layers.0.mlp.shared_expert.down_proj"):
+        if any(k.startswith("model.layers.0.mlp.shared_expert.") for k in desc):
+            required.append(candidate)
+    print("\nrequired lookups:")
+    for prefix in required:
+        status, detail = lookup(desc, prefix)
+        print(f"  {prefix:55s} -> {status}: {detail}")
+        if status in ("missing", "mixed"):
+            problems.append(f"required lookup failed: {prefix} -> {status} ({detail})")
+    status, detail = lookup(desc, "model.layers.0.mlp.experts")
+    if status == "quant" and detail not in MOE_SCHEMES:
+        problems.append(
+            f"experts quant type {detail!r} has no registered 'moe' scheme {sorted(MOE_SCHEMES)}"
+        )
+
+    # Expert coverage: every layer should describe the same, full expert set.
+    experts_per_layer = defaultdict(set)
+    for key in weight_keys:
+        parts = key.split(".")
+        if key.startswith("model.layers.") and "experts" in parts:
+            idx = parts.index("experts")
+            if parts[2].isdigit() and idx + 1 < len(parts) and parts[idx + 1].isdigit():
+                experts_per_layer[int(parts[2])].add(int(parts[idx + 1]))
+    if experts_per_layer:
+        counts = {layer: len(ids) for layer, ids in experts_per_layer.items()}
+        distinct = Counter(counts.values())
+        print(f"\nexpert coverage: {len(counts)} MoE layers, experts-per-layer counts {dict(distinct)}")
+        if num_layers and len(counts) != num_layers:
+            warnings.append(f"{len(counts)} MoE layers described vs num_hidden_layers={num_layers}")
+        if num_experts and set(distinct) != {num_experts}:
+            problems.append(f"expert count per layer {dict(distinct)} != config num_experts={num_experts}")
+    else:
+        problems.append("no per-expert keys (model.layers.N.mlp.experts.M.*) found at all")
+
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+    if problems:
+        print(f"\n[RED] {len(problems)} problem(s):")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("\n[GREEN] quant description resolves cleanly with the qwen3_5_moe_text mapping fix")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
