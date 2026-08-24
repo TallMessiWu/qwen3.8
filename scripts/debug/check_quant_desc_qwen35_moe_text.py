@@ -56,6 +56,17 @@ for fused, shards in PACKED.items():
 EXPERT_SHARDS = ("gate_proj", "up_proj", "down_proj")
 
 
+def fmt_value(value):
+    """Render a description value compactly; dict/list values are JSON-encoded."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)[:160]
+
+
+def key_pattern(key):
+    return ".".join("*" if part.isdigit() else part for part in key.split("."))
+
+
 def reduce_to_query_prefix(weight_key):
     """Map one description key to the module prefix vLLM queries for it."""
     name = weight_key[: -len(".weight")]
@@ -120,14 +131,34 @@ def main():
     desc = json.loads((model_path / "quant_model_description.json").read_text())
     weight_keys = [k for k in desc if k.endswith(".weight")]
     print(f"\nquant_model_description.json: {len(desc)} keys, {len(weight_keys)} '.weight' keys")
-    print(f"  value distribution: {dict(Counter(desc.values()))}")
+    value_kinds = Counter(v if isinstance(v, str) else f"<{type(v).__name__}>" for v in desc.values())
+    print(f"  value distribution: {dict(value_kinds)}")
+    non_str = {k: v for k, v in desc.items() if not isinstance(v, str)}
+    if non_str:
+        non_str_weight = [k for k in non_str if k.endswith(".weight")]
+        print(
+            f"  {len(non_str)} keys carry non-string values "
+            f"({len(non_str_weight)} of them '.weight' keys); one sample per key pattern:"
+        )
+        shown = set()
+        for key, value in non_str.items():
+            pattern = key_pattern(key)
+            if pattern in shown:
+                continue
+            shown.add(pattern)
+            print(f"    {key} = {fmt_value(value)}")
+            if len(shown) >= 15:
+                print(f"    ... ({len(non_str)} non-string keys total)")
+                break
+        if non_str_weight:
+            warnings.append(
+                f"{len(non_str_weight)} '.weight' keys have dict/list values; "
+                "modelslim_config compares values against plain strings"
+            )
 
     patterns = Counter()
     for key in desc:
-        parts = []
-        for part in key.split("."):
-            parts.append("*" if part.isdigit() else part)
-        patterns[".".join(parts)] += 1
+        patterns[key_pattern(key)] += 1
     print(f"  {len(patterns)} distinct key patterns:")
     for pattern, count in sorted(patterns.items()):
         print(f"    {count:6d}  {pattern}")
@@ -140,7 +171,7 @@ def main():
         status, detail = lookup(desc, prefix)
         by_status[status].append((prefix, detail))
         if status == "quant":
-            quant_types_seen[detail] += 1
+            quant_types_seen[fmt_value(detail)] += 1
     print(
         f"\nlookup over {len(prefixes)} module prefixes: "
         f"{len(by_status['quant'])} quantized, {len(by_status['float'])} FLOAT-skipped, "
@@ -157,7 +188,8 @@ def main():
     if non_model:
         print(f"  note: {len(non_model)} prefixes outside model./lm_head (MTP etc.):")
         for prefix in non_model[:10]:
-            print(f"    {prefix}  -> {lookup(desc, prefix)}")
+            status, detail = lookup(desc, prefix)
+            print(f"    {prefix}  -> {status}: {fmt_value(detail)}")
 
     # Forward pass: lookups the model performs even if the description omits them.
     required = ["model.embed_tokens", "lm_head", "model.layers.0.mlp.experts",
@@ -169,14 +201,20 @@ def main():
     print("\nrequired lookups:")
     for prefix in required:
         status, detail = lookup(desc, prefix)
-        print(f"  {prefix:55s} -> {status}: {detail}")
+        print(f"  {prefix:55s} -> {status}: {fmt_value(detail)}")
         if status in ("missing", "mixed"):
-            problems.append(f"required lookup failed: {prefix} -> {status} ({detail})")
+            problems.append(f"required lookup failed: {prefix} -> {status} ({fmt_value(detail)})")
     status, detail = lookup(desc, "model.layers.0.mlp.experts")
-    if status == "quant" and detail not in MOE_SCHEMES:
-        problems.append(
-            f"experts quant type {detail!r} has no registered 'moe' scheme {sorted(MOE_SCHEMES)}"
-        )
+    if status == "quant":
+        if not isinstance(detail, str):
+            problems.append(
+                f"experts quant value is a {type(detail).__name__} ({fmt_value(detail)}); "
+                "modelslim_config expects a plain string quant type -- schema adaptation needed"
+            )
+        elif detail not in MOE_SCHEMES:
+            problems.append(
+                f"experts quant type {detail!r} has no registered 'moe' scheme {sorted(MOE_SCHEMES)}"
+            )
 
     # Expert coverage: every layer should describe the same, full expert set.
     experts_per_layer = defaultdict(set)
