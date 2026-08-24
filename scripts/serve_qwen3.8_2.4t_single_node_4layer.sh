@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # Single-node 8-NPU launcher for a four-layer Qwen3.8-2.4T weight smoke test.
 #
-# This loads the original BF16 checkpoint. It does not validate the W8A8
-# checkpoint, ModelSlim metadata, or multi-node communication.
+# This loads the ModelSlim mxfp8-quantized checkpoint (same weights as the
+# four-node launcher) with --quantization ascend, so it exercises the
+# ModelSlim metadata path. It does not validate multi-node communication.
 
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 layer_filter_dir="${script_dir}/runtime/qwen38_checkpoint_layer_filter"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 
 if [[ ! -r "$MODEL_PATH/config.json" ]]; then
     echo "ERROR: missing or unreadable $MODEL_PATH/config.json" >&2
+    exit 2
+fi
+if [[ ! -r "$MODEL_PATH/quant_model_description.json" ]]; then
+    echo "ERROR: --quantization ascend requires $MODEL_PATH/quant_model_description.json" >&2
     exit 2
 fi
 if [[ ! -r "$layer_filter_dir/sitecustomize.py" ]]; then
@@ -33,6 +38,14 @@ if ! grep -Fq 'if isinstance(self.rotary_emb, AscendMRotaryEmbedding):' "$active
     exit 2
 fi
 echo "QWEN38_ROPE_DISPATCH=GREEN active_patch=$active_qwen_patch"
+active_modelslim_config="${active_vllm_ascend_root}/quantization/modelslim_config.py"
+if ! grep -Fq '"qwen3_5_moe_text"' "$active_modelslim_config"; then
+    echo "ERROR: active vLLM-Ascend lacks the qwen3_5_moe_text ModelSlim packed mapping." >&2
+    echo "Active config: $active_modelslim_config" >&2
+    echo "Pull the junlin-bugfix-modelslim-qwen35-moe-text branch (commit with PR14238 mapping) and retry." >&2
+    exit 2
+fi
+echo "QWEN38_MODELSLIM_MAPPING=GREEN active_config=$active_modelslim_config"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
@@ -55,6 +68,7 @@ cmd=(
     --served-model-name qwen3.8-smoke
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
+    --quantization ascend
     --safetensors-load-strategy lazy
     --dtype bfloat16
     --tensor-parallel-size 8
