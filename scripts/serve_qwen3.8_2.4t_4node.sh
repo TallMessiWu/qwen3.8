@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Common launcher for the original BF16 Qwen3.8-2.4T-A95B checkpoint on four 8-NPU nodes.
+# Common launcher for the ModelSlim mxfp8-quantized Qwen3.8-2.4T-A95B checkpoint
+# on four 8-NPU nodes.
 #
 # Machine-specific wrappers are 2.4T-0.sh through 2.4T-3.sh.  Keep MTP off
 # until the base model has loaded successfully; enable it later with
@@ -21,7 +22,7 @@ case "$NODE_RANK" in
         ;;
 esac
 
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 NIC_NAME="${NIC_NAME:-enp35s0f2}"
 VLLM_PORT="${VLLM_PORT:-6969}"
@@ -46,6 +47,10 @@ fi
 
 if [[ ! -r "$MODEL_PATH/config.json" ]]; then
     echo "ERROR: missing or unreadable $MODEL_PATH/config.json" >&2
+    exit 2
+fi
+if [[ ! -r "$MODEL_PATH/quant_model_description.json" ]]; then
+    echo "ERROR: --quantization ascend requires $MODEL_PATH/quant_model_description.json" >&2
     exit 2
 fi
 if command -v ip >/dev/null 2>&1; then
@@ -87,6 +92,7 @@ cmd=(
     --served-model-name qwen3.8
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
+    --quantization ascend
     --safetensors-load-strategy lazy
     --dtype bfloat16
     --tensor-parallel-size "$TP_SIZE"
