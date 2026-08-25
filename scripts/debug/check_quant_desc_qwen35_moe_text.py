@@ -108,6 +108,78 @@ def lookup(desc, prefix):
     return ("float", value) if value == "FLOAT" else ("quant", value)
 
 
+QUANT_DTYPES = {"F8_E4M3", "F8_E5M2", "F8_E8M0", "I8", "U8", "I4", "U4", "F4_E2M1"}
+
+
+def read_safetensors_header(path):
+    with open(path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        return json.loads(f.read(header_len))
+
+
+def check_safetensors(model_path, problems, warnings):
+    """Inspect checkpoint tensor names/dtypes without loading tensor data.
+
+    Returns True if the safetensors look quantized, False if plain bf16/fp16,
+    None if no safetensors were found.
+    """
+    index_path = model_path / "model.safetensors.index.json"
+    tensor_files = {}
+    if index_path.exists():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        for name, filename in weight_map.items():
+            tensor_files[name] = model_path / filename
+    else:
+        shards = sorted(model_path.glob("*.safetensors"))
+        if not shards:
+            warnings.append("no *.safetensors found; skipped checkpoint reality check")
+            return None
+        print(f"\nno index.json; scanning {len(shards)} safetensors headers")
+        for shard in shards:
+            for name in read_safetensors_header(shard):
+                if name != "__metadata__":
+                    tensor_files[name] = shard
+
+    print(f"\nsafetensors: {len(tensor_files)} tensors")
+    name_patterns = Counter(key_pattern(name) for name in tensor_files)
+    scale_like = [n for n in tensor_files if "scale" in n.lower() or "offset" in n.lower()]
+    print(f"  {len(name_patterns)} tensor-name patterns, {len(scale_like)} scale/offset tensors")
+    for pattern, count in sorted(name_patterns.items()):
+        print(f"    {count:6d}  {pattern}")
+
+    focus = {}
+    for name in tensor_files:
+        for tag, needle in (
+            ("experts.gate_up_proj", ".mlp.experts.gate_up_proj"),
+            ("experts.down_proj", ".mlp.experts.down_proj"),
+            ("in_proj_qkv", ".linear_attn.in_proj_qkv"),
+            ("self_attn.q_proj", ".self_attn.q_proj"),
+            ("embed_tokens", "embed_tokens"),
+        ):
+            if needle in name and tag not in focus:
+                focus[tag] = name
+    for name in scale_like[:3]:
+        focus[f"scale:{key_pattern(name)}"] = name
+
+    sample_dtypes = set()
+    headers = {}
+    print("  representative tensors:")
+    for tag, name in sorted(focus.items()):
+        shard = tensor_files[name]
+        if shard not in headers:
+            headers[shard] = read_safetensors_header(shard)
+        info = headers[shard].get(name)
+        if info is None:
+            warnings.append(f"{name} listed in index but absent from {shard.name}")
+            continue
+        print(f"    {tag:28s} {name} dtype={info['dtype']} shape={info['shape']}")
+        sample_dtypes.add(info["dtype"])
+
+    quantized = bool(sample_dtypes & QUANT_DTYPES) or bool(scale_like)
+    print(f"  sample dtypes={sorted(sample_dtypes)} -> checkpoint looks {'QUANTIZED' if quantized else 'UNQUANTIZED'}")
+    return quantized
+
+
 def main():
     model_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL_PATH)
     problems = []
@@ -233,7 +305,31 @@ def main():
         if num_experts and set(distinct) != {num_experts}:
             problems.append(f"expert count per layer {dict(distinct)} != config num_experts={num_experts}")
     else:
-        problems.append("no per-expert keys (model.layers.N.mlp.experts.M.*) found at all")
+        fused_expert_keys = [
+            k for k in desc if ".mlp.experts.gate_up_proj" in k or ".mlp.experts.down_proj" in k
+        ]
+        if fused_expert_keys:
+            problems.append(
+                f"description keys use the transformers-5.x fused expert layout "
+                f"({len(fused_expert_keys)} keys like {fused_expert_keys[0]!r}, no '.weight' suffix); "
+                "modelslim_config only understands per-expert keys (experts.0.gate_proj.weight) "
+                "-- needs code adaptation or description conversion"
+            )
+        else:
+            problems.append("no per-expert keys (model.layers.N.mlp.experts.M.*) found at all")
+
+    quantized = check_safetensors(model_path, problems, warnings)
+    all_float = not quant_types_seen
+    if quantized is True and all_float:
+        problems.append(
+            "safetensors carry quantized tensors but every description value is FLOAT "
+            "-- quant_model_description.json does not describe this checkpoint's quantization"
+        )
+    elif quantized is False:
+        problems.append(
+            "safetensors are plain bf16/fp16 -- the checkpoint is not actually quantized; "
+            "serve it without --quantization ascend or fetch the real mxfp8 weights"
+        )
 
     for warning in warnings:
         print(f"[WARN] {warning}")
