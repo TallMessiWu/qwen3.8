@@ -47,7 +47,7 @@ active_vllm_ascend_root="$(
     python3 -c 'import importlib.util; from pathlib import Path; spec = importlib.util.find_spec("vllm_ascend"); raise SystemExit("vllm_ascend is not importable") if spec is None or spec.origin is None else print(Path(spec.origin).parent)'
 )"
 active_qwen_patch="${active_vllm_ascend_root}/patch/worker/patch_qwen3_5.py"
-if ! grep -Fq 'if isinstance(self.rotary_emb, AscendMRotaryEmbedding):' "$active_qwen_patch"; then
+if ! grep -Fq '_uses_multimodal_rope' "$active_qwen_patch"; then
     echo "ERROR: active vLLM-Ascend lacks the Qwen3.5 text RoPE dispatch fix." >&2
     echo "Active patch: $active_qwen_patch" >&2
     echo "Run: python3 -m pip install --no-deps --no-build-isolation -e /home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text" >&2
