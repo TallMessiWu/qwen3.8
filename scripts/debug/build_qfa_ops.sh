@@ -27,6 +27,17 @@ if [[ ! -d "$WORKTREE/csrc" ]]; then
     exit 2
 fi
 
+# The packaged tiling library (libcust_opmaster_rt2.0.so, symlinked as
+# liboptiling.so) is what TBE and the installer dlopen; list every unresolved
+# symbol at once instead of learning them one dlopen error at a time.
+dump_unresolved() {
+    local so="build/custom/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
+    if [[ -e "$so" ]]; then
+        echo "================ ALL unresolved symbols in $(basename "$(readlink -f "$so")") (ldd -r) ================"
+        ldd -r "$so" 2>&1 | grep -i "undefined" | c++filt | sort -u | head -30
+    fi
+}
+
 cd "$WORKTREE/csrc"
 echo "[INFO] worktree=$WORKTREE soc=$SOC log=$LOG"
 echo "[INFO] HEAD=$(git -C "$WORKTREE" log --oneline -1)"
@@ -81,11 +92,7 @@ if [[ $rc -ne 0 ]]; then
     ' "$LOG" | head -300
     echo "================ error lines (with context) ================"
     grep -nE "error:|Error:|CMake Error|undefined reference|undefined symbol|No such file|do not registe|ld\.lld|\[ERROR\]" "$LOG" | head -40
-    tiling_so="build/custom/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
-    if [[ -f "$tiling_so" ]]; then
-        echo "================ ALL unresolved symbols in liboptiling.so (ldd -r) ================"
-        ldd -r "$tiling_so" 2>&1 | grep -i "undefined" | c++filt | sort -u | head -30
-    fi
+    dump_unresolved
     echo "================ last 30 lines ================"
     tail -30 "$LOG"
     echo "[RED] full log: $LOG"
@@ -105,7 +112,10 @@ mkdir -p "$install_dir"
 find "$install_dir" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -exec rm -rf -- {} +
 chmod +x "$run_pkg" || true
 bash "$run_pkg" --install-path="$install_dir" >>"$LOG" 2>&1 || {
-    echo "[RED] .run install failed, tail of log:"; tail -20 "$LOG"; exit 1;
+    echo "[RED] .run install failed, tail of log:"
+    tail -25 "$LOG"
+    dump_unresolved
+    exit 1
 }
 
 lib="$WORKTREE/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib/libcust_opapi.so"
