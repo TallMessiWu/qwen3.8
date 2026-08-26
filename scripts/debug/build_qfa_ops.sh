@@ -44,9 +44,9 @@ fi
 
 rm -rf build output build_out
 
-echo "[INFO] building (streams live below AND into $LOG)"
-echo "[INFO] NOTE: after the host ninja finishes, the ascendc kernel phase (opc) is"
-echo "[INFO] SILENT and can run 10-40+ minutes; the heartbeat below proves liveness."
+echo "[INFO] building; full output goes to $LOG, only progress/error lines show live."
+echo "[INFO] Do NOT hunt errors in the stream -- they are extracted below when it ends."
+echo "[INFO] The ascendc kernel phase can run 10-40+ min; heartbeat lines prove liveness."
 (
     start=$(date +%s)
     while sleep 60; do
@@ -58,8 +58,10 @@ echo "[INFO] SILENT and can run 10-40+ minutes; the heartbeat below proves liven
 HB_PID=$!
 trap 'kill "$HB_PID" 2>/dev/null || true' EXIT
 set +e
-bash build.sh --pkg --ops="quant_flash_attn;quant_flash_attn_metadata" --soc="$SOC" 2>&1 | tee "$LOG"
-rc=$?
+bash build.sh --pkg --ops="quant_flash_attn;quant_flash_attn_metadata" --soc="$SOC" 2>&1 \
+    | tee "$LOG" \
+    | grep --line-buffered -E "^\[[0-9]+/[0-9]+\]|Generating |Opc tool|error|Error|FAILED|undefined|ld\.lld|\[ERROR\]|fatal"
+rc=${PIPESTATUS[0]}
 set -e
 kill "$HB_PID" 2>/dev/null || true
 
