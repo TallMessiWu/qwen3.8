@@ -44,8 +44,9 @@ fi
 
 rm -rf build output build_out
 
+echo "[INFO] building (streams live below AND into $LOG; host+kernel takes several minutes)"
 set +e
-bash build.sh --pkg --ops="quant_flash_attn;quant_flash_attn_metadata" --soc="$SOC" >"$LOG" 2>&1
+bash build.sh --pkg --ops="quant_flash_attn;quant_flash_attn_metadata" --soc="$SOC" 2>&1 | tee "$LOG"
 rc=$?
 set -e
 
@@ -60,7 +61,7 @@ if [[ $rc -ne 0 ]]; then
         inblock { print }
     ' "$LOG" | head -300
     echo "================ error lines (with context) ================"
-    grep -nE "error:|Error:|CMake Error|undefined reference|No such file" "$LOG" | head -40
+    grep -nE "error:|Error:|CMake Error|undefined reference|undefined symbol|No such file|do not registe|ld\.lld|\[ERROR\]" "$LOG" | head -40
     echo "================ last 30 lines ================"
     tail -30 "$LOG"
     echo "[RED] full log: $LOG"
