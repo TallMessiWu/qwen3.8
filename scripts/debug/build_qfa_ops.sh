@@ -16,7 +16,11 @@ set -uo pipefail
 
 WORKTREE="${1:-/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn}"
 SOC="${QFA_BUILD_SOC:-ascend950}"
-LOG="/tmp/qfa_build_$(date +%Y%m%d_%H%M%S).log"
+# Keep logs beside the script (root filesystem is tight); logs/ is gitignored.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "$LOG_DIR"
+LOG="${LOG_DIR}/qfa_build_$(date +%Y%m%d_%H%M%S).log"
 
 if [[ ! -d "$WORKTREE/csrc" ]]; then
     echo "[RED] missing $WORKTREE/csrc" >&2

@@ -6,6 +6,9 @@
 # CANN ops-transformer 源码克隆（quant_flash_attn 等算子的拷贝来源，只读参考）
 /ops-transformer/
 
+# 调试脚本在服务器上产生的构建日志
+/scripts/debug/logs/
+
 # Agent 本地配置（含机器相关路径与权限，不共享）
 .claude/settings.local.json
 AGENTS.local.md
