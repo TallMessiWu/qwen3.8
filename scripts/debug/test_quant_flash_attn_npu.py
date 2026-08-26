@@ -21,6 +21,12 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   online-quant+metadata+main with no host sync, mimicking the
                   per-layer launch pattern of a real 27B forward pass.
                   QFA_CASES=27B runs just this case.
+  case 5 C-SHAPES milestone-C decode/verify/chunked shapes on PA_BBND @
+                  block_size=128 (officially zero-covered): 5a decode q=1
+                  (mask 0 vs 3 equivalence, kv boundaries), 5b MTP verify
+                  q=4 + mixed accept lengths, 5c chunked-prefill mixed batch
+                  with PREFILL(TND descale) x PA_BBND, 5e seqused=0 and 0x00
+                  scale-slot corners. QFA_CASES=C-SHAPES runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -586,6 +592,117 @@ def case_27b_shape() -> bool:
     return compare("27B", out, golden)
 
 
+# --------------------------------------------------------------------------
+# Case 5: milestone-C decode/verify/chunked shapes on PA_BBND @ block_size=128
+# (officially zero-covered combination; 27B per-rank Nq=24 Nkv=4 D=256)
+# --------------------------------------------------------------------------
+def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_layout):
+    """Generic PA_BBND runner: CPU-packed caches, per-seq golden, one QFA call."""
+    torch.manual_seed(sum(map(ord, name)))  # deterministic across runs
+    b = len(kv_lens)
+    g = nq // nkv
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    blocks_per_seq = [max(1, (s + bs - 1) // bs) for s in kv_lens]
+    total_blocks = sum(blocks_per_seq)
+    k_cache = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8)
+    v_cache = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8)
+    k_scale_cache = torch.zeros(total_blocks, bs, nkv, d // 64, 2, dtype=torch.uint8)
+    # 0x00 == 2^-127: mirrors milestone-C zeros-initialized scale planes (5e)
+    v_scale_cache = torch.zeros(total_blocks, bs // 64, nkv, d, 2, dtype=torch.uint8)
+    block_table = torch.zeros(b, max(blocks_per_seq), dtype=torch.int32)
+
+    q_all, qs_all, goldens = [], [], []
+    next_block = 0
+    for i, (ql, s) in enumerate(zip(q_lens, kv_lens)):
+        q = torch.randn(max(ql, 1), nq, d, dtype=torch.bfloat16)
+        qsc = qk_group_scale(q)
+        q_fp8 = quantize_with_scale(q, qsc.repeat_interleave(GROUP, dim=-1)[..., :d])
+        q_all.append(q_fp8[:ql])
+        qs_all.append(pack_last_pairs(fp32_to_e8m0_bytes(qsc, "q_scale"))[:ql])
+
+        if s == 0:
+            goldens.append(torch.zeros(ql, nq, d))
+            block_table[i, 0] = next_block
+            next_block += 1
+            continue
+        k = torch.randn(s, nkv, d, dtype=torch.bfloat16)
+        v = torch.randn(s, nkv, d, dtype=torch.bfloat16)
+        ksc = qk_group_scale(k)
+        s_pad = blocks_per_seq[i] * bs
+        v_pad = torch.nn.functional.pad(v.float(), (0, 0, 0, 0, 0, s_pad - s))
+        vsc = v_group_scale(v_pad)
+        k_fp8 = quantize_with_scale(k, ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+        v_fp8 = quantize_with_scale(v_pad, vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+        goldens.append(
+            cpu_golden_one_seq(
+                q_fp8[:ql], k_fp8, v_fp8, qsc[:ql], ksc,
+                vsc[: (s + GROUP - 1) // GROUP], softmax_scale, mask_mode == 3,
+            )
+        )
+        k_bytes = torch.nn.functional.pad(k_fp8.view(torch.uint8), (0, 0, 0, 0, 0, s_pad - s))
+        v_bytes = torch.nn.functional.pad(v_fp8.view(torch.uint8), (0, 0, 0, 0, 0, s_pad - s))
+        ks_bytes = pack_last_pairs(fp32_to_e8m0_bytes(ksc, "k_scale"))
+        ks_bytes = torch.nn.functional.pad(ks_bytes, (0, 0, 0, 0, 0, 0, 0, s_pad - s))
+        vs_bytes = pack_v_scale_seq(fp32_to_e8m0_bytes(vsc, "v_scale"))
+        for j in range(blocks_per_seq[i]):
+            blk = next_block
+            next_block += 1
+            block_table[i, j] = blk
+            k_cache[blk] = k_bytes[j * bs : (j + 1) * bs]
+            v_cache[blk] = v_bytes[j * bs : (j + 1) * bs]
+            k_scale_cache[blk] = ks_bytes[j * bs : (j + 1) * bs]
+            v_scale_cache[blk] = vs_bytes[j * (bs // 64) : (j + 1) * (bs // 64)]
+
+    qs = torch.cat(qs_all)  # (Tq, nq, d//64, 2)
+    if q_descale_layout == "N2TGD":
+        tq = qs.shape[0]
+        qs = qs.reshape(tq, nkv, g, d // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
+    cu_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32)
+    npu_kwargs = {
+        "q": torch.cat(q_all).npu(),
+        "k": k_cache.npu().view(torch.float8_e4m3fn),
+        "v": v_cache.npu().view(torch.float8_e4m3fn),
+        "q_descale": e8m0_npu(qs),
+        "k_descale": e8m0_npu(k_scale_cache),
+        "v_descale": e8m0_npu(v_scale_cache),
+        "block_table": block_table.npu(),
+        "cu_seqlens_q": cu_q.npu(),
+        "seqused_kv": torch.tensor(kv_lens, dtype=torch.int32).npu(),
+        "softmax_scale": softmax_scale,
+        "mask_mode": mask_mode,
+        "max_seqlen_q": max(q_lens),
+        "max_seqlen_kv": max(kv_lens),
+        "layout_q": "TND",
+        "layout_q_descale": q_descale_layout,
+        "layout_kv": "PA_BBND",
+        "layout_out": "TND",
+    }
+    mask = causal_mask_npu() if mask_mode == 3 else None
+    out = call_qfa(npu_kwargs, nq, nkv, d, mask)
+    print(f"  attn_out: shape={tuple(out.shape)} dtype={out.dtype}")
+    return compare(name, out, torch.cat(goldens))
+
+
+def case_c_decode_shapes() -> bool:
+    print("== case 5: milestone-C shapes on PA_BBND@128 (27B: Nq=24 Nkv=4 D=256) ==")
+    nq, nkv, d, bs = 24, 4, 256, 128
+    ok = True
+    print("-- 5a decode q=1, mask_mode 0 vs 3 equivalence, boundary kv --")
+    kv = [1, 127, 128, 129, 300]
+    ok &= _run_pa_bbnd("5a-mask0", [1] * 5, kv, nq, nkv, d, bs, 0, "N2TGD")
+    ok &= _run_pa_bbnd("5a-mask3", [1] * 5, kv, nq, nkv, d, bs, 3, "N2TGD")
+    print("-- 5b MTP verify q=4 (uniform) + mixed accept lengths --")
+    ok &= _run_pa_bbnd("5b-q4", [4, 4, 4], [68, 130, 257], nq, nkv, d, bs, 3, "N2TGD")
+    ok &= _run_pa_bbnd("5b-var", [4, 2, 1, 3], [66, 130, 200, 41], nq, nkv, d, bs, 3, "N2TGD")
+    print("-- 5c chunked-prefill mixed batch, PREFILL(TND descale) x PA_BBND --")
+    ok &= _run_pa_bbnd("5c-mix", [1, 512], [300, 1536], nq, nkv, d, bs, 3, "TND")
+    print("-- 5e zero/padding corners (seqused=0 req, 0x00 scale slots) --")
+    ok &= _run_pa_bbnd("5e-zero", [1, 1], [0, 65], nq, nkv, d, bs, 3, "N2TGD")
+    print(f"  [C-SHAPES] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -601,6 +718,7 @@ def main() -> int:
         ("PA_BBND", case_pa_bbnd),
         ("QUANT", case_quant_consistency),
         ("27B", case_27b_shape),
+        ("C-SHAPES", case_c_decode_shapes),
     )
     only = os.environ.get("QFA_CASES")
     if only:
