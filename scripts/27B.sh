@@ -47,9 +47,10 @@ fi
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
+MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 
 exec vllm serve "$MODEL_PATH" \
-    --served-model-name qwen3.8 \
+    --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
     --data-parallel-size 1 \

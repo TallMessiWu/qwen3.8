@@ -26,6 +26,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 NIC_NAME="${NIC_NAME:-enp35s0f2}"
 VLLM_PORT="${VLLM_PORT:-6969}"
+MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 DP_RPC_PORT="${DP_RPC_PORT:-13389}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-4}"
@@ -89,7 +90,7 @@ cmd=(
     vllm serve "$MODEL_PATH"
     --host 0.0.0.0
     --port "$VLLM_PORT"
-    --served-model-name qwen3.8
+    --served-model-name "$MODEL_NAME"
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
     --quantization ascend

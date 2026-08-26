@@ -15,6 +15,7 @@ layer_filter_dir="${script_dir}/runtime/qwen38_checkpoint_layer_filter"
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$MODEL_PATH}"
 VLLM_PORT="${VLLM_PORT:-6969}"
+MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 QUANTIZATION="${QUANTIZATION:-ascend}"
 
 if [[ ! -r "$MODEL_PATH/config.json" ]]; then
@@ -83,7 +84,7 @@ cmd=(
     vllm serve "$MODEL_PATH"
     --host 0.0.0.0
     --port "$VLLM_PORT"
-    --served-model-name qwen3.8-smoke
+    --served-model-name "$MODEL_NAME"
     --tokenizer "$TOKENIZER_PATH"
     --trust-remote-code
     --safetensors-load-strategy lazy

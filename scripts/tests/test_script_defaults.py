@@ -11,6 +11,12 @@ PORT_CONSUMERS = (
     "serve_qwen3.8_2.4t_4node.sh",
     "serve_qwen3.8_2.4t_single_node_4layer.sh",
 )
+SERVICE_LAUNCHERS = (
+    "27B.sh",
+    "serve_qwen3.8_2.4t_4node.sh",
+    "serve_qwen3.8_2.4t_single_node_4layer.sh",
+)
+MODEL_NAME_CONSUMERS = SERVICE_LAUNCHERS + ("curl.sh",)
 QFA_VLLM_ASCEND_REPO = (
     "/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn"
 )
@@ -24,6 +30,19 @@ class ScriptDefaultsTest(unittest.TestCase):
                 text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
                 self.assertIn('VLLM_PORT="${VLLM_PORT:-6969}"', text)
                 self.assertNotIn("hajimi-port.sh", text)
+
+    def test_model_name_consumers_default_to_qwen38(self):
+        for name in MODEL_NAME_CONSUMERS:
+            with self.subTest(script=name):
+                text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+                self.assertIn('MODEL_NAME="${MODEL_NAME:-qwen3.8}"', text)
+                self.assertNotIn("qwen3.8-smoke", text)
+
+    def test_service_launchers_serve_the_shared_model_name(self):
+        for name in SERVICE_LAUNCHERS:
+            with self.subTest(script=name):
+                text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+                self.assertIn('--served-model-name "$MODEL_NAME"', text)
 
     def test_four_node_launcher_defaults_to_mxfp8_checkpoint(self):
         launcher = SCRIPTS_DIR / "serve_qwen3.8_2.4t_4node.sh"
