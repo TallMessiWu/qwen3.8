@@ -27,14 +27,12 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
     ├── main/              # submodule「vllm-ascend」→ 个人 fork，跟踪 origin/main
-    ├── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
-    └── junlin-bugfix-modelslim-qwen35-moe-text/
-                           # 常驻运行验证 worktree，跟踪 origin 同名分支
+    └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout。当前容器默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text`，`main` 仍作为个人 fork 基线维护。
+服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，editable 安装指向哪个 worktree 以服务器实际配置为准（此前使用的 junlin 运行验证分支已于 2026-08-26 删除，其修复已并入 upstream/main）。
 
-**主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和 Junlin 运行验证分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
+**主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和各任务分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
 submodule 指针只有在需要固定「这套脚本对应哪个版本的 vllm / vllm-ascend」时才更新，日常在子仓里提交不必顺手 bump：
 
@@ -46,12 +44,11 @@ git submodule update --init --recursive   # 新机器克隆后拉起子仓
 
 ## Worktree 工作流
 
-三个常驻 worktree 分别维护 fork 基线、官方主线与当前运行验证分支；先各自快进到对应远端：
+两个常驻 worktree 分别维护 fork 基线与官方主线；先各自快进到对应远端：
 
 ```bash
 git -C vllm-ascend/main pull --ff-only                 # origin/main
 git -C vllm-ascend/upstream-main pull --ff-only        # upstream/main
-git -C vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text pull --ff-only
 ```
 
 每个任务仍使用独立分支和目录。面向上游的新改动通常从 `upstream-main` 派生：
@@ -126,6 +123,6 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-三个常驻 worktree 分别是跟踪 fork 的 `main`、跟踪官方主线的 `upstream-main`，以及容器默认使用的 `junlin-bugfix-modelslim-qwen35-moe-text`。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`；在途功能分支 `feat/qfa-mxfp8-attn`（QFA MXFP8 算子接入）基于 upstream/main，有独立 worktree。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。
