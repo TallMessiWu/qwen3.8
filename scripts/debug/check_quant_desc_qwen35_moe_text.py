@@ -39,8 +39,8 @@ PACKED = {
 }
 MAPPED_MODEL_TYPES = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
 
-# register_scheme() snapshot from vllm_ascend/quantization/methods/ on the
-# junlin-bugfix-modelslim-qwen35-moe-text branch.
+# register_scheme() snapshot from vllm_ascend/quantization/methods/ (taken from
+# the since-deleted junlin bugfix branch; the mapping now lives on upstream/main).
 MOE_SCHEMES = {
     "W4A16", "W4A16_MXFP4", "W4A4_MXFP4", "W4A8_DYNAMIC", "W4A8_MXFP",
     "W8A8FP8_DYNAMIC", "W8A8_DYNAMIC", "W8A8_MXFP8",

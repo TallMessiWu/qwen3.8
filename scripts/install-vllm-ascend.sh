@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-repo=/home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text
+repo=/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn
 proxy_file=/home/hajimi/proxy.sh
 python_bin=python3
 vllm_version=0.27.1

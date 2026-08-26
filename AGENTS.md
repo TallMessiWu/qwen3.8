@@ -30,7 +30,7 @@ qwen3.8/                   # 主仓（git，分支 main）
     └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，editable 安装指向哪个 worktree 以服务器实际配置为准（此前使用的 junlin 运行验证分支已于 2026-08-26 删除，其修复已并入 upstream/main）。
+服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn`（QFA 在途分支，基于 upstream/main），`main` 仍作为个人 fork 基线维护。
 
 **主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和各任务分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 

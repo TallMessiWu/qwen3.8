@@ -50,7 +50,7 @@ active_qwen_patch="${active_vllm_ascend_root}/patch/worker/patch_qwen3_5.py"
 if ! grep -Fq '_uses_multimodal_rope' "$active_qwen_patch"; then
     echo "ERROR: active vLLM-Ascend lacks the Qwen3.5 text RoPE dispatch fix." >&2
     echo "Active patch: $active_qwen_patch" >&2
-    echo "Run: python3 -m pip install --no-deps --no-build-isolation -e /home/hajimi/qwen3.8/vllm-ascend/junlin-bugfix-modelslim-qwen35-moe-text" >&2
+    echo "Run: python3 -m pip install --no-deps --no-build-isolation -e /home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn" >&2
     exit 2
 fi
 echo "QWEN38_ROPE_DISPATCH=GREEN active_patch=$active_qwen_patch"
@@ -59,7 +59,7 @@ if [[ "$QUANTIZATION" == "ascend" ]]; then
     if ! grep -Fq '"qwen3_5_moe_text"' "$active_modelslim_config"; then
         echo "ERROR: active vLLM-Ascend lacks the qwen3_5_moe_text ModelSlim packed mapping." >&2
         echo "Active config: $active_modelslim_config" >&2
-        echo "Pull the junlin-bugfix-modelslim-qwen35-moe-text branch (commit with PR14238 mapping) and retry." >&2
+        echo "Pull the feat/qfa-mxfp8-attn branch (rebased on upstream/main with the PR14238 mapping) and retry." >&2
         exit 2
     fi
     echo "QWEN38_MODELSLIM_MAPPING=GREEN active_config=$active_modelslim_config"
