@@ -11,6 +11,13 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
   case 3 QUANT    torch_npu.npu_dynamic_mx_quant vs. the CPU reference
                   quantization (validates the online-quant path used by
                   VLLM_ASCEND_ENABLE_QFA_PREFILL, incl. zero-padded groups)
+  case 4 27B      Qwen3.8-27B prefill shape repro (B=1 S=1594 Nq=24 Nkv=4
+                  D=256): metadata AICPU op and main op run with a synchronize
+                  between them, so an AICPU crash points at the exact stage.
+                  Bisect knobs: QFA27B_S / QFA27B_NQ / QFA27B_NKV / QFA27B_D
+                  (e.g. QFA27B_D=128 checks whether D=256 is the trigger),
+                  QFA27B_GOLDEN=0 skips the slow CPU golden (crash-only mode).
+                  QFA_CASES=27B runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -440,6 +447,85 @@ def case_quant_consistency() -> bool:
     return good
 
 
+# --------------------------------------------------------------------------
+# Case 4: Qwen3.8-27B prefill shape repro (crash isolation, staged syncs)
+# --------------------------------------------------------------------------
+def case_27b_shape() -> bool:
+    s = int(os.environ.get("QFA27B_S", "1594"))
+    nq = int(os.environ.get("QFA27B_NQ", "24"))
+    nkv = int(os.environ.get("QFA27B_NKV", "4"))
+    d = int(os.environ.get("QFA27B_D", "256"))
+    with_golden = os.environ.get("QFA27B_GOLDEN", "1") == "1"
+    print(f"== case 4: 27B prefill shape repro (B=1, S={s}, Nq={nq}, Nkv={nkv}, D={d}) ==")
+    torch.manual_seed(27)
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    q = torch.randn(s, nq, d, dtype=torch.bfloat16)
+    k = torch.randn(s, nkv, d, dtype=torch.bfloat16)
+    v = torch.randn(s, nkv, d, dtype=torch.bfloat16)
+    qsc, ksc = qk_group_scale(q), qk_group_scale(k)
+    s_pad = (s + 63) // 64 * 64
+    v_pad = torch.nn.functional.pad(v.float(), (0, 0, 0, 0, 0, s_pad - s))
+    vsc = v_group_scale(v_pad)  # (s_pad//32, nkv, d)
+
+    q_fp8 = quantize_with_scale(q, qsc.repeat_interleave(GROUP, dim=-1)[..., :d])
+    k_fp8 = quantize_with_scale(k, ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+    v_fp8 = quantize_with_scale(v_pad, vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+
+    cu = torch.tensor([0, s], dtype=torch.int32).npu()
+    common = {
+        "cu_seqlens_q": cu,
+        "cu_seqlens_kv": cu,
+        "mask_mode": 3,
+        "max_seqlen_q": s,
+        "max_seqlen_kv": s,
+        "layout_q": "TND",
+        "layout_q_descale": "TND",
+        "layout_kv": "TND",
+        "layout_out": "TND",
+    }
+    q_npu = q_fp8.npu()
+    k_npu = k_fp8.npu()
+    v_npu = v_fp8.npu()
+    qs_npu = e8m0_npu(pack_last_pairs(fp32_to_e8m0_bytes(qsc, "q_scale")))
+    ks_npu = e8m0_npu(pack_last_pairs(fp32_to_e8m0_bytes(ksc, "k_scale")))
+    vs_npu = e8m0_npu(pack_v_scale_seq(fp32_to_e8m0_bytes(vsc, "v_scale")))
+    mask = causal_mask_npu()
+    torch.npu.synchronize()  # inputs materialized; failures past here are the op's
+
+    # Stage 1: metadata AICPU op alone. The 27B server crash reported
+    # kernelName=QuantFlashAttnMetadata, so a hang/abort here confirms it.
+    print("  [stage] metadata AICPU op ...", flush=True)
+    metadata = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+        nq, nkv, d, v_descale=vs_npu, **common
+    )
+    torch.npu.synchronize()
+    head = metadata.cpu()[:4].tolist()
+    print(
+        f"  [stage] metadata OK: sectionNum={head[0]} isFd={head[1]} "
+        f"mBase={head[2]} s2Base={head[3]}",
+        flush=True,
+    )
+
+    # Stage 2: main op with the very same argument set.
+    print("  [stage] main op ...", flush=True)
+    out = torch.ops._C_ascend.npu_quant_flash_attn(
+        q_npu, k_npu, v_npu, qs_npu, ks_npu, vs_npu, metadata, softmax_scale,
+        attn_mask=mask, **common,
+    )
+    torch.npu.synchronize()
+    print(f"  [stage] main op OK: shape={tuple(out.shape)} dtype={out.dtype}", flush=True)
+
+    if not with_golden:
+        print("  [27B] GREEN (no-crash mode, golden skipped via QFA27B_GOLDEN=0)")
+        return True
+    print("  [stage] CPU golden (may take a minute or two) ...", flush=True)
+    golden = cpu_golden_one_seq(
+        q_fp8, k_fp8, v_fp8, qsc, ksc, vsc[: (s + GROUP - 1) // GROUP], softmax_scale, True
+    )
+    return compare("27B", out, golden)
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -450,8 +536,24 @@ def main() -> int:
     print(f"[INFO] device npu:{device_id}")
     bootstrap_ops()
 
+    all_cases = (
+        ("TND", case_tnd),
+        ("PA_BBND", case_pa_bbnd),
+        ("QUANT", case_quant_consistency),
+        ("27B", case_27b_shape),
+    )
+    only = os.environ.get("QFA_CASES")
+    if only:
+        wanted = {token.strip() for token in only.split(",") if token.strip()}
+        cases = tuple(case for case in all_cases if case[0] in wanted)
+        if not cases:
+            print(f"[ERROR] QFA_CASES={only!r} matches none of {[c[0] for c in all_cases]}")
+            return 2
+    else:
+        cases = all_cases
+
     results = {}
-    for name, fn in (("TND", case_tnd), ("PA_BBND", case_pa_bbnd), ("QUANT", case_quant_consistency)):
+    for name, fn in cases:
         try:
             results[name] = fn()
         except Exception:
