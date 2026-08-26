@@ -12,11 +12,22 @@ first-token top-5 candidate sets overlap by >= 4/5. Token-prefix divergence
 beyond the first token is reported but does not gate (MXFP8 rounding may
 legitimately flip near-ties on a sliced 4-layer model).
 
-Environment (mirrors serve_qwen3.8_2.4t_single_node_4layer.sh):
+Environment:
   MODEL_PATH     default /mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8
-  QUANTIZATION   ascend (default) or none
+  FOUR_LAYER     1 (default): apply the 4-layer hf_overrides + checkpoint layer
+                 filter + expert parallel (the 2.4T smoke setup);
+                 0: load the model as-is (e.g. Qwen3.8-27B)
+  QUANTIZATION   ascend (default) passes --quantization ascend; anything else
+                 (auto/none) lets vLLM auto-detect the checkpoint quant config
   TP_SIZE        default 8
-Run inside the serving container on an idle 8-NPU host.
+
+27B single-card example (mirrors scripts/27B.sh):
+  MODEL_PATH=/mnt/share/weight/Qwen3.8-27B-mxfp8 FOUR_LAYER=0 QUANTIZATION=auto \
+      TP_SIZE=1 python scripts/debug/smoke_qfa_prefill_compare.py
+
+The QFA run must print "QFA MXFP8 prefill path engaged" (from vllm-ascend);
+if it does not, the model never hit the quantized branch and the comparison is
+vacuous.
 """
 
 import json
@@ -28,6 +39,7 @@ import tempfile
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/share/weight/Qwen3.8-2.4T-A95B-mxfp8")
 QUANTIZATION = os.environ.get("QUANTIZATION", "ascend")
 TP_SIZE = int(os.environ.get("TP_SIZE", "8"))
+FOUR_LAYER = os.environ.get("FOUR_LAYER", "1") == "1"
 PROMPTS = [
     "The capital of France is",
     "请用一句话介绍一下人工智能。",
@@ -39,11 +51,13 @@ TOP_LOGPROBS = 5
 def child(result_path: str) -> None:
     from vllm import LLM, SamplingParams
 
-    hf_overrides = {
-        "num_hidden_layers": 4,
-        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-    }
     kwargs = {}
+    if FOUR_LAYER:
+        kwargs["hf_overrides"] = {
+            "num_hidden_layers": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        }
+        kwargs["enable_expert_parallel"] = True
     if QUANTIZATION == "ascend":
         kwargs["quantization"] = "ascend"
     llm = LLM(
@@ -51,8 +65,6 @@ def child(result_path: str) -> None:
         trust_remote_code=True,
         dtype="bfloat16",
         tensor_parallel_size=TP_SIZE,
-        enable_expert_parallel=True,
-        hf_overrides=hf_overrides,
         max_model_len=2048,
         max_num_seqs=1,
         gpu_memory_utilization=0.8,
@@ -83,7 +95,7 @@ def run_child(qfa: int, result_path: str) -> None:
     env["VLLM_ASCEND_ENABLE_QFA_PREFILL"] = str(qfa)
     layer_filter = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "runtime", "qwen38_checkpoint_layer_filter")
-    if os.path.isdir(layer_filter):
+    if FOUR_LAYER and os.path.isdir(layer_filter):
         env["QWEN38_CHECKPOINT_LAYER_LIMIT"] = "4"
         env["PYTHONPATH"] = layer_filter + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
