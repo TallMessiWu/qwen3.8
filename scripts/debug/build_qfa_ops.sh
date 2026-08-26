@@ -44,11 +44,24 @@ fi
 
 rm -rf build output build_out
 
-echo "[INFO] building (streams live below AND into $LOG; host+kernel takes several minutes)"
+echo "[INFO] building (streams live below AND into $LOG)"
+echo "[INFO] NOTE: after the host ninja finishes, the ascendc kernel phase (opc) is"
+echo "[INFO] SILENT and can run 10-40+ minutes; the heartbeat below proves liveness."
+(
+    start=$(date +%s)
+    while sleep 60; do
+        objs=$(find build/binary -name '*.o' 2>/dev/null | wc -l)
+        procs=$(pgrep -fc 'ccec|bisheng|opc|te_fusion' 2>/dev/null || echo 0)
+        echo "[hb +$((($(date +%s) - start) / 60))min] alive: kernel objs=$objs, compiler procs=$procs"
+    done
+) &
+HB_PID=$!
+trap 'kill "$HB_PID" 2>/dev/null || true' EXIT
 set +e
 bash build.sh --pkg --ops="quant_flash_attn;quant_flash_attn_metadata" --soc="$SOC" 2>&1 | tee "$LOG"
 rc=$?
 set -e
+kill "$HB_PID" 2>/dev/null || true
 
 if [[ $rc -ne 0 ]]; then
     echo "[RED] build failed (exit=$rc). Extracting failures from $LOG:"
@@ -62,6 +75,11 @@ if [[ $rc -ne 0 ]]; then
     ' "$LOG" | head -300
     echo "================ error lines (with context) ================"
     grep -nE "error:|Error:|CMake Error|undefined reference|undefined symbol|No such file|do not registe|ld\.lld|\[ERROR\]" "$LOG" | head -40
+    tiling_so="build/custom/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
+    if [[ -f "$tiling_so" ]]; then
+        echo "================ ALL unresolved symbols in liboptiling.so (ldd -r) ================"
+        ldd -r "$tiling_so" 2>&1 | grep -i "undefined" | c++filt | sort -u | head -30
+    fi
     echo "================ last 30 lines ================"
     tail -30 "$LOG"
     echo "[RED] full log: $LOG"
