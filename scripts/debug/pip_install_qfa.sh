@@ -27,6 +27,14 @@ fi
 cd "$WORKTREE"
 echo "[INFO] worktree=$WORKTREE SOC_VERSION=$SOC_VERSION log=$LOG"
 echo "[INFO] HEAD=$(git log --oneline -1)"
+# The quick 2-op script leaves csrc/build/custom holding a QFA-only op store;
+# reusing it makes every other op fall through to CANN's built-in catalog and
+# fail parameter checks (e.g. SwigluGroupQuant 3-vs-4 inputs). Default to a
+# clean build; third-party tarballs live outside build/ so nothing re-downloads.
+if [[ "${KEEP_BUILD:-0}" != "1" ]]; then
+    echo "[INFO] wiping csrc/{build,build_out,output} for an un-mixed full build (KEEP_BUILD=1 to reuse)"
+    rm -rf csrc/build csrc/build_out csrc/output
+fi
 echo "[INFO] full pip output goes to the log; only progress/error lines show live."
 echo "[INFO] Ignore transient [ERROR] noise -- read the extracted sections at the end."
 
