@@ -26,6 +26,22 @@ fi
 cd "$WORKTREE/csrc"
 echo "[INFO] worktree=$WORKTREE soc=$SOC log=$LOG"
 echo "[INFO] HEAD=$(git -C "$WORKTREE" log --oneline -1)"
+
+# Third-party tarballs persist in csrc/third_party (outside build/), so wiping
+# build/ does NOT re-download. If the cache is empty this build needs network
+# access to gitcode.com once (abseil-cpp / protobuf) -- surface that up front.
+if compgen -G "third_party/pkg/*" >/dev/null 2>&1 || [[ -d third_party/abseil-cpp/absl ]]; then
+    echo "[INFO] third_party cache present: $(ls third_party/pkg 2>/dev/null | tr '\n' ' ')"
+else
+    echo "[WARN] no third_party cache under csrc/third_party -- first build will download abseil/protobuf from gitcode.com"
+fi
+# Mirror build_aclnn.sh: expose catlass headers via CPATH when the submodule
+# is checked out (QFA itself does not need it, but keep the env identical).
+if [[ -d third_party/catlass/include ]]; then
+    export CPATH="$(cd third_party/catlass/include && pwd)${CPATH:+:${CPATH}}"
+    echo "[INFO] catlass include exported to CPATH"
+fi
+
 rm -rf build output build_out
 
 set +e
@@ -57,7 +73,13 @@ if [[ -z "$run_pkg" ]]; then
     echo "[RED] no .run package under csrc/build (see $LOG)" >&2
     exit 1
 fi
-bash "$run_pkg" --install-path="$WORKTREE/vllm_ascend/_cann_ops_custom" >>"$LOG" 2>&1 || {
+# Mirror build_aclnn.sh: clear everything under _cann_ops_custom except
+# .gitkeep so stale vendor content never mixes with this install.
+install_dir="$WORKTREE/vllm_ascend/_cann_ops_custom"
+mkdir -p "$install_dir"
+find "$install_dir" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -exec rm -rf -- {} +
+chmod +x "$run_pkg" || true
+bash "$run_pkg" --install-path="$install_dir" >>"$LOG" 2>&1 || {
     echo "[RED] .run install failed, tail of log:"; tail -20 "$LOG"; exit 1;
 }
 
