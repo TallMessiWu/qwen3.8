@@ -16,7 +16,10 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   between them, so an AICPU crash points at the exact stage.
                   Bisect knobs: QFA27B_S / QFA27B_NQ / QFA27B_NKV / QFA27B_D
                   (e.g. QFA27B_D=128 checks whether D=256 is the trigger),
-                  QFA27B_GOLDEN=0 skips the slow CPU golden (crash-only mode).
+                  QFA27B_GOLDEN=0 skips the slow CPU golden (crash-only mode),
+                  QFA27B_ITERS=12 additionally fires 12 back-to-back rounds of
+                  online-quant+metadata+main with no host sync, mimicking the
+                  per-layer launch pattern of a real 27B forward pass.
                   QFA_CASES=27B runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
@@ -450,6 +453,34 @@ def case_quant_consistency() -> bool:
 # --------------------------------------------------------------------------
 # Case 4: Qwen3.8-27B prefill shape repro (crash isolation, staged syncs)
 # --------------------------------------------------------------------------
+def _online_quant_qk(x: torch.Tensor):
+    """Mirror of AscendAttentionBackendImpl._qfa_quant_query_key (scale_alg=0)."""
+    import torch_npu
+
+    t, n, d = x.shape
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(
+        x.reshape(t * n, d), dst_type=torch.float8_e4m3fn, scale_alg=0
+    )
+    scale = scale.view(torch.uint8).reshape(t, n, d // 64, 2)
+    return fp8.reshape(t, n, d), scale.view(torch.float8_e8m0fnu)
+
+
+def _online_quant_v(v: torch.Tensor, s: int):
+    """Mirror of _qfa_quant_value_per_seq for a single sequence."""
+    import torch_npu
+
+    n, d = v.shape[1], v.shape[2]
+    padded = (s + 63) // 64 * 64
+    chunk = v
+    if padded != s:
+        chunk = torch.nn.functional.pad(chunk, (0, 0, 0, 0, 0, padded - s))
+    chunk = chunk.permute(1, 2, 0).contiguous().view(n * d, padded)
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(chunk, dst_type=torch.float8_e4m3fn, scale_alg=0)
+    fp8 = fp8.view(n, d, padded).permute(2, 0, 1)[:s].contiguous()
+    scale = scale.view(torch.uint8).reshape(n, d, padded // 64, 2).permute(2, 0, 1, 3).contiguous()
+    return fp8, scale.view(torch.float8_e8m0fnu)
+
+
 def case_27b_shape() -> bool:
     s = int(os.environ.get("QFA27B_S", "1594"))
     nq = int(os.environ.get("QFA27B_NQ", "24"))
@@ -515,6 +546,35 @@ def case_27b_shape() -> bool:
     )
     torch.npu.synchronize()
     print(f"  [stage] main op OK: shape={tuple(out.shape)} dtype={out.dtype}", flush=True)
+
+    # Stage 3 (optional): back-to-back layers like a real 27B forward pass.
+    # The server launches online-quant + metadata + main for every full-attn
+    # layer with no host sync in between, and each layer's temporaries are
+    # freed and recycled by the caching allocator while earlier AICPU tasks
+    # may still sit in the stream queue. QFA27B_ITERS=12 reproduces exactly
+    # that queue shape (also the first on-device run of online npu_dynamic_
+    # mx_quant feeding QFA, D=256 included).
+    iters = int(os.environ.get("QFA27B_ITERS", "1"))
+    if iters > 1:
+        q_bf, k_bf, v_bf = q.npu(), k.npu(), v.npu()
+        torch.npu.synchronize()
+        print(
+            f"  [stage] back-to-back x{iters} (online-quant+metadata+main, no host sync) ...",
+            flush=True,
+        )
+        last = None
+        for _ in range(iters):
+            qf, qd = _online_quant_qk(q_bf)
+            kf, kd = _online_quant_qk(k_bf)
+            vf, vd = _online_quant_v(v_bf, s)
+            md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+                nq, nkv, d, v_descale=vd, **common
+            )
+            last = torch.ops._C_ascend.npu_quant_flash_attn(
+                qf, kf, vf, qd, kd, vd, md, softmax_scale, attn_mask=mask, **common
+            )
+        torch.npu.synchronize()
+        print(f"  [stage] back-to-back OK: shape={tuple(last.shape)}", flush=True)
 
     if not with_golden:
         print("  [27B] GREEN (no-crash mode, golden skipped via QFA27B_GOLDEN=0)")
