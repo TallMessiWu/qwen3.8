@@ -83,6 +83,15 @@ SELF_SPEC = os.environ.get("SELF_SPEC") == "1"
 # keeps roughly the same headroom over the measured worst case that 0.5 does.
 DELTA_GATE = float(os.environ.get("DELTA_GATE", "1.5" if NUM_SPEC > 0 else "0.5"))
 OVERLAP_GATE = float(os.environ.get("OVERLAP_GATE", "0.8"))
+# Top-k membership churns on its own wherever the top two candidates sit close
+# together: the ranks below them are settled by hundredths of a logprob, and
+# quantization noise reshuffles those without ever touching the winner. So the
+# overlap is only counted on steps whose top-1 is clearly ahead, where a
+# reshuffle means something. Measured on 27B: a run with all 64 chosen tokens
+# identical to BF16 still averaged 8.08/10 overlap - 0.08 off failing - purely
+# from the flat tail of a list-continuation prompt. Ungated, this statistic
+# reports how flat the prompt is, not whether the distribution moved.
+OVERLAP_MIN_GAP = float(os.environ.get("OVERLAP_MIN_GAP", "0.5"))
 # Below this many comparable steps the verdict rests on too little evidence to
 # mean much; it is reported rather than failed, since an early tie is normal.
 MIN_STEPS = int(os.environ.get("MIN_STEPS", "3"))
@@ -258,6 +267,7 @@ def report_numerics(b: dict, q: dict, prefix: int, ref_label: str = "baseline", 
         "mean_delta": float("nan"),
         "mean_overlap": 0.0,
         "min_overlap": 0,
+        "overlap_steps": 0,
         "off_topk": 0,
     }
     if not b_steps or not q_steps:
@@ -277,19 +287,24 @@ def report_numerics(b: dict, q: dict, prefix: int, ref_label: str = "baseline", 
             # shift is larger than this window can measure. Fail loudly
             # instead of quietly dropping the step from the average.
             off_topk += 1
-        overlaps.append(len(set(b_steps[i]) & set(q_steps[i])))
+        if _top_gap(b_steps[i]) >= OVERLAP_MIN_GAP:
+            overlaps.append(len(set(b_steps[i]) & set(q_steps[i])))
     stats.update(
         steps=last,
         max_delta=float("inf") if off_topk else (max(deltas) if deltas else float("inf")),
         mean_delta=sum(deltas) / len(deltas) if deltas else float("nan"),
-        mean_overlap=sum(overlaps) / len(overlaps) if overlaps else 0.0,
-        min_overlap=min(overlaps) if overlaps else 0,
+        # With no decisive step there is nothing for this statistic to say, so
+        # it abstains rather than failing the prompt on the delta's behalf.
+        mean_overlap=sum(overlaps) / len(overlaps) if overlaps else float(TOP_LOGPROBS),
+        min_overlap=min(overlaps) if overlaps else TOP_LOGPROBS,
+        overlap_steps=len(overlaps),
         off_topk=off_topk,
     )
     print(
         f"  comparable steps={stats['steps']} | chosen-token logprob delta "
         f"max={stats['max_delta']:.4f} mean={stats['mean_delta']:.4f} | "
-        f"top{TOP_LOGPROBS} overlap mean={stats['mean_overlap']:.2f} min={stats['min_overlap']}"
+        f"top{TOP_LOGPROBS} overlap mean={stats['mean_overlap']:.2f} min={stats['min_overlap']} "
+        f"over {stats['overlap_steps']} decisive step(s)"
         + (f" | {off_topk} step(s) where the baseline's pick left the QFA top-k" if off_topk else "")
     )
     if stats["steps"] < MIN_STEPS:

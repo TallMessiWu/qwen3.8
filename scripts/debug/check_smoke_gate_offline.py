@@ -22,22 +22,41 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import smoke_qfa_decode_compare as s
 
 
-def topk(pick_tid, pick_lp, rival_tid, rival_lp, filler_base):
-    """One step's top-10: the two contenders plus eight identical also-rans."""
+def topk(pick_tid, pick_lp, rival_tid, rival_lp, filler_base, filler_shift=0):
+    """One step's top-10: the two contenders plus eight also-rans.
+
+    filler_shift renames some of the also-rans, which is how a step with
+    churning top-k membership but a stable winner is expressed.
+    """
     step = {str(pick_tid): [pick_lp, f"tok{pick_tid}"], str(rival_tid): [rival_lp, f"tok{rival_tid}"]}
     for j in range(8):
-        step[str(900 + j)] = [filler_base - j, f"f{j}"]
+        step[str(900 + j + filler_shift)] = [filler_base - j, f"f{j}"]
     return step
 
 
-def run(name, chosen, deltas, div_base, div_qfa, div_pick_b, div_pick_q, gate=None):
-    """chosen = tokens both runs picked before divergence; deltas = their shifts."""
+def run(
+    name,
+    chosen,
+    deltas,
+    div_base,
+    div_qfa,
+    div_pick_b,
+    div_pick_q,
+    gate=None,
+    rival_lp=-2.0,
+    q_shift=0,
+):
+    """chosen = tokens both runs picked before divergence; deltas = their shifts.
+
+    rival_lp sets how far ahead the winner is - raise it towards the winner to
+    make every step a near-tie. q_shift churns the QFA side's also-rans.
+    """
     if gate is not None:
         s.DELTA_GATE = gate
     b_steps, q_steps, b_ids, q_ids = [], [], [], []
     for i, (tid, d) in enumerate(zip(chosen, deltas)):
-        b_steps.append(topk(tid, -0.10 - i * 0.01, 800 + i, -2.0, -3.0))
-        q_steps.append(topk(tid, -0.10 - i * 0.01 - d, 800 + i, -2.0, -3.0))
+        b_steps.append(topk(tid, -0.10 - i * 0.01, 800 + i, rival_lp, -3.0))
+        q_steps.append(topk(tid, -0.10 - i * 0.01 - d, 800 + i, rival_lp, -3.0, q_shift))
         b_ids.append(tid)
         q_ids.append(tid)
     if div_base is not None:
@@ -91,6 +110,23 @@ p2 = run(
     div_pick_q=513,
 )
 
+# A flat prompt: every step a near-tie, the also-rans reshuffling underneath a
+# winner both runs agree on. Overlap alone would fail this - it is what put the
+# real prompt 0 at 8.08 against a gate of 8.0 while all 64 chosen tokens
+# matched - so the statistic has to abstain where no step is decisive.
+flat = run(
+    "flat prompt: near-ties throughout, top-k churns, every chosen token agrees",
+    list(range(500, 530)),
+    [0.05] * 30,
+    div_base=None,
+    div_qfa=None,
+    div_pick_b=None,
+    div_pick_q=None,
+    gate=0.5,
+    rival_lp=-0.30,
+    q_shift=4,
+)
+
 # The three real prompts above were measured without speculation, so they are
 # judged at that gate. Re-assert it explicitly before the sanity cases.
 bad_nospec = run(
@@ -127,6 +163,6 @@ bad_spec = run(
     gate=1.5,
 )
 
-print(f"RESULT green={[p0, p1, p2]} rejected_at_0.5={not bad_nospec} rejected_at_1.5={not bad_spec}")
+print(f"RESULT green={[p0, p1, p2]} flat_prompt_ok={flat} rejected_at_0.5={not bad_nospec} rejected_at_1.5={not bad_spec}")
 print(f"KNOWN GAP: a 1.2 defect passes the speculative gate -> {missed} (expected True)")
-sys.exit(0 if (p0 and p1 and p2 and not bad_nospec and not bad_spec and missed) else 1)
+sys.exit(0 if (p0 and p1 and p2 and flat and not bad_nospec and not bad_spec and missed) else 1)
