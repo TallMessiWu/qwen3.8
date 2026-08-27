@@ -10,7 +10,9 @@ The three prompts are the 2026-08-27 NUM_SPEC=0 run: prompt 0 diverged at step
 34 steps despite having the largest delta of the three, prompt 2 diverged at
 step 2 on a symmetric +-0.2500 flip. All three are quantization noise and must
 read GREEN. The sanity cases then pin down what each gate does and does not
-catch, including one defect the speculative gate is known to miss.
+catch: a flat prompt where overlap alone would false-RED, the measured MTP
+step that has to stay RED, a prediction of what that step should look like
+once the verify write is fixed, and an outright broken cache.
 
 Run: python scripts/debug/check_smoke_gate_offline.py
 """
@@ -143,6 +145,22 @@ mtp = run(
     gate=0.5,
 )
 
+# The same step once the verify write stops letting unconfirmed tokens set the
+# V window's scale. The shift is scaled by the 3x the policy simulation gives
+# (sim_qfa_spec_scale_policies.py), so this is a PREDICTION, not a measurement:
+# it says the gate can tell the fixed run from the broken one above, not that
+# the fix lands here. Replace it with the real numbers once the run exists.
+mtp_fixed = run(
+    "predicted MTP after the two-write fix: the same step at a third of the drift",
+    [600, 601],
+    [0.02, 0.02],
+    div_base=(-1.4281, -1.9906),
+    div_qfa=(-1.5046, -1.7823),
+    div_pick_b=198,
+    div_pick_q=198,
+    gate=0.5,
+)
+
 bad = run(
     "sanity: broken cache, delta 1.2",
     list(range(300, 310)),
@@ -156,6 +174,6 @@ bad = run(
 
 print(
     f"RESULT green={[p0, p1, p2]} flat_prompt_ok={flat} "
-    f"mtp_rejected={not mtp} broken_rejected={not bad}"
+    f"mtp_rejected={not mtp} mtp_fixed_accepted={mtp_fixed} broken_rejected={not bad}"
 )
 sys.exit(0 if (p0 and p1 and p2 and flat and not mtp and not bad) else 1)

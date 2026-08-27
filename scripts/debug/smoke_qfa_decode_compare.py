@@ -15,12 +15,14 @@ underlying error - what differed was only how soon a near-tie came up, and a
 tie flips on a fraction of a bf16 ulp. The acceptance rate is printed because
 a large drop there is the signal that verify accuracy suffered.
 
-Speculative decoding turns the MXFP8 cache OFF, so NUM_SPEC>0 measures the
-BF16 fallback rather than the cache, and the paged-path check below will fail
-the run as vacuous. The combination lost on both counts it was measured on -
-a 0.96 logprob shift that turned one prompt into a repetition loop, and 18.59x
-concurrency against BF16's 24.67x - so it is excluded until the V scale stops
-depending on tokens a verify step has not yet confirmed.
+NUM_SPEC>0 measures the same cache with MTP on top, and both of the things
+that used to cost have an answer now. The KV cache groups no longer collapse,
+because the drafter declares MXFP8 like the backbone instead of standing alone
+as the smallest bucket; and a verify step writes its V windows twice around
+the attention read, so tokens it has not yet confirmed no longer set the scale
+that read sees. Both need checking here: the group layout is printed at
+startup ("KV cache layout:"), the drift shows up in SELF_SPEC, and the
+acceptance rate says whether the drafter's own MXFP8 cache cost anything.
 
 check_smoke_gate_offline.py replays measured numbers through the gate offline;
 run it after touching any of the thresholds.
@@ -28,12 +30,11 @@ run it after touching any of the thresholds.
 Environment:
   MODEL_PATH    default /mnt/share/weight/Qwen3.8-27B-mxfp8
   TP_SIZE       default 1
-  NUM_SPEC      default 0; >0 configures MTP, which disables the MXFP8 cache
+  NUM_SPEC      default 0; >0 configures MTP, which now shares the same cache
   MAX_TOKENS    default 64
   SELF_SPEC     1 compares the QFA path against ITSELF with NUM_SPEC=0 rather
-                than against BF16. Kept for when speculation is allowed back on
-                the cache; today it reports a vacuous run, since neither side
-                engages the paged path.
+                than against BF16, which cancels the quantization error out and
+                leaves only what speculation costs. Needs NUM_SPEC>0.
   DELTA_GATE    default 0.5 - max chosen-token logprob shift
   OVERLAP_GATE  default 0.8 - min mean top-k overlap, as a fraction of k
   TOP_LOGPROBS  default 10
@@ -56,10 +57,8 @@ import time
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/share/weight/Qwen3.8-27B-mxfp8")
 TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
-# 0, because the MXFP8 KV cache is off whenever speculation is configured:
-# it costs both accuracy and capacity there, so decode falls back to BF16
-# and the paged path under test would never engage. Set NUM_SPEC>0 to check
-# that the fallback itself holds up, not to measure the cache.
+# 0 by default so the headline comparison is the cache alone. NUM_SPEC>0
+# adds MTP, which now serves from the same MXFP8 cache - the drafter included.
 NUM_SPEC = int(os.environ.get("NUM_SPEC", "0"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 # SELF_SPEC=1 runs the quantized path against ITSELF with speculation off,
@@ -68,14 +67,15 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 # It does NOT gate on the two agreeing, though the arithmetic argument says it
 # should: at temperature 0 rejection sampling only accepts a draft token that
 # already is the target's argmax, so the target alone decides the output, and
-# BF16 does reproduce its NUM_SPEC=0 output exactly. QFA does not, because its
-# V scale is shared across a 64-token window: a verify step appends up to
-# 1 + num_spec tokens before the attention read, so that read sees a scale a
-# non-speculative run reaches only later, and the same history comes back
-# quantized differently. Measured on 27B: outputs identical for 34 steps with
-# a 0.16 logprob delta throughout. So the same gate as the BF16 comparison
-# applies here - what this mode buys is a delta with the quantization error
-# already cancelled out, not an exact-match check.
+# BF16 does reproduce its NUM_SPEC=0 output exactly. QFA cannot quite, because
+# its V scale is shared across a 64-token window and the window is written
+# from the cache each step: the two-write sequence keeps THIS step's drafts
+# out of the scale the read sees, but a draft an earlier step wrote and a
+# later one rejected is already baked into how that history was rounded.
+# Simulated at roughly a third of the drift of letting the drafts in
+# (sim_qfa_spec_scale_policies.py) - a smaller number, not a zero. So the same
+# gate as the BF16 comparison applies here; what this mode buys is a delta
+# with the quantization error already cancelled out, not an exact match.
 SELF_SPEC = os.environ.get("SELF_SPEC") == "1"
 # The gate is the numeric error, not the length of the agreeing token chain.
 # 0.5 sits well clear of the 0.27 worst case measured without speculation,
@@ -238,6 +238,14 @@ def report_log(tag: str, log: str) -> dict:
         "paged_engaged": "QFA MXFP8 paged path engaged" in log,
     }
     print(f"  [{tag}] prefill_engaged={marks['prefill_engaged']} paged_engaged={marks['paged_engaged']}")
+    # How the layers were bucketed decides the scale tables' share of the
+    # cache: they are per layer where the value planes are shared, so a group
+    # size of 1 takes them from 3% of the values to 49%. Printing it for both
+    # runs puts the BF16 layout next to the MXFP8 one.
+    layout = [line.split("KV cache layout:", 1)[1].strip() for line in log.splitlines() if "KV cache layout:" in line]
+    for line in layout:
+        print(f"  [{tag}] layout: {line}")
+    marks["layout"] = layout
     accept = [line.strip() for line in log.splitlines() if ACCEPT_RE.search(line)]
     for line in accept[-3:]:
         print(f"  [{tag}] {line}")
