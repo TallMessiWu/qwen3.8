@@ -21,7 +21,9 @@ Environment:
   TP_SIZE       default 1
   NUM_SPEC      default 3 (0 disables MTP, exercising plain DecodeOnly instead)
   MAX_TOKENS    default 64
-  DELTA_GATE    default 0.5 - max chosen-token logprob shift
+  SELF_SPEC     1 compares the QFA path against ITSELF with NUM_SPEC=0 rather
+                than against BF16, isolating the verify path from quantization
+  DELTA_GATE    default 0.5 (0.05 under SELF_SPEC) - max chosen-token shift
   OVERLAP_GATE  default 0.8 - min mean top-k overlap, as a fraction of k
   TOP_LOGPROBS  default 10
   PROMPT_IDX    run only ALL_PROMPTS[idx] (isolates batching from content)
@@ -48,7 +50,15 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 # The gate is the numeric error, not the length of the agreeing token chain.
 # 0.5 sits well clear of the 0.27 worst case measured on 27B while still
 # catching the order-of-magnitude jump a broken cache produces.
-DELTA_GATE = float(os.environ.get("DELTA_GATE", "0.5"))
+### SELF_SPEC=1 runs the quantized path against ITSELF with speculation off,
+# instead of against BF16. Greedy output must not depend on speculative
+# decoding - at temperature 0 rejection sampling only accepts a draft token
+# that already is the target's argmax, so the target alone decides the output.
+# With the quantization error identical on both sides it cancels out, leaving
+# a check that is both far more sensitive than the BF16 comparison and free of
+# its judgement calls: anything but agreement is a bug in the verify path.
+SELF_SPEC = os.environ.get("SELF_SPEC") == "1"
+DELTA_GATE = float(os.environ.get("DELTA_GATE", "0.05" if SELF_SPEC else "0.5"))
 OVERLAP_GATE = float(os.environ.get("OVERLAP_GATE", "0.8"))
 # Below this many comparable steps the verdict rests on too little evidence to
 # mean much; it is reported rather than failed, since an early tie is normal.
@@ -133,14 +143,16 @@ LIVE_RE = re.compile(
 )
 
 
-def run_child(qfa: int, result_path: str) -> str:
+def run_child(qfa: int, result_path: str, num_spec: int | None = None, tag: str | None = None) -> str:
     env = dict(os.environ)
     env["VLLM_ASCEND_ENABLE_QFA_PREFILL"] = str(qfa)
     env["VLLM_ASCEND_ENABLE_QFA_DECODE"] = str(qfa)
+    if num_spec is not None:
+        env["NUM_SPEC"] = str(num_spec)
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")
     env.setdefault("PYTHONUNBUFFERED", "1")
-    tag = "qfa " if qfa else "base"
+    tag = (tag or ("qfa" if qfa else "base")).ljust(4)
     print(
         f"[INFO] launching child {tag.strip()} "
         f"(VLLM_ASCEND_ENABLE_QFA_PREFILL/DECODE={qfa}); filtered child output follows",
@@ -203,7 +215,7 @@ def _top_gap(step: dict) -> float:
     return ranked[0] - ranked[1] if len(ranked) > 1 else float("inf")
 
 
-def report_numerics(b: dict, q: dict, prefix: int) -> dict:
+def report_numerics(b: dict, q: dict, prefix: int, ref_label: str = "baseline", test_label: str = "qfa") -> dict:
     """Measure the cache's error on the steps where the runs are comparable.
 
     Both runs fed the model identical context for every step up to and
@@ -262,12 +274,13 @@ def report_numerics(b: dict, q: dict, prefix: int) -> dict:
     if prefix >= min(len(b_steps), len(q_steps)):
         return stats
     b_step, q_step = b_steps[prefix], q_steps[prefix]
+    width = max(len(ref_label), len(test_label))
     print(f"  divergence at step {prefix}:")
-    for who, tid in (("baseline", str(b["token_ids"][prefix])), ("qfa     ", str(q["token_ids"][prefix]))):
+    for who, tid in ((ref_label, str(b["token_ids"][prefix])), (test_label, str(q["token_ids"][prefix]))):
         label = (b_step.get(tid) or q_step.get(tid) or [0.0, "?"])[1]
         print(
-            f"    {who} picked {tid:>7} {label!r:<14} "
-            f"base={_logprob(b_step, tid)} qfa={_logprob(q_step, tid)}"
+            f"    {who.ljust(width)} picked {tid:>7} {label!r:<14} "
+            f"{ref_label}={_logprob(b_step, tid)} {test_label}={_logprob(q_step, tid)}"
         )
     print(f"    top1-top2 gap: base={_top_gap(b_step):.4f} qfa={_top_gap(q_step):.4f}")
     return stats
@@ -282,34 +295,39 @@ def main() -> int:
         print(f"[RED] missing {MODEL_PATH}/config.json")
         return 2
 
+    test_label, ref_label = (f"spec{NUM_SPEC}", "spec0") if SELF_SPEC else ("qfa", "baseline")
     with tempfile.TemporaryDirectory(prefix="qfa_dec_") as tmp:
-        base_path = os.path.join(tmp, "base.json")
-        qfa_path = os.path.join(tmp, "qfa.json")
-        # QFA first: it is the run that can fail, and waiting out a full
-        # baseline before finding that out wastes minutes every iteration.
-        qfa_log = run_child(1, qfa_path)
-        if os.environ.get("QFA_ONLY") == "1":
+        ref_path = os.path.join(tmp, "ref.json")
+        test_path = os.path.join(tmp, "test.json")
+        # The test run goes first: it is the one that can fail, and waiting out
+        # a full reference before finding that out wastes minutes every
+        # iteration.
+        test_log = run_child(1, test_path, tag=test_label)
+        if not SELF_SPEC and os.environ.get("QFA_ONLY") == "1":
             # Instrumentation runs only need the QFA child; the baseline costs
             # another three minutes and says nothing about the debug output.
-            with open(qfa_path, encoding="utf-8") as f:
-                qfa = json.load(f)
-            report_log("qfa", qfa_log)
-            for i, q in enumerate(qfa):
+            with open(test_path, encoding="utf-8") as f:
+                test = json.load(f)
+            report_log(test_label, test_log)
+            for i, t in enumerate(test):
                 print(f"== prompt {i}: {PROMPTS[i]!r}")
-                print(f"  qfa: {q['text']!r}")
+                print(f"  {test_label}: {t['text']!r}")
             print("[INFO] QFA_ONLY=1: skipped the baseline, no verdict")
             return 0
-        base_log = run_child(0, base_path)
-        with open(base_path, encoding="utf-8") as f:
+        ref_log = run_child(1 if SELF_SPEC else 0, ref_path, num_spec=0 if SELF_SPEC else None, tag=ref_label)
+        with open(ref_path, encoding="utf-8") as f:
             base = json.load(f)
-        with open(qfa_path, encoding="utf-8") as f:
+        with open(test_path, encoding="utf-8") as f:
             qfa = json.load(f)
 
     print("== run markers ==")
-    report_log("baseline", base_log)
-    qfa_marks = report_log("qfa", qfa_log)
-    if not qfa_marks["paged_engaged"]:
+    ref_marks = report_log(ref_label, ref_log)
+    test_marks = report_log(test_label, test_log)
+    if not test_marks["paged_engaged"]:
         print("[RED] the QFA run never entered the paged path - the comparison is vacuous")
+        return 1
+    if SELF_SPEC and not ref_marks["paged_engaged"]:
+        print("[RED] the spec0 reference never entered the paged path - it is not the same path")
         return 1
 
     all_ok = True
@@ -321,17 +339,23 @@ def main() -> int:
                 break
             prefix += 1
         shared = min(len(b_ids), len(q_ids))
+        width = max(len(ref_label), len(test_label))
         print(f"== prompt {i}: {PROMPTS[i]!r}")
-        print(f"  baseline: {b['text']!r}")
-        print(f"  qfa:      {q['text']!r}")
-        print(f"  greedy_prefix_match={prefix}/{shared} (informational - a near-tie flips this at any step)")
-        stats = report_numerics(b, q, prefix)
+        print(f"  {(ref_label + ':').ljust(width + 1)} {b['text']!r}")
+        print(f"  {(test_label + ':').ljust(width + 1)} {q['text']!r}")
+        note = "must be identical" if SELF_SPEC else "informational - a near-tie flips this at any step"
+        print(f"  greedy_prefix_match={prefix}/{shared} ({note})")
+        stats = report_numerics(b, q, prefix, ref_label, test_label)
         overlap_gate = OVERLAP_GATE * TOP_LOGPROBS
         ok = (
             stats["steps"] > 0
             and stats["max_delta"] <= DELTA_GATE
             and stats["mean_overlap"] >= overlap_gate
         )
+        if SELF_SPEC:
+            # Speculation is not allowed to change a single greedy token, so
+            # here the chains must agree outright - no tie-flip allowance.
+            ok = ok and prefix == shared
         print(
             f"  [{'GREEN' if ok else 'RED'}] prompt {i}: "
             f"delta {stats['max_delta']:.4f} vs gate {DELTA_GATE}, "
