@@ -93,6 +93,15 @@ def child(result_path: str) -> None:
                 "token_ids": list(seq.token_ids),
                 "text": seq.text,
                 "first_top": {str(tid): lp.logprob for tid, lp in first.items()},
+                # Every step's top-k, not just the first. Greedy can diverge
+                # well past token 0, and only the steps inside the shared
+                # prefix are comparable at all - there both runs fed the model
+                # the same context, so a logprob difference is the quantized
+                # KV cache's numeric error and nothing else.
+                "steps": [
+                    {str(tid): [lp.logprob, lp.decoded_token] for tid, lp in step.items()}
+                    for step in (seq.logprobs or [])
+                ],
             }
         )
     with open(result_path, "w", encoding="utf-8") as f:
@@ -104,6 +113,10 @@ def child(result_path: str) -> None:
 LIVE_RE = re.compile(
     r"QFA MXFP8|QFA-DEBUG|QFA-CACHE|Traceback|Error|ERROR|Exception|AssertionError|"
     r"Loading|Memory profiling|KV cache|Capturing|Adding requests|Processed prompts|"
+    # Page sizing decides whether the MXFP8 cache actually saves memory: the
+    # mamba page is padded to a BF16 attention page during platform setup, so
+    # these lines are what say the halved page survived.
+    r"attention block size|Padding mamba|[Cc]oncurrency|"
     r"[Aa]cceptance|it/s|\[child\]"
 )
 
@@ -165,6 +178,55 @@ def report_log(tag: str, log: str) -> dict:
         print(f"  [{tag}] {line}")
     marks["accept_lines"] = accept[-3:]
     return marks
+
+
+def _logprob(step: dict, tid: str) -> str:
+    entry = step.get(tid)
+    return f"{entry[0]:8.4f}" if entry else "  <off-topk>"
+
+
+def _top_gap(step: dict) -> float:
+    """How close this step was to flipping, ignoring the other run entirely."""
+    ranked = sorted((entry[0] for entry in step.values()), reverse=True)
+    return ranked[0] - ranked[1] if len(ranked) > 1 else float("inf")
+
+
+def report_numerics(b: dict, q: dict, prefix: int) -> None:
+    """Separate "the KV cache is wrong" from "greedy tipped over at a coin flip".
+
+    Two numbers decide it. Over the shared prefix both runs saw identical
+    context, so the delta on the token they both chose is a direct read of the
+    quantized cache's error - a few thousandths is quantization, tenths is a
+    bug. At the divergent step, the top1/top2 gap says how much error it would
+    have taken to flip: a gap below the measured delta means the flip is
+    explained by that error and nothing else has to be wrong.
+    """
+    b_steps, q_steps = b.get("steps") or [], q.get("steps") or []
+    if not b_steps or not q_steps:
+        print("  [WARN] no per-step logprobs in the result; rerun with the current script")
+        return
+    deltas = []
+    for i in range(min(prefix, len(b_steps), len(q_steps))):
+        tid = str(b["token_ids"][i])
+        if tid in b_steps[i] and tid in q_steps[i]:
+            deltas.append(abs(b_steps[i][tid][0] - q_steps[i][tid][0]))
+    if deltas:
+        print(
+            f"  chosen-token logprob delta across the shared prefix: "
+            f"max={max(deltas):.4f} mean={sum(deltas) / len(deltas):.4f} n={len(deltas)}"
+        )
+    if prefix >= min(len(b_steps), len(q_steps)):
+        print("  no divergence inside the logged steps")
+        return
+    b_step, q_step = b_steps[prefix], q_steps[prefix]
+    print(f"  divergence at step {prefix}:")
+    for who, tid in (("baseline", str(b["token_ids"][prefix])), ("qfa     ", str(q["token_ids"][prefix]))):
+        label = (b_step.get(tid) or q_step.get(tid) or [0.0, "?"])[1]
+        print(
+            f"    {who} picked {tid:>7} {label!r:<14} "
+            f"base={_logprob(b_step, tid)} qfa={_logprob(q_step, tid)}"
+        )
+    print(f"    top1-top2 gap: base={_top_gap(b_step):.4f} qfa={_top_gap(q_step):.4f}")
 
 
 def main() -> int:
@@ -231,6 +293,7 @@ def main() -> int:
                 f"    token {tid}: logprob base={b['first_top'][tid]:.4f} "
                 f"qfa={q['first_top'][tid]:.4f} delta={delta:.4f}"
             )
+        report_numerics(b, q, prefix)
         ok = first_same and overlap >= TOP_LOGPROBS - 1 and prefix >= min(PREFIX_GATE, shared)
         print(f"  [{'GREEN' if ok else 'RED'}] prompt {i}")
         all_ok = all_ok and ok
