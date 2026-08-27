@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Compare the MXFP8 QFA decode path against the BF16 baseline end to end.
 
-Milestone C moves the full-attention KV cache to MXFP8 and serves decode, MTP
-verify and chunked prefill from the paged QuantFlashAttn op. This runs the same
-greedy generation twice in subprocesses - once with both QFA switches off (BF16
-FIA everywhere) and once with both on - with MTP speculative decoding enabled so
-the verify path is exercised, then compares outputs and acceptance behaviour.
+Milestone C moves the full-attention KV cache to MXFP8 and serves decode and
+chunked prefill from the paged QuantFlashAttn op. This runs the same greedy
+generation twice in subprocesses - once with both QFA switches off (BF16 FIA
+everywhere) and once with both on - then compares the outputs.
 
 GREEN criteria: both runs finish, the QFA run reports the paged path engaged,
 and on the steps where the two runs saw identical context the quantized cache
@@ -16,21 +15,26 @@ underlying error - what differed was only how soon a near-tie came up, and a
 tie flips on a fraction of a bf16 ulp. The acceptance rate is printed because
 a large drop there is the signal that verify accuracy suffered.
 
-A speculative run is expected to be RED today, and that is a finding rather
-than a broken test: the V scale is shared across a 32-token group, a verify
-step writes every candidate's KV before the read that judges them, and the
-resulting shift reached 0.96 - enough to turn one prompt into a repetition
-loop. See DELTA_GATE. check_smoke_gate_offline.py replays measured numbers
-through the gate offline; run it after touching any of them.
+Speculative decoding turns the MXFP8 cache OFF, so NUM_SPEC>0 measures the
+BF16 fallback rather than the cache, and the paged-path check below will fail
+the run as vacuous. The combination lost on both counts it was measured on -
+a 0.96 logprob shift that turned one prompt into a repetition loop, and 18.59x
+concurrency against BF16's 24.67x - so it is excluded until the V scale stops
+depending on tokens a verify step has not yet confirmed.
+
+check_smoke_gate_offline.py replays measured numbers through the gate offline;
+run it after touching any of the thresholds.
 
 Environment:
   MODEL_PATH    default /mnt/share/weight/Qwen3.8-27B-mxfp8
   TP_SIZE       default 1
-  NUM_SPEC      default 3 (0 disables MTP, exercising plain DecodeOnly instead)
+  NUM_SPEC      default 0; >0 configures MTP, which disables the MXFP8 cache
   MAX_TOKENS    default 64
   SELF_SPEC     1 compares the QFA path against ITSELF with NUM_SPEC=0 rather
-                than against BF16, isolating the verify path from quantization
-  DELTA_GATE    default 0.5, or 1.5 when NUM_SPEC>0 - max chosen-token shift
+                than against BF16. Kept for when speculation is allowed back on
+                the cache; today it reports a vacuous run, since neither side
+                engages the paged path.
+  DELTA_GATE    default 0.5 - max chosen-token logprob shift
   OVERLAP_GATE  default 0.8 - min mean top-k overlap, as a fraction of k
   TOP_LOGPROBS  default 10
   PROMPT_IDX    run only ALL_PROMPTS[idx] (isolates batching from content)
@@ -52,7 +56,11 @@ import time
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/share/weight/Qwen3.8-27B-mxfp8")
 TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
-NUM_SPEC = int(os.environ.get("NUM_SPEC", "3"))
+# 0, because the MXFP8 KV cache is off whenever speculation is configured:
+# it costs both accuracy and capacity there, so decode falls back to BF16
+# and the paged path under test would never engage. Set NUM_SPEC>0 to check
+# that the fallback itself holds up, not to measure the cache.
+NUM_SPEC = int(os.environ.get("NUM_SPEC", "0"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 # SELF_SPEC=1 runs the quantized path against ITSELF with speculation off,
 # instead of against BF16, which isolates what speculation alone costs.
