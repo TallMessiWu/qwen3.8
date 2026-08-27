@@ -140,7 +140,7 @@ def child(result_path: str) -> None:
 # A 27B load takes minutes; without live output the script looks hung. These
 # patterns are surfaced as they arrive, everything else is kept for the report.
 LIVE_RE = re.compile(
-    r"QFA MXFP8|QFA-DEBUG|QFA-CACHE|Traceback|Error|ERROR|Exception|AssertionError|"
+    r"QFA MXFP8|QFA-DEBUG|QFA-CACHE|QFA-SCALE|Traceback|Error|ERROR|Exception|AssertionError|"
     r"Loading|Memory profiling|KV cache|Capturing|Adding requests|Processed prompts|"
     # Page sizing decides whether the MXFP8 cache actually saves memory: the
     # mamba page is padded to a BF16 attention page during platform setup, so
