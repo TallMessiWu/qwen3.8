@@ -170,8 +170,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="qfa_dec_") as tmp:
         base_path = os.path.join(tmp, "base.json")
         qfa_path = os.path.join(tmp, "qfa.json")
-        base_log = run_child(0, base_path)
+        # QFA first: it is the run that can fail, and waiting out a full
+        # baseline before finding that out wastes minutes every iteration.
         qfa_log = run_child(1, qfa_path)
+        base_log = run_child(0, base_path)
         with open(base_path, encoding="utf-8") as f:
             base = json.load(f)
         with open(qfa_path, encoding="utf-8") as f:
