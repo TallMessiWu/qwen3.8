@@ -42,6 +42,12 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   it while the others prefill, then pure decode steps. This is
                   the shape the end-to-end smoke takes and the earlier cases
                   never do. QFA_CASES=SCHEDULE runs just this case.
+  case 9 SHAPES   runs that same schedule over four block-table geometries,
+                  stepping from the hand-built one to the engine's real one
+                  (36 columns, ids far from zero, thousands of blocks). On
+                  hardware the live decode read is correct for batch row 0 and
+                  wrong for rows 1 and 2, which no earlier case reproduces.
+                  QFA_CASES=SHAPES runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -1088,7 +1094,7 @@ def _impl_write_value_bulk(staging, v_fp8, v_scale, value, cu_q, seq_lens_list, 
         q_start = q_end
 
 
-def case_real_schedule() -> bool:
+def _run_schedule(total_blocks: int, bt_cols: int, base_ids: list, label: str) -> bool:
     """Replay the step pattern a live engine produces for a 3-prompt batch.
 
     The runtime does not prefill every prompt together: it prefills the first
@@ -1096,8 +1102,12 @@ def case_real_schedule() -> bool:
     others prefill, and only afterwards settles into pure decode steps. The
     earlier cases all assumed the all-together shape, which is exactly the
     scheduling the end-to-end smoke never takes.
+
+    The block-table geometry is a parameter because the live engine hands the
+    op a far wider and sparser table than a hand-built test does, and the
+    decode read is wrong there for every batch row but the first.
     """
-    print("== case 8: real engine schedule (solo prefill -> mixed -> decode) ==")
+    print(f"== {label} ==")
     torch.manual_seed(808)
     nq, nkv, d, bs = 24, 4, 256, 128
     g = nq // nkv
@@ -1105,9 +1115,12 @@ def case_real_schedule() -> bool:
     b = len(prompt_lens)
     steps = int(os.environ.get("QFA_STEPS", "4"))
     softmax_scale = 1.0 / math.sqrt(d)
-    blocks_per_req = 2
-    total_blocks = b * blocks_per_req
-    block_table = torch.arange(total_blocks, dtype=torch.int32).reshape(b, blocks_per_req)
+    # Rows hold consecutive 128-token block ids, as the hybrid allocator's
+    # 1536-token pages do; columns past the allocation stay 0 (the null block).
+    block_table = torch.zeros(b, bt_cols, dtype=torch.int32)
+    for row, base in enumerate(base_ids):
+        span = min(bt_cols, 12)
+        block_table[row, :span] = torch.arange(base, base + span, dtype=torch.int32)
     bt_npu = block_table.npu()
 
     k_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
@@ -1217,7 +1230,41 @@ def case_real_schedule() -> bool:
         ok &= check([0, 1, 2], f"after decode {step}")
         if not ok:
             break
+    return ok
+
+
+def case_real_schedule() -> bool:
+    """The original hand-built geometry: narrow table, block ids from zero."""
+    print("== case 8: real engine schedule (solo prefill -> mixed -> decode) ==")
+    ok = _run_schedule(6, 2, [0, 2, 4], "8: narrow table, ids from 0")
     print(f"  [SCHEDULE] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
+def case_real_shapes() -> bool:
+    """Walk the block-table geometry from the test's toward the engine's.
+
+    Everything about the write side is verified byte-correct on hardware and
+    the first batch row reads back fine, so what is left is a per-row indexing
+    difference the earlier cases never exercised: the live table is 36 columns
+    wide, its ids start well above zero, and it indexes a cache of thousands
+    of blocks. Each variant changes exactly one of those.
+    """
+    print("== case 9: engine block-table geometry ==")
+    variants = (
+        (6, 2, [0, 2, 4], "9a control (= case 8)"),
+        (128, 2, [12, 60, 108], "9b real ids, narrow table"),
+        (128, 36, [12, 60, 108], "9c real ids, 36-column table"),
+        (2293, 36, [12, 60, 108], "9d real ids, wide table, full-size cache"),
+    )
+    results = []
+    for total_blocks, bt_cols, base_ids, label in variants:
+        ok = _run_schedule(total_blocks, bt_cols, base_ids, label)
+        results.append((label, ok))
+    for label, ok in results:
+        print(f"  [9] {label}: {'ok' if ok else 'DIVERGED'}")
+    ok = all(o for _, o in results)
+    print(f"  [SHAPES] {'GREEN' if ok else 'RED'}")
     return ok
 
 
@@ -1240,6 +1287,7 @@ def main() -> int:
         ("COMPOSE", case_write_read_composition),
         ("BATCH-STEPS", case_batched_decode_steps),
         ("SCHEDULE", case_real_schedule),
+        ("SHAPES", case_real_shapes),
     )
     only = os.environ.get("QFA_CASES")
     if only:
