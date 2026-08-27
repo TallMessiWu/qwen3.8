@@ -26,7 +26,9 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   (mask 0 vs 3 equivalence, kv boundaries), 5b MTP verify
                   q=4 + mixed accept lengths, 5c chunked-prefill mixed batch
                   with PREFILL(TND descale) x PA_BBND, 5e seqused=0 and 0x00
-                  scale-slot corners. QFA_CASES=C-SHAPES runs just this case.
+                  scale-slot corners, 5f a fixed max_seqlen_kv (what a captured
+                  aclgraph must carry) vs a tight one.
+                  QFA_CASES=C-SHAPES runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -406,7 +408,7 @@ def case_pa_bbnd() -> bool:
         "softmax_scale": softmax_scale,
         "mask_mode": 3,
         "max_seqlen_q": 1,
-        "max_seqlen_kv": max(kv_lens),
+        "max_seqlen_kv": max_kv or max(kv_lens),
         "layout_q": "TND",
         "layout_q_descale": "N2TGD",
         "layout_kv": "PA_BBND",
@@ -596,7 +598,7 @@ def case_27b_shape() -> bool:
 # Case 5: milestone-C decode/verify/chunked shapes on PA_BBND @ block_size=128
 # (officially zero-covered combination; 27B per-rank Nq=24 Nkv=4 D=256)
 # --------------------------------------------------------------------------
-def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_layout):
+def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_layout, max_kv=None, ret_out=False):
     """Generic PA_BBND runner: CPU-packed caches, per-seq golden, one QFA call."""
     torch.manual_seed(sum(map(ord, name)))  # deterministic across runs
     b = len(kv_lens)
@@ -672,7 +674,7 @@ def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_lay
         "softmax_scale": softmax_scale,
         "mask_mode": mask_mode,
         "max_seqlen_q": max(q_lens),
-        "max_seqlen_kv": max(kv_lens),
+        "max_seqlen_kv": max_kv or max(kv_lens),
         "layout_q": "TND",
         "layout_q_descale": q_descale_layout,
         "layout_kv": "PA_BBND",
@@ -680,6 +682,8 @@ def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_lay
     }
     mask = causal_mask_npu() if mask_mode == 3 else None
     out = call_qfa(npu_kwargs, nq, nkv, d, mask)
+    if ret_out:
+        return out
     print(f"  attn_out: shape={tuple(out.shape)} dtype={out.dtype}")
     return compare(name, out, torch.cat(goldens))
 
@@ -699,6 +703,14 @@ def case_c_decode_shapes() -> bool:
     ok &= _run_pa_bbnd("5c-mix", [1, 512], [300, 1536], nq, nkv, d, bs, 3, "TND")
     print("-- 5e zero/padding corners (seqused=0 req, 0x00 scale slots) --")
     ok &= _run_pa_bbnd("5e-zero", [1, 1], [0, 65], nq, nkv, d, bs, 3, "N2TGD")
+    print("-- 5f max_seqlen_kv as a capture constant vs a tight bound --")
+    args = ([4, 4], [130, 257], nq, nkv, d, bs, 3, "N2TGD")
+    tight = _run_pa_bbnd("5f-tight", *args, ret_out=True)
+    loose = _run_pa_bbnd("5f-const", *args, max_kv=8192, ret_out=True)
+    same = torch.equal(tight.cpu(), loose.cpu())
+    print(f"  [5f] tight(257) vs constant(8192) bit-exact={same}")
+    print(f"  [5f] {'GREEN' if same else 'RED'} (C3 capture needs a fixed max_seqlen_kv)")
+    ok &= same
     print(f"  [C-SHAPES] {'GREEN' if ok else 'RED'}")
     return ok
 
