@@ -33,6 +33,10 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   byte-compares it against the golden packing, then reads it
                   back through QFA - the composition that W1/W2 and case 5
                   each only half-cover. QFA_CASES=COMPOSE runs just this case.
+  case 7 BATCH-STEPS  prefills a 3-request batch then steps decode with the
+                  impl's own write algorithms, reading the cache back after
+                  every step and naming the first step/request that diverges.
+                  QFA_STEPS sets the step count (default 6).
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -812,9 +816,16 @@ def case_write_read_composition() -> bool:
         ref_vsc = v_group_scale(v_pad)
         ref_v = quantize_with_scale(v_pad, ref_vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
         v_match = torch.equal(v_fp8[blk, :s].cpu(), ref_v.view(torch.uint8))
-        vs_match = torch.equal(
-            v_scale[blk, : (s_pad // 64)].cpu(), pack_v_scale_seq(fp32_to_e8m0_bytes(ref_vsc, "v"))
-        )
+        # Groups made entirely of padding have no canonical scale: the golden
+        # calls them 2^0 and the NPU quantizer 2^-127, and either way they
+        # multiply zeroed V to zero. Compare only groups holding real tokens.
+        got_vs = v_scale[blk, : (s_pad // 64)].cpu()
+        exp_vs = pack_v_scale_seq(fp32_to_e8m0_bytes(ref_vsc, "v"))
+        real_groups = (s + GROUP - 1) // GROUP
+        vs_match = True
+        for grp in range(real_groups):
+            row, half = grp // 2, grp % 2
+            vs_match = vs_match and torch.equal(got_vs[row, ..., half], exp_vs[row, ..., half])
         print(
             f"  [6] req {i} (len={s}): k={k_match} k_scale={ks_match} v={v_match} v_scale={vs_match}"
         )
@@ -867,6 +878,171 @@ def case_write_read_composition() -> bool:
     return ok
 
 
+
+# --------------------------------------------------------------------------
+# Case 7: multi-step batched decode (the shape the end-to-end smoke fails on)
+# --------------------------------------------------------------------------
+def _impl_write_value_decode(staging, v_fp8, v_scale, value, req_ids, positions, ctx_lens, lens, bt, b):
+    """Port of AscendAttentionBackendImpl._qfa_write_value_decode."""
+    group, n, d = 64, value.shape[1], value.shape[2]
+    staging[req_ids, positions % 128] = value
+
+    reqs = torch.arange(b, device=value.device)
+    last_window = torch.div(lens - 1, group, rounding_mode="floor").clamp(min=0)
+    first_window = torch.minimum(torch.div(ctx_lens, group, rounding_mode="floor"), last_window)
+    windows = torch.stack([first_window, last_window], dim=1).reshape(-1)
+    win_reqs = reqs.repeat_interleave(2)
+
+    rows = staging.view(-1, 2, group, n, d)[win_reqs, windows % 2]
+    valid = (lens.repeat_interleave(2) - windows * group).clamp(0, group)
+    keep = torch.arange(group, device=value.device).unsqueeze(0) < valid.unsqueeze(1)
+    rows = rows * keep.view(-1, group, 1, 1)
+
+    fp8, scale = _impl_quant_windows(rows)
+    blocks = bt[win_reqs, torch.div(windows, 2, rounding_mode="floor")].long()
+    slots = blocks * 2 + (windows % 2)
+    v_fp8.view(-1, group, n, d).index_put_((slots,), fp8)
+    v_scale.view(-1, n, d, 2).index_put_((slots,), scale)
+
+
+def case_batched_decode_steps() -> bool:
+    """Prefill a 3-request batch, then step decode, checking the cache each step.
+
+    The end-to-end smoke is correct for a single request and wrong for the same
+    request inside a batch, so the fault lives in the per-request bookkeeping
+    across steps rather than in the op or the packing. This drives the impl's
+    own write algorithms over several decode steps and reads the cache back
+    after each one, naming the first step and request that diverges.
+    """
+    print("== case 7: batched prefill + multi-step decode (impl algorithms) ==")
+    torch.manual_seed(707)
+    nq, nkv, d, bs = 24, 4, 256, 128
+    g = nq // nkv
+    prompt_lens = [5, 10, 9]
+    b = len(prompt_lens)
+    steps = int(os.environ.get("QFA_STEPS", "6"))
+    softmax_scale = 1.0 / math.sqrt(d)
+    blocks_per_req = 2
+    total_blocks = b * blocks_per_req
+    block_table = torch.arange(total_blocks, dtype=torch.int32).reshape(b, blocks_per_req)
+    bt_npu = block_table.npu()
+
+    k_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    k_scale = torch.zeros(total_blocks, bs, nkv, d // 64, 2, dtype=torch.uint8).npu()
+    v_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    v_scale = torch.zeros(total_blocks, bs // 64, nkv, d, 2, dtype=torch.uint8).npu()
+    staging = torch.zeros(b + 1, 128, nkv, d, dtype=torch.bfloat16).npu()
+
+    # Full history per request, revealed one step at a time.
+    total = [s + steps for s in prompt_lens]
+    keys = [torch.randn(t, nkv, d, dtype=torch.bfloat16).npu() for t in total]
+    values = [torch.randn(t, nkv, d, dtype=torch.bfloat16).npu() for t in total]
+
+    def slots_for(req, lo, hi):
+        pos = torch.arange(lo, hi, device="npu")
+        return (bt_npu[req, torch.div(pos, bs, rounding_mode="floor")].long() * bs + pos % bs)
+
+    # ---- step 0: prefill all three (bulk path) ----
+    key_cat = torch.cat([keys[i][: prompt_lens[i]] for i in range(b)])
+    kf, ks = _impl_quant_key(key_cat)
+    all_slots = torch.cat([slots_for(i, 0, prompt_lens[i]) for i in range(b)])
+    k_fp8.view(-1, nkv, d).index_put_((all_slots,), kf)
+    k_scale.view(-1, nkv, d // 64, 2).index_put_((all_slots,), ks)
+    for i, s in enumerate(prompt_lens):
+        num_windows = (s - 1) // 64 + 1
+        buf = torch.zeros(num_windows * 64, nkv, d, dtype=torch.bfloat16).npu()
+        buf[:s] = values[i][:s]
+        vf, vsc = _impl_quant_windows(buf.view(num_windows, 64, nkv, d))
+        windows = torch.arange(num_windows).npu()
+        blocks = bt_npu[i, torch.div(windows, 2, rounding_mode="floor")].long()
+        v_fp8.view(-1, 64, nkv, d).index_put_((blocks * 2 + windows % 2,), vf)
+        v_scale.view(-1, nkv, d, 2).index_put_((blocks * 2 + windows % 2,), vsc)
+        staging[i, torch.arange(s).npu() % 128] = buf[:s]
+    torch.npu.synchronize()
+
+    cur = list(prompt_lens)
+    ok = True
+    for step in range(1, steps + 1):
+        # ---- write one new token per request (decode path) ----
+        new_key = torch.stack([keys[i][cur[i]] for i in range(b)])
+        new_value = torch.stack([values[i][cur[i]] for i in range(b)])
+        slots = torch.stack([slots_for(i, cur[i], cur[i] + 1)[0] for i in range(b)])
+        kf, ks = _impl_quant_key(new_key)
+        k_fp8.view(-1, nkv, d).index_put_((slots,), kf)
+        k_scale.view(-1, nkv, d // 64, 2).index_put_((slots,), ks)
+
+        ctx_lens = torch.tensor(cur, dtype=torch.int32).npu()
+        lens = ctx_lens + 1
+        req_ids = torch.arange(b).npu()
+        positions = ctx_lens.clone()
+        _impl_write_value_decode(
+            staging, v_fp8, v_scale, new_value, req_ids, positions, ctx_lens, lens, bt_npu, b
+        )
+        cur = [c + 1 for c in cur]
+        torch.npu.synchronize()
+
+        # ---- read the whole batch back and compare to golden ----
+        q_all, qs_all, goldens = [], [], []
+        for i in range(b):
+            s = cur[i]
+            q = torch.randn(1, nq, d, dtype=torch.bfloat16)
+            qsc = qk_group_scale(q)
+            q_fp8 = quantize_with_scale(q, qsc.repeat_interleave(GROUP, dim=-1)[..., :d])
+            q_all.append(q_fp8)
+            qs_all.append(pack_last_pairs(fp32_to_e8m0_bytes(qsc, "q")))
+            k_cpu = keys[i][:s].cpu()
+            v_cpu = values[i][:s].cpu()
+            ref_ksc = qk_group_scale(k_cpu)
+            ref_k = quantize_with_scale(k_cpu, ref_ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+            s_pad = (s + 63) // 64 * 64
+            v_pad = torch.nn.functional.pad(v_cpu.float(), (0, 0, 0, 0, 0, s_pad - s))
+            ref_vsc = v_group_scale(v_pad)
+            ref_v = quantize_with_scale(v_pad, ref_vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+            goldens.append(
+                cpu_golden_one_seq(
+                    q_fp8, ref_k, ref_v, qsc, ref_ksc,
+                    ref_vsc[: (s + GROUP - 1) // GROUP], softmax_scale, True,
+                )
+            )
+        qs = torch.cat(qs_all).reshape(b, nkv, g, d // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
+        npu_kwargs = {
+            "q": torch.cat(q_all).npu(),
+            "k": k_fp8.view(torch.float8_e4m3fn),
+            "v": v_fp8.view(torch.float8_e4m3fn),
+            "q_descale": e8m0_npu(qs),
+            "k_descale": k_scale.view(torch.float8_e8m0fnu),
+            "v_descale": v_scale.view(torch.float8_e8m0fnu),
+            "block_table": bt_npu,
+            "cu_seqlens_q": torch.arange(b + 1, dtype=torch.int32).npu(),
+            "seqused_kv": torch.tensor(cur, dtype=torch.int32).npu(),
+            "softmax_scale": softmax_scale,
+            "mask_mode": 3,
+            "max_seqlen_q": 1,
+            "max_seqlen_kv": max(cur),
+            "layout_q": "TND",
+            "layout_q_descale": "N2TGD",
+            "layout_kv": "PA_BBND",
+            "layout_out": "TND",
+        }
+        out = call_qfa(npu_kwargs, nq, nkv, d, causal_mask_npu()).float().cpu()
+        bad = []
+        for i in range(b):
+            ref = goldens[i].float()
+            got = out[i : i + 1]
+            cos = torch.nn.functional.cosine_similarity(
+                got.reshape(-1), ref.reshape(-1), dim=0
+            ).item()
+            if cos < 0.999:
+                bad.append((i, cur[i], round(cos, 5)))
+        status = "ok" if not bad else f"DIVERGED {bad}"
+        print(f"  [7] step {step} lens={cur}: {status}")
+        if bad:
+            ok = False
+            break
+    print(f"  [BATCH-STEPS] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -884,6 +1060,7 @@ def main() -> int:
         ("27B", case_27b_shape),
         ("C-SHAPES", case_c_decode_shapes),
         ("COMPOSE", case_write_read_composition),
+        ("BATCH-STEPS", case_batched_decode_steps),
     )
     only = os.environ.get("QFA_CASES")
     if only:
