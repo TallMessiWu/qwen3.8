@@ -33,6 +33,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/share/weight/Qwen3.8-27B-mxfp8")
 TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
@@ -70,8 +71,10 @@ def child(result_path: str) -> None:
         safetensors_load_strategy="lazy",
         **kwargs,
     )
+    print(f"[child] engine ready, generating {len(PROMPTS)} prompts x {MAX_TOKENS} tokens", flush=True)
     params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, logprobs=TOP_LOGPROBS)
     outputs = llm.generate(PROMPTS, params)
+    print("[child] generation done", flush=True)
     result = []
     for out in outputs:
         seq = out.outputs[0]
@@ -87,25 +90,57 @@ def child(result_path: str) -> None:
         json.dump(result, f)
 
 
+# A 27B load takes minutes; without live output the script looks hung. These
+# patterns are surfaced as they arrive, everything else is kept for the report.
+LIVE_RE = re.compile(
+    r"QFA MXFP8|Traceback|Error|ERROR|Exception|AssertionError|"
+    r"Loading|Memory profiling|KV cache|Capturing|Adding requests|Processed prompts|"
+    r"[Aa]cceptance|it/s|\[child\]"
+)
+
+
 def run_child(qfa: int, result_path: str) -> str:
     env = dict(os.environ)
     env["VLLM_ASCEND_ENABLE_QFA_PREFILL"] = str(qfa)
     env["VLLM_ASCEND_ENABLE_QFA_DECODE"] = str(qfa)
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")
-    print(f"[INFO] launching child with QFA={qfa} (prefill+decode) ...", flush=True)
-    proc = subprocess.run(
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    tag = "qfa " if qfa else "base"
+    print(
+        f"[INFO] launching child {tag.strip()} "
+        f"(VLLM_ASCEND_ENABLE_QFA_PREFILL/DECODE={qfa}); filtered child output follows",
+        flush=True,
+    )
+    started = time.time()
+    proc = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--child", result_path],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
-        check=False,  # the tail of a failing child is more useful than a traceback
+        bufsize=1,
     )
-    log = proc.stdout + proc.stderr
+    lines: list[str] = []
+    last_print = started
+    for line in proc.stdout:
+        lines.append(line)
+        now = time.time()
+        if LIVE_RE.search(line):
+            print(f"  [{tag} {now - started:5.0f}s] {line.rstrip()}", flush=True)
+            last_print = now
+        elif now - last_print >= 30:
+            # Heartbeat so a long quiet stretch is not mistaken for a hang.
+            print(f"  [{tag} {now - started:5.0f}s] ... alive, {len(lines)} log lines", flush=True)
+            last_print = now
+    proc.wait()
+    log = "".join(lines)
+    print(f"[INFO] child {tag.strip()} finished in {time.time() - started:.0f}s (rc={proc.returncode})", flush=True)
     if proc.returncode != 0:
-        tail = "\n".join(log.splitlines()[-40:])
-        print(f"[RED] child QFA={qfa} exited {proc.returncode}\n{tail}")
+        print(f"[RED] child {tag.strip()} exited {proc.returncode}; last 40 lines:")
+        for tail_line in log.splitlines()[-40:]:
+            print(f"    {tail_line}")
         raise SystemExit(1)
     return log
 
