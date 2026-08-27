@@ -180,6 +180,17 @@ def main() -> int:
         # QFA first: it is the run that can fail, and waiting out a full
         # baseline before finding that out wastes minutes every iteration.
         qfa_log = run_child(1, qfa_path)
+        if os.environ.get("QFA_ONLY") == "1":
+            # Instrumentation runs only need the QFA child; the baseline costs
+            # another three minutes and says nothing about the debug output.
+            with open(qfa_path, encoding="utf-8") as f:
+                qfa = json.load(f)
+            report_log("qfa", qfa_log)
+            for i, q in enumerate(qfa):
+                print(f"== prompt {i}: {PROMPTS[i]!r}")
+                print(f"  qfa: {q['text']!r}")
+            print("[INFO] QFA_ONLY=1: skipped the baseline, no verdict")
+            return 0
         base_log = run_child(0, base_path)
         with open(base_path, encoding="utf-8") as f:
             base = json.load(f)
