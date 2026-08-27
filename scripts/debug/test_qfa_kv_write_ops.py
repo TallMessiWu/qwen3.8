@@ -361,8 +361,10 @@ def case_v_incremental() -> bool:
             positions = torch.arange(seq_len, seq_len + adv).npu()
             staging[positions % BS] = new
             new_len = seq_len + adv
-            w_last = (new_len - 1) // 64
-            for w in sorted({max(0, w_last - 1), w_last}):
+            # Only windows that received a token: an older one may already have
+            # scrolled out of the 128-row ring, and rewriting it from stale ring
+            # rows would corrupt bytes that were committed correctly earlier.
+            for w in sorted({seq_len // 64, (new_len - 1) // 64}):
                 _v_window_write(staging, new_len, w, v_fp8, v_scale, block_table)
             seq_len = new_len
             if seq_len == 130:  # simulate spec rollback: reject 2 of the last step
@@ -370,9 +372,8 @@ def case_v_incremental() -> bool:
                 # rejected positions will be re-sampled with DIFFERENT values,
                 # so stale staging rows must actually be overwritten next step
                 all_v[seq_len : seq_len + 2] = torch.randn(2, n, d, dtype=torch.bfloat16).npu()
-                w_last = (seq_len - 1) // 64
-                for w in sorted({max(0, w_last - 1), w_last}):
-                    _v_window_write(staging, seq_len, w, v_fp8, v_scale, block_table)
+                # A rollback adds no tokens, so no window needs rewriting; the
+                # rejected slots are overwritten by the next step's tokens.
     torch.npu.synchronize()
 
     # one-shot reference: quantize the whole (rolled-back-consistent) sequence

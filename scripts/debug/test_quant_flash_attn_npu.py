@@ -408,7 +408,7 @@ def case_pa_bbnd() -> bool:
         "softmax_scale": softmax_scale,
         "mask_mode": 3,
         "max_seqlen_q": 1,
-        "max_seqlen_kv": max_kv or max(kv_lens),
+        "max_seqlen_kv": max(kv_lens),
         "layout_q": "TND",
         "layout_q_descale": "N2TGD",
         "layout_kv": "PA_BBND",
@@ -598,9 +598,11 @@ def case_27b_shape() -> bool:
 # Case 5: milestone-C decode/verify/chunked shapes on PA_BBND @ block_size=128
 # (officially zero-covered combination; 27B per-rank Nq=24 Nkv=4 D=256)
 # --------------------------------------------------------------------------
-def _run_pa_bbnd(name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_layout, max_kv=None, ret_out=False):
+def _run_pa_bbnd(
+    name, q_lens, kv_lens, nq, nkv, d, bs, mask_mode, q_descale_layout, max_kv=None, ret_out=False, seed=None
+):
     """Generic PA_BBND runner: CPU-packed caches, per-seq golden, one QFA call."""
-    torch.manual_seed(sum(map(ord, name)))  # deterministic across runs
+    torch.manual_seed(seed if seed is not None else sum(map(ord, name)))  # deterministic across runs
     b = len(kv_lens)
     g = nq // nkv
     softmax_scale = 1.0 / math.sqrt(d)
@@ -705,8 +707,8 @@ def case_c_decode_shapes() -> bool:
     ok &= _run_pa_bbnd("5e-zero", [1, 1], [0, 65], nq, nkv, d, bs, 3, "N2TGD")
     print("-- 5f max_seqlen_kv as a capture constant vs a tight bound --")
     args = ([4, 4], [130, 257], nq, nkv, d, bs, 3, "N2TGD")
-    tight = _run_pa_bbnd("5f-tight", *args, ret_out=True)
-    loose = _run_pa_bbnd("5f-const", *args, max_kv=8192, ret_out=True)
+    tight = _run_pa_bbnd("5f-tight", *args, ret_out=True, seed=5150)
+    loose = _run_pa_bbnd("5f-const", *args, max_kv=8192, ret_out=True, seed=5150)
     same = torch.equal(tight.cpu(), loose.cpu())
     print(f"  [5f] tight(257) vs constant(8192) bit-exact={same}")
     print(f"  [5f] {'GREEN' if same else 'RED'} (C3 capture needs a fixed max_seqlen_kv)")
