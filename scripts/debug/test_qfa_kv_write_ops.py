@@ -9,13 +9,14 @@ K quantizes per-token along D; V shares one e8m0 per (head,channel) across 32
 tokens (packed 64/row), so decode appends re-quantize a 128-row staging ring.
 
 Cases (each prints GREEN/RED; non-blocking probes print INFO):
-  P1 scatter-int8    npu_scatter_pa_kv_cache on int8 views + slot=-1 skip
-  P2 scatter-scale   same op writing (T,N,8) uint8 scale planes (head_size
-                     mismatch vs. values -> separate call), fallback probing
-  P3 index-put       uint8 flat-slot index_put_ fallback + negative-slot remap
+  P1 scatter-bbnd    can the fused scatter serve a BBND cache? (informational;
+                     first run said no - it wants the NZ-style C8 layout)
+  P2 scatter-scale   same question for (T,N,8) scale planes (informational)
+  P3 index-put       the write path actually used: uint8 flat-slot index_put_
+                     with negative slots folded onto the null block
   P4 quant-k128      npu_dynamic_mx_quant on (rows,128) vs CPU reference
   P5 noncontig-qfa   strided k-cache view fed to QFA (informational)
-  W1 k-write-golden  full K path: quant -> scatter -> bit-exact vs CPU ref
+  W1 k-write-golden  full K path: quant -> index_put_ -> bit-exact vs CPU ref
   W2 v-incremental   the 128-row staging-ring algorithm, stepped +1..+4 with
                      64/128-boundary crossings and a spec-decode rollback,
                      final cache bit-exact vs one-shot whole-sequence quant
@@ -108,31 +109,35 @@ def npu_quant_128(x_rows_128_npu: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 # P1: npu_scatter_pa_kv_cache on int8 views + -1 skip
 # --------------------------------------------------------------------------
 def probe_scatter_int8() -> bool:
+    """Informational: can the fused scatter serve a (Bn,Bs,N,D) BBND cache?
+
+    Answer from the first run: no. aclnnScatterPaKvCache demands
+    key_cache.dim1 == ceil(numHead*headSize/lastDim) with a 32-byte last dim,
+    i.e. the NZ-style layout the C8 path uses. Milestone C keeps the vLLM-native
+    BBND layout (QFA reads it directly), so the write path uses index_put_
+    instead. Kept as a probe so a future CANN release that lifts the constraint
+    shows up here.
+    """
     import torch_npu
 
-    print("== P1: npu_scatter_pa_kv_cache int8 + slot=-1 skip ==")
+    print("== P1: npu_scatter_pa_kv_cache on a BBND cache (informational) ==")
     t, n, d, bn = 5, 2, 32, 2
     key = torch.randint(-127, 127, (t, n, d), dtype=torch.int8).npu()
-    value = torch.randint(-127, 127, (t, n, d), dtype=torch.int8).npu()
     k_cache = torch.zeros(bn, BS, n, d, dtype=torch.int8).npu()
     v_cache = torch.zeros(bn, BS, n, d, dtype=torch.int8).npu()
     slots = torch.tensor([0, 1, 130, -1, 255], dtype=torch.int32).npu()
-    torch_npu.npu_scatter_pa_kv_cache(key, value, k_cache, v_cache, slots)
-    torch.npu.synchronize()
-
-    k_flat = k_cache.view(bn * BS, n, d).cpu()
-    key_cpu = key.cpu()
-    ok = True
-    for i, s in enumerate([0, 1, 130, 255]):
-        src = i if i < 3 else 4  # slots[3] == -1 skipped
-        if not torch.equal(k_flat[s], key_cpu[src]):
-            print(f"  [P1] slot {s} mismatch")
-            ok = False
-    written = int(k_flat.flatten(1).ne(0).any(dim=1).sum())
-    print(f"  [P1] rows written={written} (expect 4; token@slot=-1 skipped)")
-    ok = ok and written == 4
-    print(f"  [P1] {'GREEN' if ok else 'RED'}")
-    return ok
+    try:
+        torch_npu.npu_scatter_pa_kv_cache(key, key, k_cache, v_cache, slots)
+        torch.npu.synchronize()
+        k_flat = k_cache.view(bn * BS, n, d).cpu()
+        key_cpu = key.cpu()
+        hits = [s_ for i, s_ in enumerate([0, 1, 130, 255]) if torch.equal(k_flat[s_], key_cpu[i if i < 3 else 4])]
+        written = int(k_flat.flatten(1).ne(0).any(dim=1).sum())
+        print(f"  [P1] INFO: ACCEPTED, {len(hits)}/4 slots match, rows written={written} (-1 skipped)")
+    except Exception as exc:  # noqa: BLE001 - capability probe
+        print(f"  [P1] INFO: rejected for BBND layout -> index_put_ write path stands: {exc}")
+    print("  [P1] GREEN (informational)")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -141,7 +146,7 @@ def probe_scatter_int8() -> bool:
 def probe_scatter_scale() -> bool:
     import torch_npu
 
-    print("== P2: scatter for k_scale planes (head_size=8 uint8-as-int8) ==")
+    print("== P2: scatter for k_scale planes (head_size=8, informational) ==")
     t, n, bn = 5, 2, 2
     ds = 8  # D/64*2 for D=256
     scale = torch.randint(0, 255, (t, n, ds), dtype=torch.uint8)
@@ -156,13 +161,13 @@ def probe_scatter_scale() -> bool:
         torch.npu.synchronize()
         got = s_cache.view(bn * BS, n, ds).cpu()
         ok = all(torch.equal(got[s], scale[i]) for i, s in enumerate([3, 64, 127, 128, 200]))
-        print(f"  [P2] dedicated-call scatter works, values {'match' if ok else 'MISMATCH'}")
-        print(f"  [P2] {'GREEN' if ok else 'RED'}")
-        return ok
+        print(f"  [P2] INFO: scatter accepted scale planes, values {'match' if ok else 'MISMATCH'}")
+        print("  [P2] GREEN (informational)")
+        return True
     except Exception as exc:  # noqa: BLE001 - probe reports capability
-        print(f"  [P2] scatter rejected head_size={ds}: {exc}")
-        print("  [P2] RED (will rely on P3 index_put_ fallback for scales)")
-        return False
+        print(f"  [P2] INFO: scatter rejected head_size={ds}: {exc}")
+        print("  [P2] GREEN (informational; scales go through index_put_)")
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -179,9 +184,9 @@ def probe_index_put() -> bool:
     torch.npu.synchronize()
     got = s_cache.cpu()
     scale_cpu = scale.cpu()
-    ok = all(torch.equal(got[s], scale_cpu[i]) for i, s in enumerate([3, 64, 128, 200]) if i != 2)
-    # slot -1 remapped to 0: row 0 holds token 2's plane (garbage into null block, by design)
-    ok = ok and torch.equal(got[0], scale_cpu[2])
+    # token index -> destination row, with token 2 (slot -1) folded onto the null block
+    expected = {0: 3, 1: 64, 2: 0, 3: 128, 4: 200}
+    ok = all(torch.equal(got[row], scale_cpu[tok]) for tok, row in expected.items())
     print(f"  [P3] {'GREEN' if ok else 'RED'} (negative slot lands in null block 0)")
     return ok
 
@@ -260,41 +265,40 @@ def probe_noncontig_qfa() -> bool:
 # W1: full K write path, bit-exact vs CPU
 # --------------------------------------------------------------------------
 def case_k_write_golden() -> bool:
+    """Full K path exactly as the impl does it: quant -> index_put_ -> golden."""
     import torch_npu
 
-    print("== W1: K quant+scatter vs CPU golden (bit-exact) ==")
+    print("== W1: K quant+index_put_ vs CPU golden (bit-exact) ==")
     torch.manual_seed(21)
     t, n, d, bn = 100, 4, 256, 3
     key = torch.randn(t, n, d, dtype=torch.bfloat16)
-    slots = torch.randperm(bn * BS)[:t].to(torch.int32)
+    slots = torch.randperm(bn * BS)[:t]
+    slots[7] = -1  # a padded token must land in the null block, not corrupt a real slot
 
-    # NPU path: quant (T*N, D) -> scatter values (int8 view) + scales (uint8)
     fp8, scale = torch_npu.npu_dynamic_mx_quant(
         key.npu().reshape(t * n, d), dst_type=FP8, scale_alg=0
     )
-    fp8 = fp8.reshape(t, n, d)
+    fp8 = fp8.reshape(t, n, d).view(torch.uint8)
     scale_b = scale.view(torch.uint8).reshape(t, n, d // GROUP)
-    k_cache = torch.zeros(bn, BS, n, d, dtype=torch.int8).npu()
-    ks_cache = torch.zeros(bn, BS, n, d // GROUP, dtype=torch.uint8).npu()
-    v_dummy = torch.zeros_like(fp8.view(torch.int8))
-    vc_dummy = torch.zeros_like(k_cache)
-    torch_npu.npu_scatter_pa_kv_cache(
-        fp8.view(torch.int8), v_dummy, k_cache, vc_dummy, slots.npu()
-    )
-    ks_cache.view(bn * BS, n, d // GROUP).index_put_((slots.long().npu(),), scale_b)
+    k_cache = torch.zeros(bn * BS, n, d, dtype=torch.uint8).npu()
+    ks_cache = torch.zeros(bn * BS, n, d // GROUP, dtype=torch.uint8).npu()
+    safe = torch.where(slots >= 0, slots, torch.zeros_like(slots)).to(torch.int64).npu()
+    k_cache.index_put_((safe,), fp8)
+    ks_cache.index_put_((safe,), scale_b.npu())
     torch.npu.synchronize()
 
-    # CPU reference
     ref_scale = qk_group_scale(key)
     ref_fp8 = quantize_with_scale(key, ref_scale.repeat_interleave(GROUP, dim=-1)[..., :d])
     ref_scale_b = fp32_to_e8m0_bytes(ref_scale)
 
-    got_k = k_cache.view(bn * BS, n, d).cpu()
-    got_s = ks_cache.view(bn * BS, n, d // GROUP).cpu()
-    fp8_match = (got_k[slots.long()] == ref_fp8.view(torch.int8)).float().mean().item()
-    scale_match = (got_s[slots.long()] == ref_scale_b).float().mean().item()
+    got_k = k_cache.cpu()
+    got_s = ks_cache.cpu()
+    real = slots >= 0
+    fp8_match = (got_k[slots[real].long()] == ref_fp8.view(torch.uint8)[real]).float().mean().item()
+    scale_match = (got_s[slots[real].long()] == ref_scale_b[real]).float().mean().item()
     untouched = torch.ones(bn * BS, dtype=torch.bool)
-    untouched[slots.long()] = False
+    untouched[slots[real].long()] = False
+    untouched[0] = False  # null block absorbs the padded token
     clean = bool((got_k[untouched] == 0).all())
     print(f"  [W1] fp8 match={fp8_match:.6f} scale match={scale_match:.6f} untouched-clean={clean}")
     ok = fp8_match >= 0.99 and scale_match >= 0.999 and clean
@@ -305,23 +309,32 @@ def case_k_write_golden() -> bool:
 # --------------------------------------------------------------------------
 # W2: V 128-row staging-ring incremental algorithm
 # --------------------------------------------------------------------------
+def quant_window_rows(rows: torch.Tensor):
+    """Mirror of AscendAttentionBackendImpl._qfa_quant_along_tokens.
+
+    (W,64,N,D) BF16 -> fp8 (W,64,N,D) + packed scale (W,N,D,2): one E8M0 pair
+    per (head, channel) per 64-token window.
+    """
+    import torch_npu
+
+    w, group, n, d = rows.shape
+    cols = rows.permute(0, 2, 3, 1).reshape(w * n * d, group).contiguous()
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(cols, dst_type=FP8, scale_alg=0)
+    fp8 = fp8.reshape(w, n, d, group).permute(0, 3, 1, 2).contiguous()
+    return fp8, scale.view(torch.uint8).reshape(w, n, d, 2)
+
+
 def _v_window_write(staging, seq_len, w, v_fp8_flat, v_scale_flat, block_table):
-    """Re-quantize window w (64 rows) from the ring and write cache."""
-    n, d = staging.shape[1], staging.shape[2]
+    """Re-quantize window w (64 rows) from the ring and write it to cache."""
     half = (w % 2) * 64
-    rows = staging[half : half + 64]  # (64, N, D) BF16 view
+    rows = staging[half : half + 64]  # (64, N, D) BF16 view into the ring
     valid = max(0, min(64, seq_len - w * 64))
     if valid < 64:
-        rows[valid:] = 0  # zero rows beyond current (possibly rolled-back) tail
-    cols = rows.permute(1, 2, 0).reshape(n * d, 64)  # quant along token axis
-    padded = torch.zeros(n * d, BS, dtype=cols.dtype, device=cols.device)
-    padded[:, :64] = cols
-    fp8, scale = npu_quant_128(padded)
-    fp8 = fp8[:, :64].reshape(n, d, 64).permute(2, 0, 1)  # (64,N,D)
-    scale = scale.reshape(n, d, 4)[..., :2]  # first 64 cols -> groups 0,1 -> (N,D,2)
+        rows[valid:] = 0  # drop anything past the (possibly rolled-back) tail
+    fp8, scale = quant_window_rows(rows.unsqueeze(0))
     slot0 = int(block_table[w * 64 // BS]) * (BS // 64) + (w * 64 % BS) // 64
-    v_fp8_flat[slot0] = fp8.view(torch.int8)
-    v_scale_flat[slot0] = scale
+    v_fp8_flat[slot0] = fp8[0].view(torch.int8)
+    v_scale_flat[slot0] = scale[0]
 
 
 def case_v_incremental() -> bool:
@@ -369,20 +382,45 @@ def case_v_incremental() -> bool:
         rows = torch.zeros(64, n, d, dtype=torch.bfloat16).npu()
         valid = min(64, seq_len - w * 64)
         rows[:valid] = all_v[w * 64 : w * 64 + valid]
-        cols = rows.permute(1, 2, 0).reshape(n * d, 64)
-        padded = torch.zeros(n * d, BS, dtype=cols.dtype, device=cols.device)
-        padded[:, :64] = cols
-        fp8, scale = npu_quant_128(padded)
+        fp8, scale = quant_window_rows(rows.unsqueeze(0))
         slot0 = block_table[w * 64 // BS] * (BS // 64) + (w * 64 % BS) // 64
-        ref_fp8[slot0] = fp8[:, :64].reshape(n, d, 64).permute(2, 0, 1).view(torch.int8)
-        ref_scale[slot0] = scale.reshape(n, d, 4)[..., :2]
+        ref_fp8[slot0] = fp8[0].view(torch.int8)
+        ref_scale[slot0] = scale[0]
     torch.npu.synchronize()
 
     used = (seq_len + 63) // 64
-    fp8_eq = torch.equal(v_fp8[:used].cpu(), ref_fp8[:used].cpu())
-    scale_eq = torch.equal(v_scale[:used].cpu(), ref_scale[:used].cpu())
-    print(f"  [W2] final seq_len={seq_len} windows={used} fp8 bit-exact={fp8_eq} scale bit-exact={scale_eq}")
-    ok = fp8_eq and scale_eq
+    got_f, ref_f = v_fp8.cpu(), ref_fp8.cpu()
+    got_s, ref_s = v_scale.cpu(), ref_scale.cpu()
+    bad_fp8, bad_scale = [], []
+    for w in range(used):
+        slot = block_table[w * 64 // BS] * (BS // 64) + (w * 64 % BS) // 64
+        if not torch.equal(got_f[slot], ref_f[slot]):
+            bad_fp8.append((w, slot, int((got_f[slot] != ref_f[slot]).sum())))
+        if not torch.equal(got_s[slot], ref_s[slot]):
+            bad_scale.append((w, slot, int((got_s[slot] != ref_s[slot]).sum())))
+    print(f"  [W2] final seq_len={seq_len} windows={used}")
+    if bad_fp8 or bad_scale:
+        print(f"  [W2] fp8 mismatching windows (w, slot, diff_bytes)={bad_fp8}")
+        print(f"  [W2] scale mismatching windows (w, slot, diff_bytes)={bad_scale}")
+        # For the first bad window, show whether the staging ring or the
+        # quantization is at fault: re-quantize straight from all_v.
+        w, slot, _ = (bad_fp8 or bad_scale)[0]
+        rows = torch.zeros(64, n, d, dtype=torch.bfloat16).npu()
+        valid = min(64, seq_len - w * 64)
+        rows[:valid] = all_v[w * 64 : w * 64 + valid]
+        half = (w % 2) * 64
+        ring = staging[half : half + 64].clone()
+        ring[valid:] = 0
+        same_rows = torch.equal(ring.cpu(), rows.cpu())
+        # Only meaningful for the last two windows: the ring has moved on
+        # from anything older, which is expected and not itself a fault.
+        print(f"  [W2] first bad window w={w} (last window={(seq_len - 1) // 64}): "
+              f"staging rows == all_v rows? {same_rows}")
+        if not same_rows:
+            diff = (ring.float() - rows.float()).abs().sum(dim=(1, 2))
+            bad_rows = torch.nonzero(diff > 0).flatten().tolist()
+            print(f"  [W2]   differing ring rows within the window: {bad_rows[:16]}")
+    ok = not bad_fp8 and not bad_scale
     print(f"  [W2] {'GREEN' if ok else 'RED'}")
     return ok
 
