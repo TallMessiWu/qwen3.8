@@ -37,6 +37,11 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   impl's own write algorithms, reading the cache back after
                   every step and naming the first step/request that diverges.
                   QFA_STEPS sets the step count (default 6).
+  case 8 SCHEDULE replays the step pattern a live engine actually produces:
+                  the first prompt prefills alone, then a mixed batch decodes
+                  it while the others prefill, then pure decode steps. This is
+                  the shape the end-to-end smoke takes and the earlier cases
+                  never do. QFA_CASES=SCHEDULE runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -1043,6 +1048,179 @@ def case_batched_decode_steps() -> bool:
     return ok
 
 
+
+# --------------------------------------------------------------------------
+# Case 8: the schedule the runtime actually produces (mixed prefill+decode)
+# --------------------------------------------------------------------------
+def _impl_write_value_bulk(staging, v_fp8, v_scale, value, cu_q, seq_lens_list, bt, num_reqs):
+    """Port of AscendAttentionBackendImpl._qfa_write_value_bulk."""
+    group, n, d = 64, value.shape[1], value.shape[2]
+    q_start = 0
+    for req in range(num_reqs):
+        q_end = cu_q[req]
+        q_len = q_end - q_start
+        new_len = seq_lens_list[req]
+        if q_len <= 0 or new_len <= 0:
+            q_start = q_end
+            continue
+        ctx_len = new_len - q_len
+        first_window = ctx_len // group
+        num_windows = (new_len - 1) // group - first_window + 1
+        lead = ctx_len - first_window * group
+
+        buf = value.new_zeros(num_windows * group, n, d)
+        if lead > 0:
+            ring_rows = torch.arange(first_window * group, ctx_len, device=value.device) % 128
+            buf[:lead] = staging[req, ring_rows]
+        buf[lead : lead + q_len] = value[q_start:q_end]
+
+        windows = torch.arange(first_window, first_window + num_windows, device=value.device)
+        blocks = bt[req, torch.div(windows, 2, rounding_mode="floor")].long()
+        fp8, scale = _impl_quant_windows(buf.view(num_windows, group, n, d))
+        slots = blocks * 2 + (windows % 2)
+        v_fp8.view(-1, group, n, d).index_put_((slots,), fp8)
+        v_scale.view(-1, n, d, 2).index_put_((slots,), scale)
+
+        buf_start = first_window * group
+        ring_lo = max(new_len - 128, buf_start)
+        tail_positions = torch.arange(ring_lo, new_len, device=value.device)
+        staging[req, tail_positions % 128] = buf[tail_positions - buf_start]
+        q_start = q_end
+
+
+def case_real_schedule() -> bool:
+    """Replay the step pattern a live engine produces for a 3-prompt batch.
+
+    The runtime does not prefill every prompt together: it prefills the first
+    one alone, then runs a mixed batch where that request decodes while the
+    others prefill, and only afterwards settles into pure decode steps. The
+    earlier cases all assumed the all-together shape, which is exactly the
+    scheduling the end-to-end smoke never takes.
+    """
+    print("== case 8: real engine schedule (solo prefill -> mixed -> decode) ==")
+    torch.manual_seed(808)
+    nq, nkv, d, bs = 24, 4, 256, 128
+    g = nq // nkv
+    prompt_lens = [5, 5, 9]  # what the smoke actually tokenizes to
+    b = len(prompt_lens)
+    steps = int(os.environ.get("QFA_STEPS", "4"))
+    softmax_scale = 1.0 / math.sqrt(d)
+    blocks_per_req = 2
+    total_blocks = b * blocks_per_req
+    block_table = torch.arange(total_blocks, dtype=torch.int32).reshape(b, blocks_per_req)
+    bt_npu = block_table.npu()
+
+    k_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    k_scale = torch.zeros(total_blocks, bs, nkv, d // 64, 2, dtype=torch.uint8).npu()
+    v_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    v_scale = torch.zeros(total_blocks, bs // 64, nkv, d, 2, dtype=torch.uint8).npu()
+    staging = torch.zeros(b + 1, 128, nkv, d, dtype=torch.bfloat16).npu()
+
+    horizon = max(prompt_lens) + steps + 4
+    keys = [torch.randn(horizon, nkv, d, dtype=torch.bfloat16).npu() for _ in range(b)]
+    values = [torch.randn(horizon, nkv, d, dtype=torch.bfloat16).npu() for _ in range(b)]
+    cur = [0] * b
+
+    def slots_for(req, lo, hi):
+        pos = torch.arange(lo, hi, device="npu")
+        return bt_npu[req, torch.div(pos, bs, rounding_mode="floor")].long() * bs + pos % bs
+
+    def run_step(active, q_lens, bulk):
+        """One engine step over `active` requests taking `q_lens` tokens each."""
+        key_cat = torch.cat([keys[r][cur[r] : cur[r] + q] for r, q in zip(active, q_lens)])
+        val_cat = torch.cat([values[r][cur[r] : cur[r] + q] for r, q in zip(active, q_lens)])
+        all_slots = torch.cat([slots_for(r, cur[r], cur[r] + q) for r, q in zip(active, q_lens)])
+        kf, ks = _impl_quant_key(key_cat)
+        k_fp8.view(-1, nkv, d).index_put_((all_slots,), kf)
+        k_scale.view(-1, nkv, d // 64, 2).index_put_((all_slots,), ks)
+
+        new_lens = [cur[r] + q for r, q in zip(active, q_lens)]
+        sub_bt = bt_npu[torch.tensor(active).npu()]
+        if bulk:
+            cu = torch.tensor(q_lens).cumsum(0).tolist()
+            _impl_write_value_bulk(staging, v_fp8, v_scale, val_cat, cu, new_lens, sub_bt, len(active))
+        else:
+            ctx = torch.tensor([cur[r] for r in active], dtype=torch.int32).npu()
+            lens = torch.tensor(new_lens, dtype=torch.int32).npu()
+            req_ids = torch.arange(len(active)).npu()
+            _impl_write_value_decode(
+                staging, v_fp8, v_scale, val_cat, req_ids, ctx, ctx, lens, sub_bt, len(active)
+            )
+        for r, q in zip(active, q_lens):
+            cur[r] += q
+        torch.npu.synchronize()
+
+    def check(active, tag):
+        """Read every active request back with a single decode token."""
+        q_all, qs_all, goldens = [], [], []
+        for r in active:
+            s = cur[r]
+            q = torch.randn(1, nq, d, dtype=torch.bfloat16)
+            qsc = qk_group_scale(q)
+            q_fp8 = quantize_with_scale(q, qsc.repeat_interleave(GROUP, dim=-1)[..., :d])
+            q_all.append(q_fp8)
+            qs_all.append(pack_last_pairs(fp32_to_e8m0_bytes(qsc, "q")))
+            k_cpu, v_cpu = keys[r][:s].cpu(), values[r][:s].cpu()
+            ref_ksc = qk_group_scale(k_cpu)
+            ref_k = quantize_with_scale(k_cpu, ref_ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+            s_pad = (s + 63) // 64 * 64
+            v_pad = torch.nn.functional.pad(v_cpu.float(), (0, 0, 0, 0, 0, s_pad - s))
+            ref_vsc = v_group_scale(v_pad)
+            ref_v = quantize_with_scale(v_pad, ref_vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+            goldens.append(
+                cpu_golden_one_seq(
+                    q_fp8, ref_k, ref_v, qsc, ref_ksc,
+                    ref_vsc[: (s + GROUP - 1) // GROUP], softmax_scale, True,
+                )
+            )
+        n_act = len(active)
+        qs = torch.cat(qs_all).reshape(n_act, nkv, g, d // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
+        npu_kwargs = {
+            "q": torch.cat(q_all).npu(),
+            "k": k_fp8.view(torch.float8_e4m3fn),
+            "v": v_fp8.view(torch.float8_e4m3fn),
+            "q_descale": e8m0_npu(qs),
+            "k_descale": k_scale.view(torch.float8_e8m0fnu),
+            "v_descale": v_scale.view(torch.float8_e8m0fnu),
+            "block_table": bt_npu[torch.tensor(active).npu()],
+            "cu_seqlens_q": torch.arange(n_act + 1, dtype=torch.int32).npu(),
+            "seqused_kv": torch.tensor([cur[r] for r in active], dtype=torch.int32).npu(),
+            "softmax_scale": softmax_scale,
+            "mask_mode": 3,
+            "max_seqlen_q": 1,
+            "max_seqlen_kv": max(cur[r] for r in active),
+            "layout_q": "TND",
+            "layout_q_descale": "N2TGD",
+            "layout_kv": "PA_BBND",
+            "layout_out": "TND",
+        }
+        out = call_qfa(npu_kwargs, nq, nkv, d, causal_mask_npu()).float().cpu()
+        bad = []
+        for i, r in enumerate(active):
+            cos = torch.nn.functional.cosine_similarity(
+                out[i : i + 1].reshape(-1), goldens[i].float().reshape(-1), dim=0
+            ).item()
+            if cos < 0.999:
+                bad.append((f"req{r}", cur[r], round(cos, 5)))
+        lens = [cur[r] for r in active]
+        print(f"  [8] {tag} lens={lens}: {'ok' if not bad else f'DIVERGED {bad}'}")
+        return not bad
+
+    ok = True
+    run_step([0], [prompt_lens[0]], bulk=True)  # step 1: PrefillNoCache, req 0 alone
+    ok &= check([0], "after solo prefill")
+    # step 2: ChunkedPrefill - req 0 decodes while reqs 1 and 2 prefill
+    run_step([0, 1, 2], [1, prompt_lens[1], prompt_lens[2]], bulk=True)
+    ok &= check([0, 1, 2], "after mixed batch")
+    for step in range(1, steps + 1):  # steps 3+: pure decode
+        run_step([0, 1, 2], [1, 1, 1], bulk=False)
+        ok &= check([0, 1, 2], f"after decode {step}")
+        if not ok:
+            break
+    print(f"  [SCHEDULE] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -1061,6 +1239,7 @@ def main() -> int:
         ("C-SHAPES", case_c_decode_shapes),
         ("COMPOSE", case_write_read_composition),
         ("BATCH-STEPS", case_batched_decode_steps),
+        ("SCHEDULE", case_real_schedule),
     )
     only = os.environ.get("QFA_CASES")
     if only:
