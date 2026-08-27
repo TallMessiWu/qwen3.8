@@ -127,10 +127,24 @@ flat = run(
     q_shift=4,
 )
 
-# The three real prompts above were measured without speculation, so they are
-# judged at that gate. Re-assert it explicitly before the sanity cases.
-bad_nospec = run(
-    "sanity: broken cache, delta 1.2 at the NUM_SPEC=0 gate 0.5",
+# The MTP run measured on 2026-08-27. The baseline's pick moved only 0.23 -
+# the number a one-sided delta would report - while the candidate that
+# displaced it moved 0.96, and the output degenerated into a repetition loop.
+# This has to come out RED, both because the run is genuinely bad and because
+# it is what stops a one-sided delta from being reinstated.
+mtp = run(
+    "measured MTP: '\\n' moved 0.23 but the '\\n\\n' that won moved 0.96",
+    [600, 601],
+    [0.05, 0.05],
+    div_base=(-1.4281, -1.9906),
+    div_qfa=(-1.6576, -1.0326),
+    div_pick_b=198,
+    div_pick_q=271,
+    gate=0.5,
+)
+
+bad = run(
+    "sanity: broken cache, delta 1.2",
     list(range(300, 310)),
     [1.2] * 10,
     div_base=(-0.5, -0.9),
@@ -139,30 +153,9 @@ bad_nospec = run(
     div_pick_q=401,
     gate=0.5,
 )
-# The speculative gate is 3x looser, so this is what it can and cannot catch.
-# A defect of the same size now passes: that is the documented cost of the
-# gate, and the reason NUM_SPEC=0 stays the real accuracy check.
-missed = run(
-    "gap: the SAME 1.2 defect at the NUM_SPEC>0 gate 1.5 - expected to pass",
-    list(range(300, 310)),
-    [1.2] * 10,
-    div_base=(-0.5, -0.9),
-    div_qfa=(-2.0, -0.6),
-    div_pick_b=400,
-    div_pick_q=401,
-    gate=1.5,
-)
-bad_spec = run(
-    "sanity: broken cache, delta 3.0 at the NUM_SPEC>0 gate 1.5",
-    list(range(300, 310)),
-    [3.0] * 10,
-    div_base=(-0.5, -0.9),
-    div_qfa=(-4.0, -0.6),
-    div_pick_b=400,
-    div_pick_q=401,
-    gate=1.5,
-)
 
-print(f"RESULT green={[p0, p1, p2]} flat_prompt_ok={flat} rejected_at_0.5={not bad_nospec} rejected_at_1.5={not bad_spec}")
-print(f"KNOWN GAP: a 1.2 defect passes the speculative gate -> {missed} (expected True)")
-sys.exit(0 if (p0 and p1 and p2 and flat and not bad_nospec and not bad_spec and missed) else 1)
+print(
+    f"RESULT green={[p0, p1, p2]} flat_prompt_ok={flat} "
+    f"mtp_rejected={not mtp} broken_rejected={not bad}"
+)
+sys.exit(0 if (p0 and p1 and p2 and flat and not mtp and not bad) else 1)

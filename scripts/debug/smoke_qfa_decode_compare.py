@@ -16,12 +16,12 @@ underlying error - what differed was only how soon a near-tie came up, and a
 tie flips on a fraction of a bf16 ulp. The acceptance rate is printed because
 a large drop there is the signal that verify accuracy suffered.
 
-NUM_SPEC=0 is the real accuracy check. Speculation gets a 3x looser gate for
-the reason spelled out at DELTA_GATE, loose enough that a defect shifting
-logprobs by 1.2 would pass it, so a green speculative run means the verify
-path did not make things much worse - not that the cache is accurate.
-check_smoke_gate_offline.py replays measured numbers through both gates and
-pins down that gap; run it after touching any of them.
+A speculative run is expected to be RED today, and that is a finding rather
+than a broken test: the V scale is shared across a 32-token group, a verify
+step writes every candidate's KV before the read that judges them, and the
+resulting shift reached 0.96 - enough to turn one prompt into a repetition
+loop. See DELTA_GATE. check_smoke_gate_offline.py replays measured numbers
+through the gate offline; run it after touching any of them.
 
 Environment:
   MODEL_PATH    default /mnt/share/weight/Qwen3.8-27B-mxfp8
@@ -73,15 +73,16 @@ SELF_SPEC = os.environ.get("SELF_SPEC") == "1"
 # 0.5 sits well clear of the 0.27 worst case measured without speculation,
 # while still catching the order-of-magnitude jump a broken cache produces.
 #
-# Speculation gets its own gate rather than loosening that one, which would
-# let real defects through on the path that has none. A verify step writes
-# 1 + num_spec tokens before the read, and the V scale it shares across a
-# 32-token group moves with every one of them: measured on 27B at num_spec=3,
-# a step moves 12% of the scale bytes against 4% without speculation, 2.6x at
-# a group boundary rising to 6.3x mid-group. The same underlying error
-# therefore surfaces several times larger - worst observed 0.95 - so 1.5
-# keeps roughly the same headroom over the measured worst case that 0.5 does.
-DELTA_GATE = float(os.environ.get("DELTA_GATE", "1.5" if NUM_SPEC > 0 else "0.5"))
+# Speculation does NOT get a looser gate, though it earns one on paper: a
+# verify step writes 1 + num_spec tokens before the read, and the V scale
+# shared across a 32-token group moves with every one of them, so the same
+# underlying error surfaces several times larger (12% of the scale bytes move
+# per step at num_spec=3, against 4% without). But the enlarged number IS the
+# damage - at 0.96 it turned one prompt's output into a repetition loop - and
+# a gate that excuses it by pointing at where it came from reports success on
+# a run nobody would ship. Speculative runs stay RED here until the V scale
+# stops depending on tokens the step has not yet confirmed.
+DELTA_GATE = float(os.environ.get("DELTA_GATE", "0.5"))
 OVERLAP_GATE = float(os.environ.get("OVERLAP_GATE", "0.8"))
 # Top-k membership churns on its own wherever the top two candidates sit close
 # together: the ranks below them are settled by hundredths of a logprob, and
@@ -278,15 +279,20 @@ def report_numerics(b: dict, q: dict, prefix: int, ref_label: str = "baseline", 
     last = min(prefix + 1, len(b_steps), len(q_steps))
     deltas, overlaps, off_topk = [], [], 0
     for i in range(last):
-        tid = str(b["token_ids"][i])
-        b_lp, q_lp = b_steps[i].get(tid), q_steps[i].get(tid)
-        if b_lp and q_lp:
-            deltas.append(abs(b_lp[0] - q_lp[0]))
-        else:
-            # The baseline's pick left the QFA run's top-k entirely, so the
-            # shift is larger than this window can measure. Fail loudly
-            # instead of quietly dropping the step from the average.
-            off_topk += 1
+        # Both picks, not just the reference's. At the divergent step the
+        # candidate that WON under QFA is usually the one that moved: measured
+        # on 27B with MTP, the baseline's '\n' shifted 0.23 while the '\n\n'
+        # that displaced it shifted 0.96. Tracking one side reports the
+        # smaller number and calls a real regression clean.
+        for tid in {str(b["token_ids"][i]), str(q["token_ids"][i])}:
+            b_lp, q_lp = b_steps[i].get(tid), q_steps[i].get(tid)
+            if b_lp and q_lp:
+                deltas.append(abs(b_lp[0] - q_lp[0]))
+            else:
+                # A pick left the other run's top-k entirely, so the shift is
+                # larger than this window can measure. Fail loudly instead of
+                # quietly dropping the step from the average.
+                off_topk += 1
         if _top_gap(b_steps[i]) >= OVERLAP_MIN_GAP:
             overlaps.append(len(set(b_steps[i]) & set(q_steps[i])))
     stats.update(
