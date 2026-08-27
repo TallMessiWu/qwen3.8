@@ -145,7 +145,7 @@ def probe_scatter_int8() -> bool:
         written = int(k_flat.flatten(1).ne(0).any(dim=1).sum())
         print(f"  [P1] INFO: ACCEPTED, {len(hits)}/4 slots match, rows written={written} (-1 skipped)")
     except Exception as exc:  # noqa: BLE001 - capability probe
-        print(f"  [P1] INFO: rejected for BBND layout (expected) -> index_put_ write path stands")
+        print("  [P1] INFO: rejected for BBND layout (expected) -> index_put_ write path stands")
         print(f"  [P1]       {brief(exc)}")
     print("  [P1] GREEN (informational)")
     return True
