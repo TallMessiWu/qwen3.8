@@ -68,9 +68,11 @@ def child(result_path: str) -> None:
         trust_remote_code=True,
         dtype="bfloat16",
         tensor_parallel_size=TP_SIZE,
-        max_model_len=4096,
+        max_model_len=int(os.environ.get("MAX_LEN", "4096")),
         max_num_seqs=4,
-        gpu_memory_utilization=0.85,
+        # QFA decode allocates its own MXFP8 planes on top of the BF16 cache,
+        # so leave it headroom: both shrink together as this comes down.
+        gpu_memory_utilization=float(os.environ.get("GPU_UTIL", "0.85")),
         enforce_eager=True,
         seed=1024,
         safetensors_load_strategy="lazy",
