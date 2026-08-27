@@ -19,6 +19,7 @@ Environment:
   NUM_SPEC     default 3 (0 disables MTP, exercising plain DecodeOnly instead)
   MAX_TOKENS   default 64
   PREFIX_GATE  default 8
+  PROMPT_IDX   run only ALL_PROMPTS[idx] (isolates batching from content)
 
 Example (27B single card, mirrors scripts/27B.sh):
   MODEL_PATH=/mnt/share/weight/Qwen3.8-27B-mxfp8 TP_SIZE=1 \
@@ -40,11 +41,15 @@ TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
 NUM_SPEC = int(os.environ.get("NUM_SPEC", "3"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 PREFIX_GATE = int(os.environ.get("PREFIX_GATE", "8"))
-PROMPTS = [
+ALL_PROMPTS = [
     "The capital of France is",
     "请用一句话介绍一下人工智能。",
     "Count from one to twenty in English words:",
 ]
+# PROMPT_IDX isolates one prompt so a batched-only failure can be told apart
+# from a content-dependent one.
+_IDX = os.environ.get("PROMPT_IDX")
+PROMPTS = [ALL_PROMPTS[int(_IDX)]] if _IDX else ALL_PROMPTS
 TOP_LOGPROBS = 5
 ACCEPT_RE = re.compile(r"(?:acceptance length|Acceptance rate|accepted)[^\n]*", re.IGNORECASE)
 
@@ -71,7 +76,9 @@ def child(result_path: str) -> None:
         safetensors_load_strategy="lazy",
         **kwargs,
     )
-    print(f"[child] engine ready, generating {len(PROMPTS)} prompts x {MAX_TOKENS} tokens", flush=True)
+    tok = llm.get_tokenizer()
+    lens = [len(tok.encode(p)) for p in PROMPTS]
+    print(f"[child] engine ready, prompts={len(PROMPTS)} token_lens={lens} x {MAX_TOKENS} tokens", flush=True)
     params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, logprobs=TOP_LOGPROBS)
     outputs = llm.generate(PROMPTS, params)
     print("[child] generation done", flush=True)
