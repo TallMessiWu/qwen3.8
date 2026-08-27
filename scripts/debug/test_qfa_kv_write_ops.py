@@ -8,7 +8,9 @@ Milestone C stores KV as MXFP8 inside the existing BF16 cache allocation
 K quantizes per-token along D; V shares one e8m0 per (head,channel) across 32
 tokens (packed 64/row), so decode appends re-quantize a 128-row staging ring.
 
-Cases (each prints GREEN/RED; non-blocking probes print INFO):
+Cases (each prints GREEN/RED). The P* probes deliberately call ops with
+layouts we expect to be rejected, so CANN error text in their output is the
+recorded answer, not a failure.
   P1 scatter-bbnd    can the fused scatter serve a BBND cache? (informational;
                      first run said no - it wants the NZ-style C8 layout)
   P2 scatter-scale   same question for (T,N,8) scale planes (informational)
@@ -105,6 +107,14 @@ def npu_quant_128(x_rows_128_npu: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return fp8, scale.view(torch.uint8)  # (rows,128) fp8, (rows,4)? -> checked by P4
 
 
+def brief(exc: Exception) -> str:
+    """One-line gist of a CANN failure: the full stack is expected noise here."""
+    for line in str(exc).splitlines():
+        if "Reason:" in line or "incorrect" in line:
+            return line.strip()
+    return str(exc).splitlines()[0].strip()
+
+
 # --------------------------------------------------------------------------
 # P1: npu_scatter_pa_kv_cache on int8 views + -1 skip
 # --------------------------------------------------------------------------
@@ -135,7 +145,8 @@ def probe_scatter_int8() -> bool:
         written = int(k_flat.flatten(1).ne(0).any(dim=1).sum())
         print(f"  [P1] INFO: ACCEPTED, {len(hits)}/4 slots match, rows written={written} (-1 skipped)")
     except Exception as exc:  # noqa: BLE001 - capability probe
-        print(f"  [P1] INFO: rejected for BBND layout -> index_put_ write path stands: {exc}")
+        print(f"  [P1] INFO: rejected for BBND layout (expected) -> index_put_ write path stands")
+        print(f"  [P1]       {brief(exc)}")
     print("  [P1] GREEN (informational)")
     return True
 
@@ -165,7 +176,8 @@ def probe_scatter_scale() -> bool:
         print("  [P2] GREEN (informational)")
         return True
     except Exception as exc:  # noqa: BLE001 - probe reports capability
-        print(f"  [P2] INFO: scatter rejected head_size={ds}: {exc}")
+        print(f"  [P2] INFO: scatter rejected head_size={ds} (expected)")
+        print(f"  [P2]       {brief(exc)}")
         print("  [P2] GREEN (informational; scales go through index_put_)")
         return True
 
@@ -256,7 +268,8 @@ def probe_noncontig_qfa() -> bool:
         torch.npu.synchronize()
         print("  [P5] INFO: strided k view ACCEPTED (TensorV2 path available)")
     except Exception as exc:  # noqa: BLE001 - informational probe
-        print(f"  [P5] INFO: strided k view rejected -> contiguous carve-out required: {exc}")
+        print("  [P5] INFO: strided k view rejected -> contiguous carve-out required")
+        print(f"  [P5]       {brief(exc)}")
     print("  [P5] GREEN (informational)")
     return True
 
