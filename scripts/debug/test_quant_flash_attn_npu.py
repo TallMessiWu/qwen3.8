@@ -29,6 +29,10 @@ suite (tests/pytest/qfa_mxfp8_test/common/quant_flash_attn_golden.py):
                   scale-slot corners, 5f a fixed max_seqlen_kv (what a captured
                   aclgraph must carry) vs a tight one.
                   QFA_CASES=C-SHAPES runs just this case.
+  case 6 COMPOSE  writes a KV cache with the milestone-C impl's own algorithm,
+                  byte-compares it against the golden packing, then reads it
+                  back through QFA - the composition that W1/W2 and case 5
+                  each only half-cover. QFA_CASES=COMPOSE runs just this case.
 
 Prints [GREEN]/[RED] per case and exits non-zero on any RED. Requires the
 freshly built cann-ops-transformer custom package installed under
@@ -717,6 +721,152 @@ def case_c_decode_shapes() -> bool:
     return ok
 
 
+
+# --------------------------------------------------------------------------
+# Case 6: write-then-read composition (the milestone-C impl's own algorithm)
+# --------------------------------------------------------------------------
+def _impl_quant_key(key):
+    """Port of AscendAttentionBackendImpl._qfa_write_key's quant step."""
+    import torch_npu
+
+    t, n, d = key.shape
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(key.reshape(t * n, d), dst_type=FP8, scale_alg=0)
+    return (
+        fp8.reshape(t, n, d).view(torch.uint8),
+        scale.view(torch.uint8).reshape(t, n, d // 64, 2),
+    )
+
+
+def _impl_quant_windows(rows):
+    """Port of _qfa_quant_along_tokens: (W,64,N,D) bf16 -> bytes + (W,N,D,2)."""
+    import torch_npu
+
+    w, group, n, d = rows.shape
+    cols = rows.permute(0, 2, 3, 1).reshape(w * n * d, group)
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(cols.contiguous(), dst_type=FP8, scale_alg=0)
+    fp8 = fp8.view(torch.uint8).reshape(w, n, d, group).permute(0, 3, 1, 2)
+    return fp8.contiguous(), scale.view(torch.uint8).reshape(w, n, d, 2)
+
+
+def case_write_read_composition() -> bool:
+    """Does a cache written by the impl's algorithm read back correctly?
+
+    W1/W2 check the write against a CPU reference and case 5 checks the read
+    against caches packed by the golden; neither covers the composition, so a
+    packing mismatch between the two halves would leave both green and still
+    serve garbage. This writes with the impl's algorithm, byte-compares the
+    result against the golden packing, then reads it back through QFA.
+    """
+    print("== case 6: impl write -> QFA read (27B shape, multi-request batch) ==")
+    torch.manual_seed(606)
+    nq, nkv, d, bs = 24, 4, 256, 128
+    g = nq // nkv
+    prompt_lens = [5, 10, 9]  # mirrors the smoke prompts: one short, two longer
+    b = len(prompt_lens)
+    softmax_scale = 1.0 / math.sqrt(d)
+    blocks_per_req = 2
+    total_blocks = b * blocks_per_req
+    block_table = torch.arange(total_blocks, dtype=torch.int32).reshape(b, blocks_per_req)
+
+    k_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    k_scale = torch.zeros(total_blocks, bs, nkv, d // 64, 2, dtype=torch.uint8).npu()
+    v_fp8 = torch.zeros(total_blocks, bs, nkv, d, dtype=torch.uint8).npu()
+    v_scale = torch.zeros(total_blocks, bs // 64, nkv, d, 2, dtype=torch.uint8).npu()
+
+    keys = [torch.randn(s, nkv, d, dtype=torch.bfloat16) for s in prompt_lens]
+    values = [torch.randn(s, nkv, d, dtype=torch.bfloat16) for s in prompt_lens]
+
+    # ---- impl write path (bulk / prefill) ----
+    key_cat = torch.cat(keys).npu()
+    slots = torch.cat(
+        [int(block_table[i, 0]) * bs + torch.arange(s) for i, s in enumerate(prompt_lens)]
+    ).npu()
+    kf, ks = _impl_quant_key(key_cat)
+    k_fp8.view(-1, nkv, d).index_put_((slots.long(),), kf)
+    k_scale.view(-1, nkv, d // 64, 2).index_put_((slots.long(),), ks)
+
+    bt_npu = block_table.npu()
+    for i, s in enumerate(prompt_lens):
+        num_windows = (s - 1) // 64 + 1
+        buf = torch.zeros(num_windows * 64, nkv, d, dtype=torch.bfloat16).npu()
+        buf[:s] = values[i].npu()
+        vf, vsc = _impl_quant_windows(buf.view(num_windows, 64, nkv, d))
+        windows = torch.arange(num_windows).npu()
+        blocks = bt_npu[i, torch.div(windows, 2, rounding_mode="floor")].long()
+        window_slots = blocks * 2 + (windows % 2)
+        v_fp8.view(-1, 64, nkv, d).index_put_((window_slots,), vf)
+        v_scale.view(-1, nkv, d, 2).index_put_((window_slots,), vsc)
+    torch.npu.synchronize()
+
+    # ---- byte-compare against the golden packing ----
+    byte_ok = True
+    for i, s in enumerate(prompt_lens):
+        blk = int(block_table[i, 0])
+        ref_ksc = qk_group_scale(keys[i])
+        ref_k = quantize_with_scale(keys[i], ref_ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+        k_match = torch.equal(k_fp8[blk, :s].cpu(), ref_k.view(torch.uint8))
+        ks_match = torch.equal(k_scale[blk, :s].cpu(), pack_last_pairs(fp32_to_e8m0_bytes(ref_ksc, "k")))
+
+        s_pad = (s + 63) // 64 * 64
+        v_pad = torch.nn.functional.pad(values[i].float(), (0, 0, 0, 0, 0, s_pad - s))
+        ref_vsc = v_group_scale(v_pad)
+        ref_v = quantize_with_scale(v_pad, ref_vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+        v_match = torch.equal(v_fp8[blk, :s].cpu(), ref_v.view(torch.uint8))
+        vs_match = torch.equal(
+            v_scale[blk, : (s_pad // 64)].cpu(), pack_v_scale_seq(fp32_to_e8m0_bytes(ref_vsc, "v"))
+        )
+        print(
+            f"  [6] req {i} (len={s}): k={k_match} k_scale={ks_match} v={v_match} v_scale={vs_match}"
+        )
+        byte_ok = byte_ok and k_match and ks_match and v_match and vs_match
+
+    # ---- read it back with QFA, one decode token per request ----
+    q_all, qs_all, goldens = [], [], []
+    for i, s in enumerate(prompt_lens):
+        q = torch.randn(1, nq, d, dtype=torch.bfloat16)
+        qsc = qk_group_scale(q)
+        q_fp8 = quantize_with_scale(q, qsc.repeat_interleave(GROUP, dim=-1)[..., :d])
+        q_all.append(q_fp8)
+        qs_all.append(pack_last_pairs(fp32_to_e8m0_bytes(qsc, "q")))
+        ref_ksc = qk_group_scale(keys[i])
+        ref_k = quantize_with_scale(keys[i], ref_ksc.repeat_interleave(GROUP, dim=-1)[..., :d])
+        s_pad = (s + 63) // 64 * 64
+        v_pad = torch.nn.functional.pad(values[i].float(), (0, 0, 0, 0, 0, s_pad - s))
+        ref_vsc = v_group_scale(v_pad)
+        ref_v = quantize_with_scale(v_pad, ref_vsc.repeat_interleave(GROUP, dim=0)[:s_pad])[:s]
+        goldens.append(
+            cpu_golden_one_seq(
+                q_fp8, ref_k, ref_v, qsc, ref_ksc,
+                ref_vsc[: (s + GROUP - 1) // GROUP], softmax_scale, True,
+            )
+        )
+    qs = torch.cat(qs_all).reshape(b, nkv, g, d // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
+    npu_kwargs = {
+        "q": torch.cat(q_all).npu(),
+        "k": k_fp8.view(torch.float8_e4m3fn),
+        "v": v_fp8.view(torch.float8_e4m3fn),
+        "q_descale": e8m0_npu(qs),
+        "k_descale": k_scale.view(torch.float8_e8m0fnu),
+        "v_descale": v_scale.view(torch.float8_e8m0fnu),
+        "block_table": block_table.npu(),
+        "cu_seqlens_q": torch.arange(b + 1, dtype=torch.int32).npu(),
+        "seqused_kv": torch.tensor(prompt_lens, dtype=torch.int32).npu(),
+        "softmax_scale": softmax_scale,
+        "mask_mode": 3,
+        "max_seqlen_q": 1,
+        "max_seqlen_kv": max(prompt_lens),
+        "layout_q": "TND",
+        "layout_q_descale": "N2TGD",
+        "layout_kv": "PA_BBND",
+        "layout_out": "TND",
+    }
+    out = call_qfa(npu_kwargs, nq, nkv, d, causal_mask_npu())
+    read_ok = compare("6-read", out, torch.cat(goldens))
+    ok = byte_ok and read_ok
+    print(f"  [COMPOSE] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -733,6 +883,7 @@ def main() -> int:
         ("QUANT", case_quant_consistency),
         ("27B", case_27b_shape),
         ("C-SHAPES", case_c_decode_shapes),
+        ("COMPOSE", case_write_read_composition),
     )
     only = os.environ.get("QFA_CASES")
     if only:
