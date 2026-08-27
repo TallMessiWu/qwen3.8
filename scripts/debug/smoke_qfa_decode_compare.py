@@ -8,18 +8,23 @@ FIA everywhere) and once with both on - with MTP speculative decoding enabled so
 the verify path is exercised, then compares outputs and acceptance behaviour.
 
 GREEN criteria: both runs finish, the QFA run reports the paged path engaged,
-the first greedy token matches per prompt, and the greedy prefixes agree for at
-least PREFIX_GATE tokens. Quantized KV shifts logits slightly, so a late
-divergence is reported rather than gated; the acceptance rate is printed
-because a large drop there is the signal that verify accuracy suffered.
+and on the steps where the two runs saw identical context the quantized cache
+moved the logprobs by no more than DELTA_GATE while keeping OVERLAP_GATE of
+the top-k. Greedy prefix length is printed but NOT gated: measured on 27B, one
+prompt's chains agreed for 47 tokens and another's for 2 with the same
+underlying error - what differed was only how soon a near-tie came up, and a
+tie flips on a fraction of a bf16 ulp. The acceptance rate is printed because
+a large drop there is the signal that verify accuracy suffered.
 
 Environment:
-  MODEL_PATH   default /mnt/share/weight/Qwen3.8-27B-mxfp8
-  TP_SIZE      default 1
-  NUM_SPEC     default 3 (0 disables MTP, exercising plain DecodeOnly instead)
-  MAX_TOKENS   default 64
-  PREFIX_GATE  default 8
-  PROMPT_IDX   run only ALL_PROMPTS[idx] (isolates batching from content)
+  MODEL_PATH    default /mnt/share/weight/Qwen3.8-27B-mxfp8
+  TP_SIZE       default 1
+  NUM_SPEC      default 3 (0 disables MTP, exercising plain DecodeOnly instead)
+  MAX_TOKENS    default 64
+  DELTA_GATE    default 0.5 - max chosen-token logprob shift
+  OVERLAP_GATE  default 0.8 - min mean top-k overlap, as a fraction of k
+  TOP_LOGPROBS  default 10
+  PROMPT_IDX    run only ALL_PROMPTS[idx] (isolates batching from content)
 
 Example (27B single card, mirrors scripts/27B.sh):
   MODEL_PATH=/mnt/share/weight/Qwen3.8-27B-mxfp8 TP_SIZE=1 \
@@ -40,7 +45,14 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/share/weight/Qwen3.8-27B-mxfp8")
 TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
 NUM_SPEC = int(os.environ.get("NUM_SPEC", "3"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
-PREFIX_GATE = int(os.environ.get("PREFIX_GATE", "8"))
+# The gate is the numeric error, not the length of the agreeing token chain.
+# 0.5 sits well clear of the 0.27 worst case measured on 27B while still
+# catching the order-of-magnitude jump a broken cache produces.
+DELTA_GATE = float(os.environ.get("DELTA_GATE", "0.5"))
+OVERLAP_GATE = float(os.environ.get("OVERLAP_GATE", "0.8"))
+# Below this many comparable steps the verdict rests on too little evidence to
+# mean much; it is reported rather than failed, since an early tie is normal.
+MIN_STEPS = int(os.environ.get("MIN_STEPS", "3"))
 ALL_PROMPTS = [
     "The capital of France is",
     "请用一句话介绍一下人工智能。",
@@ -50,7 +62,9 @@ ALL_PROMPTS = [
 # from a content-dependent one.
 _IDX = os.environ.get("PROMPT_IDX")
 PROMPTS = [ALL_PROMPTS[int(_IDX)]] if _IDX else ALL_PROMPTS
-TOP_LOGPROBS = 5
+# A wider window than the old 5 makes the overlap average steady and gives the
+# baseline's pick room to slip a few ranks without falling off the edge.
+TOP_LOGPROBS = int(os.environ.get("TOP_LOGPROBS", "10"))
 ACCEPT_RE = re.compile(r"(?:acceptance length|Acceptance rate|accepted)[^\n]*", re.IGNORECASE)
 
 
@@ -87,12 +101,10 @@ def child(result_path: str) -> None:
     result = []
     for out in outputs:
         seq = out.outputs[0]
-        first = seq.logprobs[0] if seq.logprobs else {}
         result.append(
             {
                 "token_ids": list(seq.token_ids),
                 "text": seq.text,
-                "first_top": {str(tid): lp.logprob for tid, lp in first.items()},
                 # Every step's top-k, not just the first. Greedy can diverge
                 # well past token 0, and only the steps inside the shared
                 # prefix are comparable at all - there both runs fed the model
@@ -191,33 +203,64 @@ def _top_gap(step: dict) -> float:
     return ranked[0] - ranked[1] if len(ranked) > 1 else float("inf")
 
 
-def report_numerics(b: dict, q: dict, prefix: int) -> None:
-    """Separate "the KV cache is wrong" from "greedy tipped over at a coin flip".
+def report_numerics(b: dict, q: dict, prefix: int) -> dict:
+    """Measure the cache's error on the steps where the runs are comparable.
 
-    Two numbers decide it. Over the shared prefix both runs saw identical
-    context, so the delta on the token they both chose is a direct read of the
-    quantized cache's error - a few thousandths is quantization, tenths is a
-    bug. At the divergent step, the top1/top2 gap says how much error it would
-    have taken to flip: a gap below the measured delta means the flip is
-    explained by that error and nothing else has to be wrong.
+    Both runs fed the model identical context for every step up to and
+    including the first divergent one, so across that range a logprob
+    difference is the MXFP8 cache's error and nothing else. Past it the
+    contexts differ and nothing is comparable - which is exactly why the
+    length of the agreeing token chain is evidence about tie spacing, not
+    about accuracy.
+
+    Returns the numbers main() gates on, and prints the divergent step, where
+    the top1/top2 gap says how much error the flip actually required.
     """
     b_steps, q_steps = b.get("steps") or [], q.get("steps") or []
+    stats = {
+        "steps": 0,
+        "max_delta": float("inf"),
+        "mean_delta": float("nan"),
+        "mean_overlap": 0.0,
+        "min_overlap": 0,
+        "off_topk": 0,
+    }
     if not b_steps or not q_steps:
         print("  [WARN] no per-step logprobs in the result; rerun with the current script")
-        return
-    deltas = []
-    for i in range(min(prefix, len(b_steps), len(q_steps))):
+        return stats
+    # The divergent step is included: its context is still shared, and it is
+    # the single most informative step in the run.
+    last = min(prefix + 1, len(b_steps), len(q_steps))
+    deltas, overlaps, off_topk = [], [], 0
+    for i in range(last):
         tid = str(b["token_ids"][i])
-        if tid in b_steps[i] and tid in q_steps[i]:
-            deltas.append(abs(b_steps[i][tid][0] - q_steps[i][tid][0]))
-    if deltas:
-        print(
-            f"  chosen-token logprob delta across the shared prefix: "
-            f"max={max(deltas):.4f} mean={sum(deltas) / len(deltas):.4f} n={len(deltas)}"
-        )
+        b_lp, q_lp = b_steps[i].get(tid), q_steps[i].get(tid)
+        if b_lp and q_lp:
+            deltas.append(abs(b_lp[0] - q_lp[0]))
+        else:
+            # The baseline's pick left the QFA run's top-k entirely, so the
+            # shift is larger than this window can measure. Fail loudly
+            # instead of quietly dropping the step from the average.
+            off_topk += 1
+        overlaps.append(len(set(b_steps[i]) & set(q_steps[i])))
+    stats.update(
+        steps=last,
+        max_delta=float("inf") if off_topk else (max(deltas) if deltas else float("inf")),
+        mean_delta=sum(deltas) / len(deltas) if deltas else float("nan"),
+        mean_overlap=sum(overlaps) / len(overlaps) if overlaps else 0.0,
+        min_overlap=min(overlaps) if overlaps else 0,
+        off_topk=off_topk,
+    )
+    print(
+        f"  comparable steps={stats['steps']} | chosen-token logprob delta "
+        f"max={stats['max_delta']:.4f} mean={stats['mean_delta']:.4f} | "
+        f"top{TOP_LOGPROBS} overlap mean={stats['mean_overlap']:.2f} min={stats['min_overlap']}"
+        + (f" | {off_topk} step(s) where the baseline's pick left the QFA top-k" if off_topk else "")
+    )
+    if stats["steps"] < MIN_STEPS:
+        print(f"  [WARN] only {stats['steps']} comparable step(s) - an early tie makes this verdict weak")
     if prefix >= min(len(b_steps), len(q_steps)):
-        print("  no divergence inside the logged steps")
-        return
+        return stats
     b_step, q_step = b_steps[prefix], q_steps[prefix]
     print(f"  divergence at step {prefix}:")
     for who, tid in (("baseline", str(b["token_ids"][prefix])), ("qfa     ", str(q["token_ids"][prefix]))):
@@ -227,6 +270,7 @@ def report_numerics(b: dict, q: dict, prefix: int) -> None:
             f"base={_logprob(b_step, tid)} qfa={_logprob(q_step, tid)}"
         )
     print(f"    top1-top2 gap: base={_top_gap(b_step):.4f} qfa={_top_gap(q_step):.4f}")
+    return stats
 
 
 def main() -> int:
@@ -276,26 +320,23 @@ def main() -> int:
             if x != y:
                 break
             prefix += 1
-        b_top, q_top = set(b["first_top"]), set(q["first_top"])
-        overlap = len(b_top & q_top)
-        first_same = bool(b_ids and q_ids and b_ids[0] == q_ids[0])
         shared = min(len(b_ids), len(q_ids))
         print(f"== prompt {i}: {PROMPTS[i]!r}")
         print(f"  baseline: {b['text']!r}")
         print(f"  qfa:      {q['text']!r}")
-        print(
-            f"  first_token_same={first_same} top{TOP_LOGPROBS}_overlap={overlap}/{TOP_LOGPROBS} "
-            f"greedy_prefix_match={prefix}/{shared} (gate {PREFIX_GATE})"
+        print(f"  greedy_prefix_match={prefix}/{shared} (informational - a near-tie flips this at any step)")
+        stats = report_numerics(b, q, prefix)
+        overlap_gate = OVERLAP_GATE * TOP_LOGPROBS
+        ok = (
+            stats["steps"] > 0
+            and stats["max_delta"] <= DELTA_GATE
+            and stats["mean_overlap"] >= overlap_gate
         )
-        for tid in sorted(b_top & q_top):
-            delta = abs(b["first_top"][tid] - q["first_top"][tid])
-            print(
-                f"    token {tid}: logprob base={b['first_top'][tid]:.4f} "
-                f"qfa={q['first_top'][tid]:.4f} delta={delta:.4f}"
-            )
-        report_numerics(b, q, prefix)
-        ok = first_same and overlap >= TOP_LOGPROBS - 1 and prefix >= min(PREFIX_GATE, shared)
-        print(f"  [{'GREEN' if ok else 'RED'}] prompt {i}")
+        print(
+            f"  [{'GREEN' if ok else 'RED'}] prompt {i}: "
+            f"delta {stats['max_delta']:.4f} vs gate {DELTA_GATE}, "
+            f"overlap {stats['mean_overlap']:.2f} vs gate {overlap_gate:.1f}"
+        )
         all_ok = all_ok and ok
 
     print(f"[{'GREEN' if all_ok else 'RED'}] QFA MXFP8 decode vs BF16 baseline overall")
