@@ -30,6 +30,21 @@ isolation, so one run says which of them is broken:
   stage S  host-side per-step components L/T do not cover (pin_memory, D2H
            sync, cat, mask triu, the attach-time plane zero_ in both uint8
            and float8-view form). Any line in the seconds IS the slowdown.
+  stage P  the same decode mix under the two conditions the engine adds and
+           every earlier stage lacked. Blocking-mode py-spy pinned the
+           slowdown inside the main op's own device execution, and statics
+           cleared every shape-level difference (args sliced identically,
+           tiling/workspace ignore plane dim0, blocking rules out
+           concurrency), so what is left is state:
+             P-base : T-new mix on the 24-block rig          <- this run's floor
+             P-blob : same mix, planes at the engine's 10008 blocks
+             P-dirty: same mix, foreign kernels (matmul + mx_quant +
+                      alloc churn) between FA calls, dirtying the allocator
+                      blocks and shared workspace the way the engine does
+             P-both : both at once
+           The dirty mix also re-checks the FA output against the quiet
+           reference: a changed answer means workspace content leaks into
+           the numbers - the drift fingerprint.
   stage M  the NUM_SPEC=3 crash shape: TND prefill metadata calls (the target
            prefill) immediately followed by PA_BBND decode metadata calls (the
            draft steps), inputs sliced from oversized resident buffers, x200.
@@ -52,11 +67,26 @@ Result log:
   (intermittency!), and the blob autopsy showed garbage ints after the
   header on one allocation, zeros on another -> stage E was added. The v2
   stage-M RED was this script's own bug (1D v_descale; aclnn wants 4D).
+  v4 (2026-08-28): ASCEND_LAUNCH_BLOCKING=1 py-spy pinned the engine's
+  slowdown 3/3 inside npu_quant_flash_attn itself (attention_v1.py:1910) at
+  the same shapes stage T runs at 1.4 ms/step -> stage P added to reproduce
+  the two remaining engine-only conditions (plane size, dirty neighborhood).
 
 Verdict guide:
   L RED             -> the AICPU op itself is slow in the q_len=1 shape.
   T RED, L GREEN    -> task adjacency (blob copy_ / pin copies) is slow.
   S RED             -> the named host component is the smoke's 3.8 s/step.
+  P-blob RED        -> the main op's per-call cost scales with the plane
+                       (cache) size itself, not the referenced blocks - read
+                       the kernel with that lens.
+  P-dirty RED       -> the op is sensitive to what other kernels left in the
+                       allocator blocks / shared workspace it reuses; a
+                       changed output on top of that is the drift mechanism.
+  P all GREEN       -> neither condition reproduces it; next lens is
+                       engine-side: dump the resident metadata blob on a slow
+                       step and diff against a probe-computed blob for the
+                       same args (stale/corrupt plan programs the kernel's
+                       grid directly), and msprof one slow step.
   M RED             -> NUM_SPEC=3 crash reproduced; iterate here, not in the
                        500 s smoke.
   B1/B2 RED         -> the paged op (or its metadata) is broken below 3 rows;
@@ -91,6 +121,9 @@ E8M0 = None
 
 SEQUSED = [70, 70, 74]  # mid-generation engine shape
 PREFILL_LENS = [5, 5, 9]  # the smoke prompts
+# Smoke log: "QFA MXFP8 cache bound[L*]: 10008 blocks x 128 tokens x 4 heads
+# x 256" - the per-layer plane size the engine binds, vs this rig's 24.
+ENGINE_BLOCKS = 10008
 
 
 def _quant(x2d: torch.Tensor):
@@ -107,16 +140,23 @@ def quant_tnd(x: torch.Tensor):
 
 
 class Rig:
-    """Engine-shaped buffers: oversized residents, [:B] slices handed out."""
+    """Engine-shaped buffers: oversized residents, [:B] slices handed out.
 
-    def __init__(self):
+    `blocks` sizes the value/scale planes only; the live data, block table
+    and every launch argument stay identical, exactly like the engine, whose
+    10008-block planes hold the same 3 tiny requests at the front.
+    """
+
+    def __init__(self, blocks: int | None = None):
         dev = torch.device("npu")
         torch.manual_seed(2027)
         bn_total = B * BN_PER_SEQ
-        self.k_fp8 = torch.zeros(bn_total, BS, NKV, D, dtype=torch.uint8, device=dev)
-        self.v_fp8 = torch.zeros(bn_total, BS, NKV, D, dtype=torch.uint8, device=dev)
-        self.k_scale = torch.zeros(bn_total, BS, NKV, D // 64, 2, dtype=torch.uint8, device=dev)
-        self.v_scale = torch.zeros(bn_total, BS // 64, NKV, D, 2, dtype=torch.uint8, device=dev)
+        planes = bn_total if blocks is None else blocks
+        assert planes >= bn_total
+        self.k_fp8 = torch.zeros(planes, BS, NKV, D, dtype=torch.uint8, device=dev)
+        self.v_fp8 = torch.zeros(planes, BS, NKV, D, dtype=torch.uint8, device=dev)
+        self.k_scale = torch.zeros(planes, BS, NKV, D // 64, 2, dtype=torch.uint8, device=dev)
+        self.v_scale = torch.zeros(planes, BS // 64, NKV, D, 2, dtype=torch.uint8, device=dev)
         # Resident buffers the engine way: CAPACITY rows, only [:B] written.
         # The tail rows stay whatever torch.empty found - that is the point.
         self.res_cu = torch.empty(CAPACITY + 1, dtype=torch.int32, device=dev)
@@ -414,6 +454,128 @@ def stage_s(_rig=None) -> bool:
     return ok
 
 
+def stage_p(_rig=None) -> bool:
+    """Same decode mix, engine-sized planes and an engine-dirty neighborhood.
+
+    Stage T proved this mix costs ~1.4 ms/step on 24-block planes with the
+    device otherwise idle; the engine runs the same shapes at seconds per
+    step, and blocking-mode py-spy puts that time inside the main op itself.
+    The two conditions this rig never had are the plane size and the residue
+    other kernels leave in the allocator blocks / shared workspace between
+    FA calls - each toggled separately here. The foreign set is the engine's
+    per-layer neighborhood in miniature: a cube matmul, the write path's
+    npu_dynamic_mx_quant, and an alloc/free to churn the caching allocator.
+    """
+    import torch_npu
+
+    print("== stage P: engine-scale planes + dirty neighborhood ==")
+    dev = torch.device("npu")
+    layers = 16
+
+    def mix_per_step(rig, md, foreign, steps):
+        out = [None]
+
+        def run():
+            for _ in range(steps):
+                for _ in range(layers):
+                    rig.metadata_buf.copy_(md)
+                    out[0] = rig.launch_fa(rig.metadata_buf)
+                    if foreign is not None:
+                        foreign()
+
+        return timed(run) / steps, out[0]
+
+    def measure(rig, md, foreign):
+        per, out = mix_per_step(rig, md, foreign, steps=2)
+        if per < 0.2:  # fast enough that a 20-step average is affordable
+            per, out = mix_per_step(rig, md, foreign, steps=20)
+        return per, out
+
+    small = Rig()
+    md_small = small.launch_metadata()
+    torch.npu.synchronize()
+    ref = small.launch_fa(md_small)
+    torch.npu.synchronize()
+
+    w = torch.randn(4096, 4096, dtype=torch.bfloat16, device=dev)
+    act = torch.randn(512, 4096, dtype=torch.bfloat16, device=dev)
+
+    def foreign():
+        torch.matmul(act, w)
+        torch_npu.npu_dynamic_mx_quant(act.reshape(-1, D), dst_type=FP8, scale_alg=0)
+        torch.empty(32 << 20, dtype=torch.uint8, device=dev)
+
+    noise = timed(lambda: [foreign() for _ in range(20 * layers)]) / 20
+
+    p_base, _ = measure(small, md_small, None)
+    p_dirty, out_dirty = measure(small, md_small, foreign)
+
+    print(f"[INFO] allocating {ENGINE_BLOCKS}-block planes (~2.6 GiB)", flush=True)
+    big = Rig(blocks=ENGINE_BLOCKS)
+    md_big = big.launch_metadata()
+    torch.npu.synchronize()
+    p_blob, out_big = measure(big, md_big, None)
+    p_both, _ = measure(big, md_big, foreign)
+
+    print(f"  [P] P-noise foreign ops alone          {noise * 1e3:9.1f} ms/step (baked into the dirty rows)")
+    print(f"  [P] P-base  24-block planes, quiet     {p_base * 1e3:9.1f} ms/step")
+    print(f"  [P] P-dirty 24-block planes, foreign   {p_dirty * 1e3:9.1f} ms/step")
+    print(f"  [P] P-blob  {ENGINE_BLOCKS}-block planes, quiet  {p_blob * 1e3:9.1f} ms/step")
+    print(f"  [P] P-both  {ENGINE_BLOCKS}-block planes, foreign{p_both * 1e3:9.1f} ms/step")
+
+    same_dirty = bool(torch.equal(ref, out_dirty))
+    same_big = bool(torch.equal(ref, out_big))
+    d_dirty = 0.0 if same_dirty else float((ref.float() - out_dirty.float()).abs().max())
+    d_big = 0.0 if same_big else float((ref.float() - out_big.float()).abs().max())
+    print(f"  [P] dirty-mix output == quiet reference: {same_dirty} (max|diff|={d_dirty:.3e})")
+    print(f"  [P] big-plane output == quiet reference: {same_big} (max|diff|={d_big:.3e})")
+
+    gate = max(5 * p_base, p_base + 0.005)
+    bad_blob = p_blob > gate
+    bad_dirty = (p_dirty - noise) > gate
+    bad_both = (p_both - noise) > gate
+    if bad_blob or bad_dirty or bad_both:
+        worst_per, rig, md, fgn, name = max(
+            [
+                (p_blob, big, md_big, None, "P-blob"),
+                (p_dirty, small, md_small, foreign, "P-dirty"),
+                (p_both, big, md_big, foreign, "P-both"),
+            ],
+            key=lambda x: x[0],
+        )
+        n = 8 if worst_per > 1.0 else 64  # a seconds-per-step config gets a short histogram
+        lat = []
+        for _ in range(n):
+            if fgn is not None:
+                fgn()  # residue refreshed, but its cost kept outside the clock
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+            rig.metadata_buf.copy_(md)
+            rig.launch_fa(rig.metadata_buf)
+            torch.npu.synchronize()
+            lat.append((time.perf_counter() - t0) * 1e3)
+        lat.sort()
+        print(
+            f"  [P] {name} single-FA latency over {n} calls: "
+            f"min {lat[0]:.2f} / p50 {lat[n // 2]:.2f} / max {lat[-1]:.2f} ms"
+        )
+    verdicts = []
+    if bad_blob:
+        verdicts.append("cost scales with PLANE SIZE")
+    if bad_dirty or bad_both:
+        verdicts.append("cost depends on NEIGHBOR RESIDUE")
+    if not same_dirty:
+        verdicts.append("neighbor residue CHANGES THE OUTPUT (the drift mechanism)")
+    if not same_big:
+        verdicts.append("plane size CHANGES THE OUTPUT")
+    ok = same_dirty and same_big and not (bad_blob or bad_dirty or bad_both)
+    print(
+        f"  [P] {'GREEN' if ok else 'RED'} "
+        f"({'; '.join(verdicts) if verdicts else 'neither engine condition reproduces the slowdown'})"
+    )
+    return ok
+
+
 def stage_e(rig: Rig) -> bool:
     """Is the work-split blob fully initialized, and does the FA read the
     part that is not?
@@ -481,7 +643,7 @@ def orchestrate() -> int:
     import subprocess
 
     results = {}
-    for name in ("L", "T", "S", "B2", "B1", "M", "E"):
+    for name in ("L", "T", "S", "P", "B2", "B1", "M", "E"):
         print(f"[INFO] ---- stage {name} (subprocess) ----", flush=True)
         rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--stage", name]).returncode
         results[name] = rc == 0
@@ -491,6 +653,7 @@ def orchestrate() -> int:
     print(
         "[VERDICT] L RED -> AICPU op slow | T RED -> task-mix overhead | "
         "S RED -> the named host component is the 3.8 s/step | "
+        "P RED -> its output names the engine condition (plane size / neighbor residue) | "
         "M RED -> NUM_SPEC=3 crash recipe reproduced | "
         "B1/B2 RED -> paged op broken below 3 rows (blob head above is the autopsy) | "
         "all GREEN -> mechanisms fine in isolation, profile the smoke next"
@@ -533,6 +696,7 @@ def main() -> int:
         "L": (stage_l, True),
         "T": (stage_t, True),
         "S": (stage_s, False),
+        "P": (stage_p, False),
         "M": (stage_m, True),
         "B2": (lambda rig: stage_b(rig, 2), True),
         "B1": (lambda rig: stage_b(rig, 1), True),
