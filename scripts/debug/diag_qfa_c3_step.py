@@ -39,10 +39,19 @@ isolation, so one run says which of them is broken:
            with 507015 (AICORE) on its first rows=1 call while rows=3 passed,
            so the blob autopsy prints BEFORE the main op runs.
 
-v1 results (2026-08-28): L GREEN (0.1 ms steady), T GREEN (T-new 1.3 ms/step)
-- the AICPU op and the C3 task mix are exonerated; B RED at rows=1 with
-507015. Stages run in subprocesses since then, most dangerous last, so one
-dead device cannot poison the rest.
+  stage E  blob determinism + 0xA5 stamp: two identical metadata calls are
+           diffed to map the ints the kernel never writes, that region is
+           stamped, and the FA re-run. Changed/slow/crashed output = the FA
+           reads uninitialized memory and allocator history decides behavior
+           - which fingerprints all three regressions at once.
+
+Result log:
+  v1 (2026-08-28): L GREEN (0.1 ms steady), T GREEN (T-new 1.3 ms/step) -
+  the AICPU op and the C3 task mix exonerated; B RED at rows=1 with 507015.
+  v2 (2026-08-28): B1/B2 GREEN with the same inputs v1 crashed on
+  (intermittency!), and the blob autopsy showed garbage ints after the
+  header on one allocation, zeros on another -> stage E was added. The v2
+  stage-M RED was this script's own bug (1D v_descale; aclnn wants 4D).
 
 Verdict guide:
   L RED             -> the AICPU op itself is slow in the q_len=1 shape.
@@ -51,9 +60,10 @@ Verdict guide:
   M RED             -> NUM_SPEC=3 crash reproduced; iterate here, not in the
                        500 s smoke.
   B1/B2 RED         -> the paged op (or its metadata) is broken below 3 rows;
-                       the printed blob head is the autopsy. The smoke always
-                       ran 3 requests, so this is adjacent to - not yet proof
-                       of - regressions (1)/(3).
+                       the printed blob head is the autopsy.
+  E RED             -> the main op reads the blob's uninitialized region:
+                       fix = zero the whole blob in GenMetaData (csrc) and
+                       redeploy the opp package.
   all GREEN         -> none of these mechanisms is broken in isolation; the
                        regressions need engine state - profile the smoke next.
 
@@ -265,11 +275,11 @@ def stage_m(rig: Rig) -> bool:
     total = sum(PREFILL_LENS)
     cu_prefill = torch.zeros(len(PREFILL_LENS) + 1, dtype=torch.int32, device=dev)
     cu_prefill[1:] = torch.cumsum(torch.tensor(PREFILL_LENS, dtype=torch.int32), 0).npu()
-    # TND v_descale: sum(ceil(S/64)) token rows. The AICPU check divides dim0
-    # by (NKV * D * 2), i.e. it sees the tensor flattened - hand it flat so the
-    # check passes whether or not the adapter flattens.
+    # TND v_descale: sum(ceil(S/64)) token rows, 4D (T, NKV, D, 2) - the aclnn
+    # host check requires 4D and flattens it before the AICPU sees it (whose
+    # own check divides dim0 by NKV*D*2, i.e. it sees the flattened view).
     t_rows = sum((s + 63) // 64 for s in PREFILL_LENS)
-    v_descale_tnd = torch.ones(t_rows * NKV * D * 2, dtype=torch.uint8, device=dev).view(E8M0)
+    v_descale_tnd = torch.ones(t_rows, NKV, D, 2, dtype=torch.uint8, device=dev).view(E8M0)
     tnd_args = {
         "cu_seqlens_q": cu_prefill,
         "cu_seqlens_kv": cu_prefill,
@@ -404,6 +414,64 @@ def stage_s(_rig=None) -> bool:
     return ok
 
 
+def stage_e(rig: Rig) -> bool:
+    """Is the work-split blob fully initialized, and does the FA read the
+    part that is not?
+
+    The B1/B2 autopsy showed the same call producing [.., 1985473253, ..]
+    garbage after the header on one allocation and zeros on another: the
+    AICPU kernel writes header + sectionNum sections and leaves the rest of
+    the 4096 ints at whatever the allocation held. If the main op reads any
+    of that, its behavior depends on allocator history - which is exactly
+    the fingerprint of all three smoke regressions (sometimes-crash 507015,
+    sometimes 3.8 s/step, sometimes one batch row off). Two identical calls
+    are diffed to map the unwritten region, then that region is stamped with
+    0xA5A5A5A5 and the FA re-run: a changed/slow/crashed output is proof."""
+    print("== stage E: blob determinism + 0xA5 stamp ==")
+    md1 = rig.launch_metadata()
+    torch.npu.synchronize()
+    # shove the allocator so the second blob lands on a different history
+    filler = torch.full((1 << 20,), -1515870811, dtype=torch.int32, device="npu")
+    md2 = rig.launch_metadata()
+    torch.npu.synchronize()
+    del filler
+    h1, h2 = md1.cpu(), md2.cpu()
+    nz = h1.nonzero().flatten()
+    diff = (h1 != h2).nonzero().flatten()
+    print(f"  [E] nonzero ints: {nz.numel()} (last at idx {int(nz.max()) if nz.numel() else -1})")
+    print(f"  [E] ints differing between two identical calls: {diff.numel()}")
+    if diff.numel():
+        lo, hi = int(diff[0]), int(diff[-1])
+        print(f"  [E] unwritten region spans [{lo}..{hi}]")
+    base = rig.launch_fa(md1)
+    torch.npu.synchronize()
+    stamped = h1.clone()
+    if diff.numel():
+        stamped[diff] = -1515870811  # 0xA5A5A5A5
+    else:
+        print("  [E] no natural diff - allocator reused one block; nothing to stamp safely")
+        print("  [E] GREEN (with the caveat above)")
+        return True
+    md_stamp = stamped.npu()
+    t0 = time.perf_counter()
+    try:
+        out = rig.launch_fa(md_stamp)
+        torch.npu.synchronize()
+    except Exception:
+        traceback.print_exc()
+        print("  [E] RED - stamping the unwritten region CRASHES the main op: it reads garbage")
+        return False
+    dt = time.perf_counter() - t0
+    same = bool(torch.equal(base, out))
+    print(f"  [E] FA(stamped): {dt * 1e3:.1f} ms (fresh-blob step was ~1.4 ms), output identical: {same}")
+    ok = same and dt < 0.5
+    if not ok:
+        print("  [E] RED - the main op READS the uninitialized region; allocator history decides behavior")
+    else:
+        print("  [E] GREEN - uninitialized ints exist but this shape never reads them")
+    return ok
+
+
 def orchestrate() -> int:
     """One subprocess per stage so a stage that kills the device (v1: the
     rows=1 call died with 507015 and took every later stage with it) cannot
@@ -413,7 +481,7 @@ def orchestrate() -> int:
     import subprocess
 
     results = {}
-    for name in ("L", "T", "S", "M", "B2", "B1"):
+    for name in ("L", "T", "S", "B2", "B1", "M", "E"):
         print(f"[INFO] ---- stage {name} (subprocess) ----", flush=True)
         rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--stage", name]).returncode
         results[name] = rc == 0
@@ -468,6 +536,7 @@ def main() -> int:
         "M": (stage_m, True),
         "B2": (lambda rig: stage_b(rig, 2), True),
         "B1": (lambda rig: stage_b(rig, 1), True),
+        "E": (stage_e, True),
     }
     which = sys.argv[sys.argv.index("--stage") + 1]
     fn, needs_rig = stages[which]
