@@ -82,6 +82,9 @@ Verdict guide:
   P-dirty RED       -> the op is sensitive to what other kernels left in the
                        allocator blocks / shared workspace it reuses; a
                        changed output on top of that is the drift mechanism.
+  D RED             -> the serve capture-warmup dummy shape (32 x q_len 4,
+                       seqused 4, ctx 0) hangs the named op in isolation -
+                       iterate on the shape dimensions here, not in serve.
   P all GREEN       -> neither condition reproduces it; next lens is
                        engine-side: dump the resident metadata blob on a slow
                        step and diff against a probe-computed blob for the
@@ -576,6 +579,78 @@ def stage_p(_rig=None) -> bool:
     return ok
 
 
+def stage_d(rig: Rig) -> bool:
+    """The FULL-graph capture-warmup dummy decode batch, replayed alone.
+
+    QFA=1 serve hangs the device inside the first QFA layer of the warmup
+    dummy run (aicore timeout 507014, one AIC/AIV triple stuck, MTE bits
+    set). The bounds sentinel printed that batch and it is degenerate but in
+    range: 32 rows of q_len 4, seqused 4 - zero prior context - every
+    block-table id 0, slot_mapping all -1. The QFA=0 baseline captures fine
+    with the same surrounding model, so the shape itself is the prime
+    suspect. This replays exactly that read; a watchdog turns a device hang
+    into RED within 120 s. GREEN means the read shape alone is innocent and
+    the next suspect is the write+read pairing of the dummy step."""
+    import os
+    import threading
+
+    print("== stage D: capture-warmup dummy decode shape (32 x q_len 4, seqused 4, bt 0) ==")
+    dev = torch.device("npu")
+    rows, qlen = 32, 4
+    t = rows * qlen
+    cu = torch.arange(0, t + 1, qlen, dtype=torch.int32, device=dev)
+    seqused = torch.full((rows,), qlen, dtype=torch.int32, device=dev)
+    bt = torch.zeros(rows, BN_PER_SEQ, dtype=torch.int32, device=dev)
+    q = torch.randn(t, NQ, D, dtype=torch.bfloat16, device=dev)
+    qf, qs = quant_tnd(q)
+    q_descale = qs.reshape(t, NKV, G, D // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
+    args = {
+        "cu_seqlens_q": cu,
+        "seqused_kv": seqused,
+        "mask_mode": 3,
+        "max_seqlen_q": qlen,
+        "max_seqlen_kv": qlen,
+        "layout_q": "TND",
+        "layout_q_descale": "N2TGD",
+        "layout_kv": "PA_BBND",
+        "layout_out": "TND",
+    }
+    hung_at = ["metadata"]
+
+    def watchdog():
+        print(f"  [D] RED - device hung in the {hung_at[0]} op on the dummy shape (>120 s)", flush=True)
+        os._exit(2)
+
+    timer = threading.Timer(120.0, watchdog)
+    timer.daemon = True
+    timer.start()
+    md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+        NQ, NKV, D, v_descale=rig.v_scale.view(E8M0), **args
+    )
+    torch.npu.synchronize()
+    print(f"  [D] metadata OK, blob head {md[:12].cpu().tolist()}")
+    hung_at[0] = "main FA"
+    out = torch.ops._C_ascend.npu_quant_flash_attn(
+        qf,
+        rig.k_fp8.view(FP8),
+        rig.v_fp8.view(FP8),
+        q_descale.view(E8M0),
+        rig.k_scale.view(E8M0),
+        rig.v_scale.view(E8M0),
+        md,
+        SCALE,
+        block_table=bt,
+        attn_mask=rig.mask,
+        **args,
+    )
+    torch.npu.synchronize()
+    timer.cancel()
+    finite = bool(torch.isfinite(out.float()).all())
+    print(f"  [D] FA OK: out shape {tuple(out.shape)}, finite={finite}")
+    print(f"  [D] {'GREEN' if finite else 'RED'} (the dummy read completes; if serve still hangs, suspect the write+read pairing)")
+    return finite
+
+
 def stage_e(rig: Rig) -> bool:
     """Is the work-split blob fully initialized, and does the FA read the
     part that is not?
@@ -643,7 +718,7 @@ def orchestrate() -> int:
     import subprocess
 
     results = {}
-    for name in ("L", "T", "S", "P", "B2", "B1", "M", "E"):
+    for name in ("L", "T", "S", "P", "B2", "B1", "M", "E", "D"):
         print(f"[INFO] ---- stage {name} (subprocess) ----", flush=True)
         rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--stage", name]).returncode
         results[name] = rc == 0
@@ -697,6 +772,7 @@ def main() -> int:
         "T": (stage_t, True),
         "S": (stage_s, False),
         "P": (stage_p, False),
+        "D": (stage_d, True),
         "M": (stage_m, True),
         "B2": (lambda rig: stage_b(rig, 2), True),
         "B1": (lambda rig: stage_b(rig, 1), True),
