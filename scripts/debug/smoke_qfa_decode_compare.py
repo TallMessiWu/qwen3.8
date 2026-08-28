@@ -117,6 +117,11 @@ PROMPTS = [ALL_PROMPTS[int(_IDX)]] if _IDX else ALL_PROMPTS
 # baseline's pick room to slip a few ranks without falling off the edge.
 TOP_LOGPROBS = int(os.environ.get("TOP_LOGPROBS", "10"))
 ACCEPT_RE = re.compile(r"(?:acceptance length|Acceptance rate|accepted)[^\n]*", re.IGNORECASE)
+# vLLM's own progress line. With speculation on, the ratio between the two
+# runs is what says whether the drafter's MXFP8 cache cost any acceptance:
+# if the drafter got worse, MTP would speed the QFA run up by less than it
+# speeds the BF16 one up, whatever the absolute numbers do.
+THROUGHPUT_RE = re.compile(r"output:\s*([0-9.]+)\s*toks/s")
 
 
 def child(result_path: str) -> None:
@@ -246,6 +251,10 @@ def report_log(tag: str, log: str) -> dict:
     for line in layout:
         print(f"  [{tag}] layout: {line}")
     marks["layout"] = layout
+    speeds = THROUGHPUT_RE.findall(log)
+    if speeds:
+        marks["output_toks_s"] = float(speeds[-1])
+        print(f"  [{tag}] output {marks['output_toks_s']:.2f} toks/s")
     accept = [line.strip() for line in log.splitlines() if ACCEPT_RE.search(line)]
     for line in accept[-3:]:
         print(f"  [{tag}] {line}")
@@ -389,6 +398,14 @@ def main() -> int:
     if SELF_SPEC and not ref_marks["paged_engaged"]:
         print("[RED] the spec0 reference never entered the paged path - it is not the same path")
         return 1
+    if "output_toks_s" in test_marks and "output_toks_s" in ref_marks:
+        # Printed, not gated: three short prompts on an idle card is not a
+        # benchmark. It is here because it is the only reading available on
+        # whether the drafter's own MXFP8 cache cost any acceptance.
+        print(
+            f"  throughput {test_label} / {ref_label} = "
+            f"{test_marks['output_toks_s'] / max(ref_marks['output_toks_s'], 1e-9):.3f}"
+        )
 
     all_ok = True
     for i, (b, q) in enumerate(zip(base, qfa)):

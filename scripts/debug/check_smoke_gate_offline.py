@@ -129,11 +129,11 @@ flat = run(
     q_shift=4,
 )
 
-# The MTP run measured on 2026-08-27. The baseline's pick moved only 0.23 -
-# the number a one-sided delta would report - while the candidate that
-# displaced it moved 0.96, and the output degenerated into a repetition loop.
-# This has to come out RED, both because the run is genuinely bad and because
-# it is what stops a one-sided delta from being reinstated.
+# The MTP run measured on 2026-08-27, BEFORE the verify write was split in
+# two. The baseline's pick moved only 0.23 - the number a one-sided delta
+# would report - while the candidate that displaced it moved 0.96. This has to
+# come out RED, both because the run is genuinely bad and because it is what
+# stops a one-sided delta from being reinstated.
 mtp = run(
     "measured MTP: '\\n' moved 0.23 but the '\\n\\n' that won moved 0.96",
     [600, 601],
@@ -145,19 +145,25 @@ mtp = run(
     gate=0.5,
 )
 
-# The same step once the verify write stops letting unconfirmed tokens set the
-# V window's scale. The shift is scaled by the 3x the policy simulation gives
-# (sim_qfa_spec_scale_policies.py), so this is a PREDICTION, not a measurement:
-# it says the gate can tell the fixed run from the broken one above, not that
-# the fix lands here. Replace it with the real numbers once the run exists.
+# The same prompt and the same step, measured on 2026-08-28 with the verify
+# write split around the attention read. The baseline is bit-identical (BF16 is
+# deterministic), so the two runs are directly comparable on the token that
+# displaced it, the paragraph break: it sat at -1.0326 before and
+# -1.5360 after, against a baseline of -1.9906. Against the
+# non-speculative QFA run's -1.6126 for the same token, speculation's
+# own contribution went from 0.580 to 0.0766.
+#
+# It still has to read GREEN, and only just does - 0.4546 against a gate of
+# 0.5. Top-k membership is not reproduced here (the synthetic also-rans are
+# not the model's); the real run's overlap was 8.67 against a gate of 8.0.
 mtp_fixed = run(
-    "predicted MTP after the two-write fix: the same step at a third of the drift",
+    "measured MTP after the two-write fix: the same step at 1/7.6 the speculative drift",
     [600, 601],
-    [0.02, 0.02],
+    [0.16, 0.16],
     div_base=(-1.4281, -1.9906),
-    div_qfa=(-1.5046, -1.7823),
+    div_qfa=(-1.7860, -1.5360),
     div_pick_b=198,
-    div_pick_q=198,
+    div_pick_q=271,
     gate=0.5,
 )
 
