@@ -49,6 +49,19 @@ MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 
+# QFA=1 serves the 16 full-attention layers (and the MTP drafter) from an MXFP8
+# KV cache through the QuantFlashAttn paged path. Graph mode is unchanged -
+# FULL_DECODE_ONLY is the one mode that path is captured under - but prefix
+# caching has to come off: the E8M0 scale planes are not tracked across shared
+# blocks, and the engine refuses the combination at startup anyway.
+qfa_args=()
+if [[ "${QFA:-0}" == "1" ]]; then
+    export VLLM_ASCEND_ENABLE_QFA_PREFILL=1
+    export VLLM_ASCEND_ENABLE_QFA_DECODE=1
+    qfa_args+=(--no-enable-prefix-caching)
+    echo "QFA MXFP8 KV cache enabled; prefix caching disabled (unsupported with it)." >&2
+fi
+
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
@@ -68,4 +81,5 @@ exec vllm serve "$MODEL_PATH" \
     --mm-processor-cache-gb 0 \
     --mm-encoder-tp-mode data \
     --mm-processor-cache-type shm \
-    --additional-config '{"enable_cpu_binding":true}'
+    --additional-config '{"enable_cpu_binding":true}' \
+    "${qfa_args[@]}"

@@ -39,12 +39,18 @@ Environment:
   OVERLAP_GATE  default 0.8 - min mean top-k overlap, as a fraction of k
   TOP_LOGPROBS  default 10
   PROMPT_IDX    run only ALL_PROMPTS[idx] (isolates batching from content)
+  GRAPH         1 captures aclgraphs (FULL_DECODE_ONLY) instead of eager
 
 Example (27B single card, mirrors scripts/27B.sh):
   MODEL_PATH=/mnt/share/weight/Qwen3.8-27B-mxfp8 TP_SIZE=1 \
       python scripts/debug/smoke_qfa_decode_compare.py
 
-Requires enforce_eager: aclgraph capture of the paged path lands in C3.
+GRAPH=1 drops enforce_eager and runs both children under
+cudagraph_mode=FULL_DECODE_ONLY, the one mode the captured QFA paged path
+supports. Read it against the same command without GRAPH: the deltas should
+land in the same range, because capture is not supposed to change a number -
+only where the work-split blob is computed. A delta that moves means something
+dynamic got baked into the graph.
 """
 
 import json
@@ -77,6 +83,10 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 # gate as the BF16 comparison applies here; what this mode buys is a delta
 # with the quantization error already cancelled out, not an exact match.
 SELF_SPEC = os.environ.get("SELF_SPEC") == "1"
+# GRAPH=1 exercises the captured paged path (C3). Both children get the same
+# setting, so the QFA-vs-BF16 comparison stays like for like; what changes is
+# whether the run also answers "does capture alter the numbers".
+GRAPH = os.environ.get("GRAPH") == "1"
 # The gate is the numeric error, not the length of the agreeing token chain.
 # 0.5 sits well clear of the 0.27 worst case measured without speculation,
 # while still catching the order-of-magnitude jump a broken cache produces.
@@ -128,6 +138,10 @@ def child(result_path: str) -> None:
     from vllm import LLM, SamplingParams
 
     kwargs = {}
+    if GRAPH:
+        # The only mode with a captured QFA path: prefill graphs would reach
+        # the AICPU metadata op inside the graph. platform.py refuses the rest.
+        kwargs["compilation_config"] = {"cudagraph_mode": "FULL_DECODE_ONLY"}
     if NUM_SPEC > 0:
         kwargs["speculative_config"] = {
             "method": "qwen3_5_mtp",
@@ -143,7 +157,7 @@ def child(result_path: str) -> None:
         # The FP8 values are the KV cache itself now; only the E8M0 scale side
         # tables sit on top of it, at 1/32 of the values.
         gpu_memory_utilization=float(os.environ.get("GPU_UTIL", "0.85")),
-        enforce_eager=True,
+        enforce_eager=not GRAPH,
         seed=1024,
         safetensors_load_strategy="lazy",
         **kwargs,
@@ -179,7 +193,7 @@ def child(result_path: str) -> None:
 # A 27B load takes minutes; without live output the script looks hung. These
 # patterns are surfaced as they arrive, everything else is kept for the report.
 LIVE_RE = re.compile(
-    r"QFA MXFP8|QFA-DEBUG|QFA-CACHE|QFA-SCALE|Traceback|Error|ERROR|Exception|AssertionError|"
+    r"QFA MXFP8|QFA-DEBUG|QFA-CACHE|QFA-SCALE|QFA resident|Traceback|Error|ERROR|Exception|AssertionError|"
     r"Loading|Memory profiling|KV cache|Capturing|Adding requests|Processed prompts|"
     # Page sizing decides whether the MXFP8 cache actually saves memory: the
     # mamba page is padded to a BF16 attention page during platform setup, so
@@ -365,6 +379,13 @@ def main() -> int:
         return 2
 
     test_label, ref_label = (f"spec{NUM_SPEC}", "spec0") if SELF_SPEC else ("qfa", "baseline")
+    # Which configuration produced the numbers below. A GRAPH run is only
+    # meaningful next to the eager run of the same command.
+    print(
+        f"[INFO] num_spec={NUM_SPEC} self_spec={int(SELF_SPEC)} "
+        f"graph={'FULL_DECODE_ONLY' if GRAPH else 'off (enforce_eager)'}",
+        flush=True,
+    )
     with tempfile.TemporaryDirectory(prefix="qfa_dec_") as tmp:
         ref_path = os.path.join(tmp, "ref.json")
         test_path = os.path.join(tmp, "test.json")
