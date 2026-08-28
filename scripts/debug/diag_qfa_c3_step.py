@@ -27,30 +27,38 @@ isolation, so one run says which of them is broken:
              T-pin : T-new + the 3 resident-buffer refresh copies build() does
            RED if T-new (or T-pin) >> T-old: the C3 step form itself is slow,
            and the delta names the culprit component.
+  stage S  host-side per-step components L/T do not cover (pin_memory, D2H
+           sync, cat, mask triu, the attach-time plane zero_ in both uint8
+           and float8-view form). Any line in the seconds IS the slowdown.
   stage M  the NUM_SPEC=3 crash shape: TND prefill metadata calls (the target
            prefill) immediately followed by PA_BBND decode metadata calls (the
            draft steps), inputs sliced from oversized resident buffers, x200.
            RED (507018) = crash reproduced with a 300-line recipe.
-  stage B  batch-position check for regression (3): one batch [r0, r1, r2]
-           with unequal seqused vs three single-request calls; each row must
-           match its solo run bitwise. A RED row = the paged op mixes rows
-           when fed resident-slice inputs (capacity > batch).
+  stage B2/B1  paged decode with a 2- and then 1-request batch, compared
+           against the first rows of the known-good 3-request batch. v1 died
+           with 507015 (AICORE) on its first rows=1 call while rows=3 passed,
+           so the blob autopsy prints BEFORE the main op runs.
+
+v1 results (2026-08-28): L GREEN (0.1 ms steady), T GREEN (T-new 1.3 ms/step)
+- the AICPU op and the C3 task mix are exonerated; B RED at rows=1 with
+507015. Stages run in subprocesses since then, most dangerous last, so one
+dead device cannot poison the rest.
 
 Verdict guide:
-  L RED             -> the slowdown is the AICPU op itself in the q_len=1
-                       shape; look at SectionStreamK for that shape, not at
-                       the vllm-ascend python.
-  T RED, L GREEN    -> the slowdown is task adjacency (blob copy_ / pin
-                       copies), component named by which mix is slow.
-  M RED             -> crash reproduced; iterate on this recipe, not the
+  L RED             -> the AICPU op itself is slow in the q_len=1 shape.
+  T RED, L GREEN    -> task adjacency (blob copy_ / pin copies) is slow.
+  S RED             -> the named host component is the smoke's 3.8 s/step.
+  M RED             -> NUM_SPEC=3 crash reproduced; iterate here, not in the
                        500 s smoke.
-  B RED             -> regression (3) is a real batch bug in the paged read
-                       with oversized resident inputs; (1)/(2) likely follow.
+  B1/B2 RED         -> the paged op (or its metadata) is broken below 3 rows;
+                       the printed blob head is the autopsy. The smoke always
+                       ran 3 requests, so this is adjacent to - not yet proof
+                       of - regressions (1)/(3).
   all GREEN         -> none of these mechanisms is broken in isolation; the
-                       regressions need engine state - next stop is profiling
-                       the smoke itself.
+                       regressions need engine state - profile the smoke next.
 
-Run: python scripts/debug/diag_qfa_c3_step.py   (1 idle NPU, no weights)
+Run: python scripts/debug/diag_qfa_c3_step.py            (1 idle NPU, no weights)
+     python scripts/debug/diag_qfa_c3_step.py --stage B1 (one stage, in-process)
 """
 
 import math
@@ -320,51 +328,114 @@ def stage_m(rig: Rig) -> bool:
     return True
 
 
-def stage_b(rig: Rig) -> bool:
-    print("== stage B: batch rows vs solo runs (regression-3 shape) ==")
-    md = rig.launch_metadata()
-    batch_out = rig.launch_fa(md)
+def stage_b(rig: Rig, rows: int) -> bool:
+    """rows<3 paged decode. v1 died with 507015 (AICORE) on the first rows=1
+    call while the rows=3 batch passed, so this isolates the batch size and
+    autopsies the work-split blob BEFORE the main op gets to crash on it."""
+    print(f"== stage B{rows}: paged decode with a {rows}-request batch ==")
+    md3 = rig.launch_metadata()
+    ref = rig.launch_fa(md3)
     torch.npu.synchronize()
-    ok = True
-    for b in range(B):
-        solo_cu = torch.arange(2, dtype=torch.int32, device="npu")
-        solo_args = rig.decode_args(rows=1)
-        solo_args["cu_seqlens_q"] = solo_cu
-        solo_args["seqused_kv"] = rig.res_seqused[b : b + 1]
-        solo_args["max_seqlen_kv"] = SEQUSED[b]
-        solo_md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
-            NQ, NKV, D, v_descale=rig.v_scale.view(E8M0), **solo_args
-        )
-        solo_out = torch.ops._C_ascend.npu_quant_flash_attn(
-            rig.q_fp8[b : b + 1].view(FP8),
-            rig.k_fp8.view(FP8),
-            rig.v_fp8.view(FP8),
-            rig.q_descale[:, b : b + 1].contiguous().view(E8M0),
-            rig.k_scale.view(E8M0),
-            rig.v_scale.view(E8M0),
-            solo_md,
-            SCALE,
-            block_table=rig.res_bt[b : b + 1],
-            attn_mask=rig.mask,
-            **solo_args,
-        )
-        torch.npu.synchronize()
-        # Different batch shapes tile differently, so reductions may differ in
-        # ULPs - bitwise equality is too strict here. A real row-mixing bug
-        # (regression 3 moved a chosen-token logprob by 1.9) is orders of
-        # magnitude above this gate.
-        diff = (batch_out[b].float() - solo_out[0].float()).abs().max().item()
-        finite = bool(torch.isfinite(batch_out[b].float()).all())
-        close = diff < 2e-2
-        print(f"  [B] row {b}: max|batch-solo|={diff:.3e} close={close} finite={finite}")
-        ok = ok and close and finite
-    print(f"  [B] {'GREEN' if ok else 'RED'} (gate: every row within 2e-2 of its solo run)")
+    print(f"  [B{rows}] rows=3 reference OK, blob head {md3[:12].cpu().tolist()}")
+    args = rig.decode_args(rows=rows)
+    md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+        NQ, NKV, D, v_descale=rig.v_scale.view(E8M0), **args
+    )
+    torch.npu.synchronize()
+    # Autopsy first: if the FA below aborts the device, this line is the
+    # evidence. Head layout: sectionNum, isFd, mBaseSize, s2BaseSize, ...
+    print(f"  [B{rows}] rows={rows} metadata OK, blob head {md[:12].cpu().tolist()}")
+    out = torch.ops._C_ascend.npu_quant_flash_attn(
+        rig.q_fp8[:rows].view(FP8),
+        rig.k_fp8.view(FP8),
+        rig.v_fp8.view(FP8),
+        rig.q_descale[:, :rows].contiguous().view(E8M0),
+        rig.k_scale.view(E8M0),
+        rig.v_scale.view(E8M0),
+        md,
+        SCALE,
+        block_table=rig.res_bt[:rows],
+        attn_mask=rig.mask,
+        **args,
+    )
+    torch.npu.synchronize()
+    # Same q/seqused/blocks as the first `rows` rows of the reference batch.
+    # Different batch shapes tile differently, so reductions may differ in
+    # ULPs - a real bug (regression 3 moved a logprob by 1.9) is orders of
+    # magnitude above this gate.
+    diffs = [(ref[b].float() - out[b].float()).abs().max().item() for b in range(rows)]
+    finite = bool(torch.isfinite(out.float()).all())
+    ok = finite and all(d < 2e-2 for d in diffs)
+    print(f"  [B{rows}] max|ref_row - out_row| = {[f'{d:.3e}' for d in diffs]} finite={finite}")
+    print(f"  [B{rows}] {'GREEN' if ok else 'RED'} (gate: within 2e-2 of the batch-3 rows)")
     return ok
+
+
+def stage_s(_rig=None) -> bool:
+    """Host-side per-step components of the engine step that stages L/T do
+    not cover. The smoke runs ~3.8 s/step while T-pin is 1.4 ms/step, so if
+    any single line below is in the seconds, it IS the slowdown."""
+    print("== stage S: host-side component timing ==")
+    dev = torch.device("npu")
+    seq_dev = torch.tensor(SEQUSED, dtype=torch.int32, device=dev)
+    rep: list[tuple[str, float, float]] = []  # (name, per-op seconds, gate)
+
+    t = timed(lambda: [torch.arange(B + 1, dtype=torch.int32).pin_memory() for _ in range(100)]) / 100
+    rep.append(("pin_memory (per build)", t, 0.05))
+    t = timed(lambda: [seq_dev.cpu() for _ in range(100)]) / 100
+    rep.append(("D2H sync .cpu() 3 ints", t, 0.05))
+    t = timed(lambda: [torch.cat([seq_dev, seq_dev.new_ones(1)]) for _ in range(100)]) / 100
+    rep.append(("torch.cat pad row", t, 0.05))
+    t = timed(lambda: [torch.triu(torch.ones(2048, 2048, dtype=torch.int8), 1).npu() for _ in range(5)]) / 5
+    rep.append(("triu 2048^2 + H2D (mask build)", t, 0.5))
+    plane = torch.empty(2560, 1024, 1024, dtype=torch.uint8, device=dev)  # 2.5 GiB, one value plane
+    t = timed(plane.zero_)
+    rep.append(("2.5 GiB uint8 zero_ (attach)", t, 1.0))
+    t = timed(lambda: plane.view(FP8).zero_())
+    rep.append(("2.5 GiB float8-view zero_", t, 1.0))
+    del plane
+
+    ok = True
+    for name, per, gate in rep:
+        bad = per > gate
+        ok = ok and not bad
+        print(f"  [S] {name:34s} {per * 1e3:10.2f} ms {'<- SLOW' if bad else ''}")
+    print(f"  [S] {'GREEN' if ok else 'RED'} (any SLOW line is the smoke's 3.8 s/step)")
+    return ok
+
+
+def orchestrate() -> int:
+    """One subprocess per stage so a stage that kills the device (v1: the
+    rows=1 call died with 507015 and took every later stage with it) cannot
+    poison the rest. Most dangerous stages run last. This process never
+    touches the NPU itself."""
+    import os
+    import subprocess
+
+    results = {}
+    for name in ("L", "T", "S", "M", "B2", "B1"):
+        print(f"[INFO] ---- stage {name} (subprocess) ----", flush=True)
+        rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--stage", name]).returncode
+        results[name] = rc == 0
+        print(flush=True)
+    for name, ok in results.items():
+        print(f"[{'GREEN' if ok else 'RED'}] stage {name}")
+    print(
+        "[VERDICT] L RED -> AICPU op slow | T RED -> task-mix overhead | "
+        "S RED -> the named host component is the 3.8 s/step | "
+        "M RED -> NUM_SPEC=3 crash recipe reproduced | "
+        "B1/B2 RED -> paged op broken below 3 rows (blob head above is the autopsy) | "
+        "all GREEN -> mechanisms fine in isolation, profile the smoke next"
+    )
+    return 0 if all(results.values()) else 1
 
 
 def main() -> int:
     global FP8, E8M0
     import os
+
+    if "--stage" not in sys.argv:
+        return orchestrate()
 
     import torch_npu  # noqa: F401
 
@@ -390,24 +461,26 @@ def main() -> int:
     FP8 = torch.float8_e4m3fn
     E8M0 = torch.float8_e8m0fnu
 
-    print("[INFO] building engine-shaped rig (no weights)")
-    rig = Rig()
-    results = {}
-    for name, fn in [("L", stage_l), ("T", stage_t), ("B", stage_b), ("M", stage_m)]:
-        try:
-            results[name] = fn(rig)
-        except Exception:
-            traceback.print_exc()
-            results[name] = False
-        print()
-    for name in ("L", "T", "B", "M"):
-        print(f"[{'GREEN' if results[name] else 'RED'}] stage {name}")
-    print(
-        "[VERDICT] L RED -> AICPU op slow in this shape | T RED -> task-mix overhead | "
-        "B RED -> paged batch bug | M RED -> crash recipe reproduced | "
-        "all GREEN -> mechanisms fine in isolation, profile the smoke next"
-    )
-    return 0 if all(results.values()) else 1
+    stages = {
+        "L": (stage_l, True),
+        "T": (stage_t, True),
+        "S": (stage_s, False),
+        "M": (stage_m, True),
+        "B2": (lambda rig: stage_b(rig, 2), True),
+        "B1": (lambda rig: stage_b(rig, 1), True),
+    }
+    which = sys.argv[sys.argv.index("--stage") + 1]
+    fn, needs_rig = stages[which]
+    rig = None
+    if needs_rig:
+        print("[INFO] building engine-shaped rig (no weights)")
+        rig = Rig()
+    try:
+        ok = fn(rig)
+    except Exception:
+        traceback.print_exc()
+        ok = False
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
