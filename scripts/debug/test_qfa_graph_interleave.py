@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""C0 experiment: QFA main op inside torch.npu.graph + per-step AICPU metadata.
+"""C0 experiment: can the whole QFA decode path live inside torch.npu.graph?
 
-Decides the milestone-C aclgraph strategy. Steady-state decode timing under
-FULL_DECODE_ONLY is:  refresh persistent buffers -> AICPU metadata (outside
-graph) -> D2D copy into a resident buffer -> graph replay. The B-stage 507018
-crash came from an AICPU task queued mid-forward right before draft-graph
-replays; DSA already ships per-step builder-stage AICPU + FULL replay, so this
-experiment must (a) prove QFA's EXEC_NPU_CMD internals survive graph capture
-and (b) stress the AICPU/replay adjacency at decode cadence.
+Decides the milestone-C3 aclgraph strategy. The target steady-state decode
+shape under FULL_DECODE_ONLY is:  refresh resident buffers -> AICPU metadata
+(outside the graph) -> D2D copy into a resident buffer -> graph replay. The
+B-stage 507018 crash came from an AICPU task queued mid-forward right before
+draft-graph replays, so this has to prove three separate things: that QFA's
+EXEC_NPU_CMD internals survive capture, that the *write* path's operators do
+too, and that AICPU next to a replay is stable at decode cadence.
 
   stage 0  capture feasibility: one graph holding the real QFA main op
            (PA_BBND, q_len=4 verify shape) reading resident metadata/seqused/
@@ -15,15 +15,34 @@ and (b) stress the AICPU/replay adjacency at decode cadence.
   stage 1  correctness across sequence growth: step committed by +1..+4
            (accept-count emulation incl. rollback overwrites), rewrite KV,
            AICPU metadata -> copy_ -> replay, compare vs eager QFA every step
-  stage 2  adjacency stress xN (default 2000, QFA_ILV_ITERS to raise):
+  stage 3  the WRITE path under capture: npu_dynamic_mx_quant, index_put_ with
+           device indices, searchsorted, gather, exp2/repeat_interleave/clamp.
+           stage 0 only ever captured the read; nothing proved these survive.
+  stage 4  the two-write restore inside one graph: confirmed-scale write ->
+           main op -> unclamped restore write. Also asserts the invariant the
+           restore exists for - the committed cache ends up byte-identical to
+           what a single unclamped write leaves.
+  stage 5  resident buffers whose CONTENTS change: the block table is
+           rewritten between replays. A graph that baked the capture-time
+           table passes stages 0-4 and fails here.
+  stage 2  adjacency stress xN (default 2000, QFA_ILV_ITERS to raise), run
+           last because it is the slow one:
            (A) metadata->copy->replay        (DSA-like, single graph)
            (C) metadata->copy->replay x2     (target+draft double graph)
            optional (D) QFA_ILV_FIA=1 adds an FIA graph interleave
 
 Verdict guide printed at the end:
-  stage0+1+2 all GREEN -> per-step AICPU outside graph is the C3 mainline
-  stage2 RED only      -> host-side SectionStreamK port (fallback) required
-  stage0 RED           -> QFA needs out-variant/explicit workspace (csrc)
+  all GREEN      -> per-step AICPU outside the graph is the C3 mainline
+  stage2 RED     -> host-side SectionStreamK port (fallback) required
+  stage3/4 RED   -> the write path has to stay outside the captured region
+  stage5 RED     -> the graph is not reading the resident buffers
+  stage0 RED     -> QFA needs out-variant/explicit workspace (csrc)
+
+Stages 3-5 re-implement the impl's write arithmetic rather than importing it:
+the real ones are methods on an attention impl that needs a live vLLM config.
+plan_v_windows IS imported, so the indexing that bit us before is the real
+code; the quantize/clamp/dequant helpers below are copies of attention_v1.py
+and have to be kept in step with it.
 
 Run: python scripts/debug/test_qfa_graph_interleave.py   (1 idle NPU)
 """
@@ -294,6 +313,249 @@ def stage2(h: Harness, graph: torch.npu.NPUGraph, iters: int) -> bool:
     return ok
 
 
+# --------------------------------------------------------------------------
+# The write path, mirrored from AscendAttentionBackendImpl. Keep in step with
+# attention_v1.py: a copy that has drifted tests nothing.
+# --------------------------------------------------------------------------
+
+VGROUP = 64  # tokens per V window - two packed 32-token E8M0 rows
+E4M3_MAX = 448.0
+PLANES = ("k_fp8", "k_scale", "v_fp8", "v_scale")
+_STEP_SRC: dict[str, torch.Tensor] = {}
+
+
+def _planes(h):
+    return (h.k_fp8, h.k_scale, h.v_fp8, h.v_scale)
+
+
+def snapshot(h):
+    return tuple(t.clone() for t in _planes(h))
+
+
+def restore(h, snap) -> None:
+    for dst, src in zip(_planes(h), snap):
+        dst.copy_(src)
+
+
+def _quant_along_tokens(rows: torch.Tensor):
+    """(W,64,N,D) bf16 -> fp8 bytes (W,64,N,D) + scale bytes (W,N,D,2)."""
+    import torch_npu
+
+    w, group, n, d = rows.shape
+    cols = rows.permute(0, 2, 3, 1).reshape(w * n * d, group)
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(cols.contiguous(), dst_type=FP8, scale_alg=0)
+    fp8 = fp8.view(torch.uint8).reshape(w, n, d, group).permute(0, 3, 1, 2)
+    scale = scale.view(torch.uint8).reshape(w, n, d, 2)
+    return fp8.contiguous(), scale
+
+
+def _clamp_to_scale(rows: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Hold (W,64,N,D) inside what e4m3 represents at these E8M0 bytes."""
+    limit = (torch.exp2((scale.to(torch.int32) - 127).to(torch.float32)) * E4M3_MAX).to(rows.dtype)
+    limit = torch.where(scale == 0, rows.new_full((), torch.finfo(rows.dtype).max), limit)
+    limit = limit.permute(0, 3, 1, 2).repeat_interleave(VGROUP // 2, dim=1)
+    return torch.clamp(rows, -limit, limit)
+
+
+def _dequant_windows(h, slots: torch.Tensor, n: int, d: int) -> torch.Tensor:
+    fp8 = h.v_fp8.view(-1, VGROUP, n, d)[slots]
+    scale = h.v_scale.view(-1, n, d, 2)[slots]
+    vals = fp8.view(FP8).to(torch.bfloat16)
+    factor = torch.exp2((scale.to(torch.int32) - 127).to(torch.float32)).to(torch.bfloat16)
+    factor = factor.permute(0, 3, 1, 2).repeat_interleave(VGROUP // 2, dim=1)
+    return vals * factor
+
+
+def _commit_windows(h, rows: torch.Tensor, slots: torch.Tensor, n: int, d: int) -> None:
+    fp8, scale = _quant_along_tokens(rows)
+    h.v_fp8.view(-1, VGROUP, n, d).index_put_((slots,), fp8)
+    h.v_scale.view(-1, n, d, 2).index_put_((slots,), scale)
+
+
+def _window_keep(valid: torch.Tensor, group: int) -> torch.Tensor:
+    return torch.arange(group, device=valid.device).unsqueeze(0) < valid.unsqueeze(1)
+
+
+def write_kv_step(h, key, value, slot_mapping, qsl, seq_lens, block_tables, num_reqs, spec_verify):
+    """Mirror of the decode branch of _qfa_write_kv. Returns the restore payload."""
+    import torch_npu
+    from vllm_ascend.attention.qfa_scale import plan_v_windows
+
+    num_tokens, n, d = key.shape
+    fp8, scale = torch_npu.npu_dynamic_mx_quant(key.reshape(num_tokens * n, d), dst_type=FP8, scale_alg=0)
+    fp8 = fp8.reshape(num_tokens, n, d).view(torch.uint8)
+    scale = scale.view(torch.uint8).reshape(num_tokens, n, d // 64, 2)
+    safe = torch.where(slot_mapping >= 0, slot_mapping, torch.zeros_like(slot_mapping)).to(torch.int64)
+    h.k_fp8.view(-1, n, d).index_put_((safe,), fp8)
+    h.k_scale.view(-1, n, d // 64, 2).index_put_((safe,), scale)
+
+    token_ids = torch.arange(num_tokens, device=value.device)
+    starts = qsl[:num_reqs]
+    req_ids = torch.searchsorted(qsl[1 : num_reqs + 1].contiguous(), token_ids, right=True)
+    ctx_lens = seq_lens[:num_reqs] - (qsl[1 : num_reqs + 1] - starts)
+    positions = ctx_lens[req_ids] + (token_ids - starts[req_ids])
+
+    plan = plan_v_windows(ctx_lens, seq_lens, block_tables, num_reqs, VGROUP)
+    slots = plan["window_slots"]
+    raw_rows = _dequant_windows(h, slots, n, d)
+    token_window = torch.div(positions, VGROUP, rounding_mode="floor")
+    scratch = raw_rows.new_zeros(1, VGROUP, n, d)
+    rows_ext = torch.cat([raw_rows, scratch])
+    discard = raw_rows.shape[0]
+    for pair_slot, window_of_row in ((0, plan["first_window"]), (1, plan["last_window"])):
+        target = torch.where(
+            token_window == window_of_row[req_ids],
+            req_ids * 2 + pair_slot,
+            torch.full_like(req_ids, discard),
+        )
+        rows_ext[target, positions % VGROUP] = value
+    raw_rows = rows_ext[:discard]
+    rows = raw_rows * _window_keep(plan["valid"], VGROUP).view(-1, VGROUP, 1, 1)
+
+    if not spec_verify:
+        _commit_windows(h, rows, slots, n, d)
+        return None
+    _, scale_read = _quant_along_tokens(rows * _window_keep(plan["confirmed"], VGROUP).view(-1, VGROUP, 1, 1))
+    _commit_windows(h, _clamp_to_scale(rows, scale_read), slots, n, d)
+    return (rows, slots, n, d)
+
+
+def decode_inputs(h, committed: int, num_reqs: int = B):
+    """The device tensors a verify step hands the write path.
+
+    The K/V it feeds are deliberately NOT the source prefill_all committed, so
+    a write that silently does nothing cannot pass as a byte-for-byte match.
+    """
+    if not _STEP_SRC:
+        torch.manual_seed(4243)
+        _STEP_SRC["k"] = torch.randn(B, MAX_LEN, NKV, D, dtype=torch.bfloat16, device="npu")
+        _STEP_SRC["v"] = torch.randn(B, MAX_LEN, NKV, D, dtype=torch.bfloat16, device="npu")
+    src_k, src_v = _STEP_SRC["k"], _STEP_SRC["v"]
+    dev = torch.device("npu")
+    end = committed + QLEN
+    qsl = torch.tensor([i * QLEN for i in range(num_reqs + 1)], dtype=torch.int32, device=dev)
+    seq_lens = torch.full((num_reqs,), end, dtype=torch.int32, device=dev)
+    key = torch.stack([src_k[b, committed:end] for b in range(num_reqs)]).reshape(-1, NKV, D).contiguous()
+    value = torch.stack([src_v[b, committed:end] for b in range(num_reqs)]).reshape(-1, NKV, D).contiguous()
+    offsets = [torch.arange(committed, end, device=dev) + b * BN_PER_SEQ * BS for b in range(num_reqs)]
+    slots = torch.cat(offsets).to(torch.int64)
+    return key, value, slots, qsl, seq_lens
+
+
+def stage3(h) -> bool:
+    print("== stage 3: the write path under capture ==")
+    committed = 62  # the 4 new tokens straddle a 64-token V window boundary
+    h.write_step(committed)  # realistic q buffers / seqused for this length
+    torch.npu.synchronize()
+    key, value, slots, qsl, seq_lens = decode_inputs(h, committed)
+    base = snapshot(h)
+
+    write_kv_step(h, key, value, slots, qsl, seq_lens, h.block_table, B, spec_verify=False)
+    torch.npu.synchronize()
+    eager = snapshot(h)
+
+    restore(h, base)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        write_kv_step(h, key, value, slots, qsl, seq_lens, h.block_table, B, spec_verify=False)
+    torch.npu.synchronize()
+    print("  [s3] capture OK")
+    restore(h, base)
+    graph.replay()
+    torch.npu.synchronize()
+    replayed = snapshot(h)
+
+    ok = True
+    for name, before, e, r in zip(PLANES, base, eager, replayed):
+        same = torch.equal(e.cpu(), r.cpu())
+        # Without this the check passes when both runs write nothing at all.
+        touched = int((e != before).sum())
+        print(f"  [s3] {name:<8} replay==eager={same} bytes-the-write-changed={touched}")
+        ok = ok and same and touched > 0
+    print(f"  [s3] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
+def stage4(h) -> bool:
+    print("== stage 4: the two-write restore inside one graph ==")
+    committed = 126  # straddles both a V window and a 128-token kernel block
+    h.write_step(committed)
+    torch.npu.synchronize()
+    key, value, slots, qsl, seq_lens = decode_inputs(h, committed)
+    h.metadata_buf.copy_(h.launch_metadata(MAX_LEN))
+    torch.npu.synchronize()
+    base = snapshot(h)
+
+    def two_write():
+        pending = write_kv_step(h, key, value, slots, qsl, seq_lens, h.block_table, B, spec_verify=True)
+        attn = h.qfa(h.metadata_buf, MAX_LEN)
+        _commit_windows(h, *pending)
+        return attn
+
+    # Where a single unclamped write lands. The restore exists to end up here,
+    # so the committed cache has to match it byte for byte.
+    write_kv_step(h, key, value, slots, qsl, seq_lens, h.block_table, B, spec_verify=False)
+    torch.npu.synchronize()
+    single = snapshot(h)
+
+    restore(h, base)
+    eager_out = two_write().cpu().clone()
+    torch.npu.synchronize()
+    eager_cache = snapshot(h)
+
+    restore(h, base)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        graph_out = two_write()
+    torch.npu.synchronize()
+    print("  [s4] capture OK")
+    restore(h, base)
+    graph.replay()
+    torch.npu.synchronize()
+
+    ok = torch.equal(eager_out, graph_out.cpu())
+    print(f"  [s4] attention output replay==eager={ok}")
+    for name, e, r, s in zip(PLANES, eager_cache, snapshot(h), single):
+        same = torch.equal(e.cpu(), r.cpu())
+        restored = torch.equal(e.cpu(), s.cpu())
+        print(f"  [s4] {name:<8} replay==eager={same} restore-lands-on-single-write={restored}")
+        ok = ok and same and restored
+    print(f"  [s4] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
+def stage5(h, graph, out) -> bool:
+    print("== stage 5: resident buffers whose contents change between replays ==")
+    original = h.block_table.clone()
+    # Same cache bytes, different rows: request 0 now reads request 1 blocks.
+    swapped = torch.stack([original[1], original[0]]).contiguous()
+
+    def replay_with(table):
+        h.block_table.copy_(table)
+        h.metadata_buf.copy_(h.launch_metadata(MAX_LEN))
+        graph.replay()
+        torch.npu.synchronize()
+        return out.cpu().clone()
+
+    ok = True
+    seen = {}
+    for name, table in (("swapped", swapped), ("original", original)):
+        got = replay_with(table)
+        ref = h.qfa(h.launch_metadata(MAX_LEN), MAX_LEN)
+        torch.npu.synchronize()
+        same = torch.equal(got, ref.cpu())
+        print(f"  [s5] block table {name:<8} replay==eager={same}")
+        seen[name] = got
+        ok = ok and same
+    # A graph that baked in the capture-time table answers both the same way.
+    differs = not torch.equal(seen["swapped"], seen["original"])
+    print(f"  [s5] swapping the table changes the replay output={differs} (else the check is vacuous)")
+    h.block_table.copy_(original)
+    ok = ok and differs
+    print(f"  [s5] {'GREEN' if ok else 'RED'}")
+    return ok
+
+
 def main() -> int:
     global FP8
     FP8 = torch.float8_e4m3fn
@@ -321,7 +583,7 @@ def main() -> int:
     steps = int(os.environ.get("QFA_ILV_STEPS", "128"))
 
     h = Harness()
-    results = {}
+    results: dict[str, bool] = {}
     try:
         results["stage0"], graph, out = stage0(h)
     except Exception:
@@ -330,26 +592,33 @@ def main() -> int:
         graph = out = None
     print()
     if results["stage0"]:
-        try:
-            results["stage1"] = stage1(h, graph, out, steps)
-        except Exception:
-            traceback.print_exc()
-            results["stage1"] = False
-        print()
-        try:
-            results["stage2"] = stage2(h, graph, iters)
-        except Exception:
-            traceback.print_exc()
-            results["stage2"] = False
-        print()
+        # stage 2 is the slow one and runs last, so a cheap stage that fails
+        # reports in seconds rather than after 2000 iterations.
+        for name, run in (
+            ("stage1", lambda: stage1(h, graph, out, steps)),
+            ("stage3", lambda: stage3(h)),
+            ("stage4", lambda: stage4(h)),
+            ("stage5", lambda: stage5(h, graph, out)),
+            ("stage2", lambda: stage2(h, graph, iters)),
+        ):
+            try:
+                results[name] = run()
+            except Exception:
+                traceback.print_exc()
+                results[name] = False
+            print()
 
-    for name, ok in results.items():
-        print(f"[{'GREEN' if ok else 'RED'}] {name}")
-    all_ok = all(results.values()) and len(results) == 3
+    for name in sorted(results):
+        print(f"[{'GREEN' if results[name] else 'RED'}] {name}")
+    all_ok = all(results.values()) and len(results) == 6
     if all_ok:
         print("[VERDICT] per-step AICPU metadata outside the graph is SAFE -> C3 mainline")
     elif not results.get("stage0", False):
         print("[VERDICT] QFA capture failed -> needs out-variant/explicit workspace (csrc)")
+    elif not (results.get("stage3", True) and results.get("stage4", True)):
+        print("[VERDICT] the write path cannot be captured -> keep it outside the captured region")
+    elif not results.get("stage5", True):
+        print("[VERDICT] the replay is not reading the resident buffers -> check what got baked in")
     elif not results.get("stage2", True):
         print("[VERDICT] adjacency unstable -> host-side SectionStreamK port (fallback)")
     print(f"[{'GREEN' if all_ok else 'RED'}] QFA graph interleave overall")
