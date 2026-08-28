@@ -25,6 +25,18 @@ before any of it is built. This also settles how the scale byte is computed
 (which decides whether the extra write costs a quantize or just a reduction)
 and whether values above the e4m3 maximum saturate or turn into NaN.
 
+Measured on A5, 2026-08-28, scale_alg=0, N=4 D=256: clamping to the confirmed
+bound re-derives that scale in all 16 cases; values above 448 saturate rather
+than turning into NaN; the tensor-bound clamp has a kernel at the real window
+shape; and the two-write sequence gives a read view byte-identical to a
+non-speculative window while leaving the committed cache unchanged. The
+operator's scale byte follows floor(log2(amax)) - 8 + 127 for 8184 of 8192
+blocks and sits one step above it for the rest, which is why the confirmed
+scale keeps coming from the operator: the extra pass costs +157% of one
+quantize at W=128 against +100% for a closed form that is wrong 0.1% of the
+time, and where it is wrong the read view is a step coarser than the
+non-speculative run it exists to reproduce.
+
 Run (seconds, no server, one card):
     python scripts/debug/probe_qfa_mx_scale_npu.py
 """
@@ -125,8 +137,15 @@ def bound_from_scale(scale: torch.Tensor) -> torch.Tensor:
 def test_scale_formula() -> None:
     """Which closed form does the operator's E8M0 byte follow?
 
-    Knowing it means the fix can derive the clamp bound from a cheap amax
-    reduction instead of a second full quantize.
+    Informational, not a gate. Nothing in the write path names a rule of its
+    own: the clamp bound is `448 * 2^(b-127)` computed from the byte the
+    operator itself returned, which is exact arithmetic on its own answer.
+    This asks a narrower question - whether the confirmed scale could come
+    from a cheap amax reduction instead of a second quantize, which test 5
+    prices. A closed form that is right 99.9% of the time is not good enough
+    for that: where it is low by one E8M0 step the read view comes back one
+    step coarser than a non-speculative run, which is exactly the property
+    the two-write sequence exists to preserve.
     """
     print("== 1. E8M0 byte vs closed forms")
     torch.manual_seed(1024)
@@ -147,10 +166,22 @@ def test_scale_formula() -> None:
     total = got.numel()
     assert got.shape == h0.shape, f"scale {tuple(got.shape)} vs expectation {tuple(h0.shape)}"
     print(f"     floor(log2(amax))-8 matches {m0}/{total}, ceil(log2(amax/448)) matches {m1}/{total}")
-    if m0 != total and m1 != total:
-        off = (got - h0)[got != h0]
-        print(f"     unmatched deltas vs H0: min {int(off.min())} max {int(off.max())}")
-    check("a closed form reproduces every scale byte", m0 == total or m1 == total, f"H0={m0 == total} H1={m1 == total}")
+    if m0 == total or m1 == total:
+        print("     a closed form reproduces every byte - the cheap path in test 5 is available")
+    else:
+        # Show what the exceptions look like: if they share a mantissa range
+        # the rule is recoverable, and if they do not, the operator is the
+        # only source of its own scale.
+        bad = got != h0
+        off = (got - h0)[bad]
+        vals = amax[bad]
+        mant = vals / torch.exp2(torch.floor(torch.log2(vals)))
+        print(
+            f"     no closed form fits: {total - m0} byte(s) differ from H0 by "
+            f"{int(off.min())}..{int(off.max())}, at mantissas "
+            f"{[round(float(x), 4) for x in mant[:8]]}"
+        )
+        print("     -> the confirmed scale must keep coming from the operator (test 5's 'safe' column)")
 
     zeros = torch.zeros(8, GROUP, dtype=torch.bfloat16, device=DEVICE)
     _, zscale = quant_cols(zeros)
