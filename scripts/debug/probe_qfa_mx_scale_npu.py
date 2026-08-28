@@ -60,10 +60,31 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+_shape_reported = False
+
+
 def quant_cols(cols: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """(M, 64) bf16 -> (M, 64) fp8 bytes + (M, 2) e8m0 bytes."""
+    """(M, 64) bf16 -> (M, 64) fp8 bytes + (M, 2) e8m0 bytes.
+
+    Both results are reshaped rather than taken as they come: the operator has
+    been observed returning the scale with an extra axis, and comparing that
+    against a (M, 2) expectation broadcasts into an outer product instead of
+    failing. The impl is not exposed to it because _qfa_quant_along_tokens
+    reshapes too; a probe that trusts the shape reports nonsense.
+    """
+    global _shape_reported
     fp8, scale = torch_npu.npu_dynamic_mx_quant(cols.contiguous(), dst_type=torch.float8_e4m3fn, scale_alg=SCALE_ALG)
-    return fp8.view(torch.uint8), scale.view(torch.uint8)
+    if not _shape_reported:
+        _shape_reported = True
+        print(f"     operator returns fp8 {tuple(fp8.shape)} scale {tuple(scale.shape)} for cols {tuple(cols.shape)}")
+    rows = cols.shape[0]
+    scale = scale.view(torch.uint8).reshape(rows, -1)
+    if scale.shape[1] != cols.shape[1] // PACK:
+        raise AssertionError(
+            f"expected {cols.shape[1] // PACK} scale bytes per row, got {scale.shape[1]} - "
+            "the operator does not share one E8M0 scale per 32 elements here"
+        )
+    return fp8.view(torch.uint8).reshape(cols.shape), scale
 
 
 def quant_windows(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -124,6 +145,7 @@ def test_scale_formula() -> None:
     m0 = int((got == h0).sum())
     m1 = int((got == h1).sum())
     total = got.numel()
+    assert got.shape == h0.shape, f"scale {tuple(got.shape)} vs expectation {tuple(h0.shape)}"
     print(f"     floor(log2(amax))-8 matches {m0}/{total}, ceil(log2(amax/448)) matches {m1}/{total}")
     if m0 != total and m1 != total:
         off = (got - h0)[got != h0]
