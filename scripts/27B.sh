@@ -62,15 +62,6 @@ if [[ "${QFA:-0}" == "1" ]]; then
     echo "QFA MXFP8 KV cache enabled; prefix caching disabled (unsupported with it)." >&2
 fi
 
-# SPEC is the MTP drafter depth (num_speculative_tokens). SPEC=0 drops the
-# speculative config entirely - the first fallback when the QFA path trips
-# on the drafter (C3 opened with 507018 during the first MTP proposal).
-SPEC="${SPEC:-3}"
-spec_args=()
-if [[ "$SPEC" != "0" ]]; then
-    spec_args+=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$SPEC}")
-fi
-
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
@@ -83,6 +74,7 @@ exec vllm serve "$MODEL_PATH" \
     --gpu-memory-utilization 0.95 \
     --reasoning-parser qwen3 \
     --compilation-config '{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' \
     --trust-remote-code \
     --async-scheduling \
     --allowed-local-media-path / \
@@ -90,5 +82,4 @@ exec vllm serve "$MODEL_PATH" \
     --mm-encoder-tp-mode data \
     --mm-processor-cache-type shm \
     --additional-config '{"enable_cpu_binding":true}' \
-    "${spec_args[@]}" \
     "${qfa_args[@]}"
