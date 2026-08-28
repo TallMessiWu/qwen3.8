@@ -594,7 +594,7 @@ def stage_d(rig: Rig) -> bool:
     import os
     import threading
 
-    print("== stage D: capture-warmup dummy decode shape (32 x q_len 4, seqused 4, bt 0) ==")
+    print("== stage D: capture-warmup dummy shape (32 x q_len 4, seqused 4, bt 0), both call forms ==")
     dev = torch.device("npu")
     rows, qlen = 32, 4
     t = rows * qlen
@@ -603,52 +603,68 @@ def stage_d(rig: Rig) -> bool:
     bt = torch.zeros(rows, BN_PER_SEQ, dtype=torch.int32, device=dev)
     q = torch.randn(t, NQ, D, dtype=torch.bfloat16, device=dev)
     qf, qs = quant_tnd(q)
-    q_descale = qs.reshape(t, NKV, G, D // 64, 2).permute(1, 0, 2, 3, 4).contiguous()
-    args = {
+    # The serve warmup runs the dummy batch through the decode=False
+    # (chunked-prefill) form - _qfa_decode_batch is False outside capture -
+    # and its breadcrumbs name main-fa in exactly that form as the hang. The
+    # only argument difference from the decode form stage D already cleared
+    # is the q_descale layout: TND straight from the quant vs the N2TGD
+    # reorder. Suspect form first.
+    qd_tnd = qs.view(E8M0)
+    qd_n2tgd = qs.reshape(t, NKV, G, D // 64, 2).permute(1, 0, 2, 3, 4).contiguous().view(E8M0)
+    base = {
         "cu_seqlens_q": cu,
         "seqused_kv": seqused,
         "mask_mode": 3,
         "max_seqlen_q": qlen,
         "max_seqlen_kv": qlen,
         "layout_q": "TND",
-        "layout_q_descale": "N2TGD",
         "layout_kv": "PA_BBND",
         "layout_out": "TND",
     }
-    hung_at = ["metadata"]
+    hung_at = ["?"]
 
     def watchdog():
-        print(f"  [D] RED - device hung in the {hung_at[0]} op on the dummy shape (>120 s)", flush=True)
+        print(f"  [D] RED - device hung in {hung_at[0]} on the dummy shape (>150 s)", flush=True)
         os._exit(2)
 
-    timer = threading.Timer(120.0, watchdog)
-    timer.daemon = True
-    timer.start()
-    md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
-        NQ, NKV, D, v_descale=rig.v_scale.view(E8M0), **args
-    )
-    torch.npu.synchronize()
-    print(f"  [D] metadata OK, blob head {md[:12].cpu().tolist()}")
-    hung_at[0] = "main FA"
-    out = torch.ops._C_ascend.npu_quant_flash_attn(
-        qf,
-        rig.k_fp8.view(FP8),
-        rig.v_fp8.view(FP8),
-        q_descale.view(E8M0),
-        rig.k_scale.view(E8M0),
-        rig.v_scale.view(E8M0),
-        md,
-        SCALE,
-        block_table=bt,
-        attn_mask=rig.mask,
-        **args,
-    )
-    torch.npu.synchronize()
-    timer.cancel()
-    finite = bool(torch.isfinite(out.float()).all())
-    print(f"  [D] FA OK: out shape {tuple(out.shape)}, finite={finite}")
-    print(f"  [D] {'GREEN' if finite else 'RED'} (the dummy read completes; if serve still hangs, suspect the write+read pairing)")
-    return finite
+    outs = {}
+    for name, layout, qd in (
+        ("prefill-form", "TND", qd_tnd),
+        ("decode-form", "N2TGD", qd_n2tgd),
+    ):
+        args = dict(base, layout_q_descale=layout)
+        timer = threading.Timer(150.0, watchdog)
+        timer.daemon = True
+        hung_at[0] = f"metadata [{name}]"
+        timer.start()
+        md = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+            NQ, NKV, D, v_descale=rig.v_scale.view(E8M0), **args
+        )
+        torch.npu.synchronize()
+        print(f"  [D] {name} metadata OK, blob head {md[:12].cpu().tolist()}")
+        hung_at[0] = f"main FA [{name}]"
+        out = torch.ops._C_ascend.npu_quant_flash_attn(
+            qf,
+            rig.k_fp8.view(FP8),
+            rig.v_fp8.view(FP8),
+            qd,
+            rig.k_scale.view(E8M0),
+            rig.v_scale.view(E8M0),
+            md,
+            SCALE,
+            block_table=bt,
+            attn_mask=rig.mask,
+            **args,
+        )
+        torch.npu.synchronize()
+        timer.cancel()
+        outs[name] = out
+        print(f"  [D] {name} FA OK: out shape {tuple(out.shape)}, finite={bool(torch.isfinite(out.float()).all())}")
+    diff = float((outs["prefill-form"].float() - outs["decode-form"].float()).abs().max())
+    ok = all(bool(torch.isfinite(o.float()).all()) for o in outs.values())
+    print(f"  [D] max|prefill-form - decode-form| = {diff:.3e} (same q/kv, layouts must agree)")
+    print(f"  [D] {'GREEN' if ok else 'RED'} (both forms complete; if serve still hangs, the delta is plane content from the dummy write)")
+    return ok
 
 
 def stage_e(rig: Rig) -> bool:
