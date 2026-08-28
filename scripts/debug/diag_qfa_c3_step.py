@@ -364,12 +364,31 @@ def stage_b(rig: Rig) -> bool:
 
 def main() -> int:
     global FP8, E8M0
+    import os
+
     import torch_npu  # noqa: F401
 
-    torch.npu.set_device(0)
+    torch.npu.set_device(int(os.environ.get("QFA_TEST_DEVICE", "0")))
+    # The aclnn entry points live in the custom opp package, not the system
+    # libopapi.so - point the loader at it BEFORE importing vllm_ascend_C,
+    # exactly like test_qfa_graph_interleave.py does.
+    try:
+        from vllm_ascend.utils import bootstrap_custom_op_env
+
+        bootstrap_custom_op_env(include_vendor_lib=True)
+    except Exception:
+        import vllm_ascend
+
+        vendor = os.path.join(
+            os.path.dirname(vllm_ascend.__file__), "_cann_ops_custom", "vendors", "custom_transformer"
+        )
+        if os.path.isdir(vendor):
+            prev = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = vendor + (":" + prev if prev else "")
+    import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+
     FP8 = torch.float8_e4m3fn
     E8M0 = torch.float8_e8m0fnu
-    import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
 
     print("[INFO] building engine-shaped rig (no weights)")
     rig = Rig()
