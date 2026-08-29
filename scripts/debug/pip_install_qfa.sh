@@ -74,4 +74,4 @@ assert hasattr(torch.ops._C_ascend, "npu_quant_flash_attn"), "npu_quant_flash_at
 assert hasattr(torch.ops._C_ascend, "npu_quant_flash_attn_metadata"), "metadata op missing"
 print("[GREEN] torch.ops._C_ascend.npu_quant_flash_attn{,_metadata} registered")
 EOF
-echo "[GREEN] full install done (log: $LOG); next: python scripts/debug/test_quant_flash_attn_npu.py"
+echo "[GREEN] full install done (log: $LOG); next: python scripts/debug/test_junlin_qfa_npu.py"
