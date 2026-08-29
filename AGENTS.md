@@ -30,7 +30,7 @@ qwen3.8/                   # 主仓（git，分支 main）
     └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn`（QFA 在途分支，基于 upstream/main），`main` 仍作为个人 fork 基线维护。
+服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa`（QFA 在途分支，基于 upstream/main），`main` 仍作为个人 fork 基线维护。
 
 **主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和各任务分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
@@ -55,13 +55,13 @@ git -C vllm-ascend/upstream-main pull --ff-only        # upstream/main
 
 ```bash
 cd vllm-ascend/upstream-main
-git worktree add ../feat-xxx -b feat/xxx upstream/main # 新分支
-git worktree add ../bugfix-yyy origin/bugfix/yyy       # 检出已有远程分支
+git worktree add ../feat-xxx -b feat-xxx upstream/main # 新分支
+git worktree add ../bugfix-yyy origin/bugfix-yyy       # 检出已有远程分支
 git worktree list
 git worktree remove ../feat-xxx                        # 收尾清理
 ```
 
-目录名用分支名去掉斜杠（`feat/mxfp8-quant-group-tp` → `feat-mxfp8-quant-group-tp`）。
+分支名不用斜杠，直接 `feat-xxx`、`bugfix-yyy` 这种扁平写法，目录名与分支名保持一致。
 
 同步上游：在 `upstream-main` 执行 `git fetch upstream && git pull --ff-only`。不要顺手把官方主线合入 `main`；`main` 保持跟踪个人 fork 的 `origin/main`，需要同步 fork 时再明确执行合并与推送。
 
@@ -93,7 +93,7 @@ vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，**提交必须带 si
 git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 ```
 
-分支命名沿用现有习惯：`feat/*`、`fix/*`、`bugfix/*`。
+分支命名不用斜杠，用连字符扁平写法：`feat-xxx`、`fix-xxx`、`bugfix-xxx`。不再使用的分支改名为 `archive-xxx` 归档，不直接删除。
 
 ## vllm-ascend 架构要点
 
@@ -123,6 +123,6 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`；在途功能分支 `feat/qfa-mxfp8-attn`（QFA MXFP8 算子接入）基于 upstream/main，有独立 worktree。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`；在途功能分支 `junlin-qfa`（QFA 算子接入，官方 master QFA 已 vendor 进 csrc）基于 upstream/main，有独立 worktree。旧的 `archive-qfa-mxfp8-attn`（原 `feat/qfa-mxfp8-attn`）已废弃归档，勿参考。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。

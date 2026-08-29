@@ -18,7 +18,7 @@ SERVICE_LAUNCHERS = (
 )
 MODEL_NAME_CONSUMERS = SERVICE_LAUNCHERS + ("curl.sh",)
 QFA_VLLM_ASCEND_REPO = (
-    "/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn"
+    "/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa"
 )
 
 
@@ -74,7 +74,7 @@ class ScriptDefaultsTest(unittest.TestCase):
         readme = (SCRIPTS_DIR.parent / "README.md").read_text(encoding="utf-8")
 
         self.assertIn(
-            "VLLM_ASCEND_QFA_BRANCH=feat/qfa-mxfp8-attn",
+            "VLLM_ASCEND_QFA_BRANCH=junlin-qfa",
             readme,
         )
         self.assertIn('"origin/${VLLM_ASCEND_QFA_BRANCH}"', readme)
