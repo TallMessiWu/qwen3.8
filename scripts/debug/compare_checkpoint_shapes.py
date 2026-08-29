@@ -82,6 +82,24 @@ def collect(model_dir, label, max_shards):
     return tensors
 
 
+def pick_fused_gate_up(tensors):
+    """Find a 3-D `experts.gate_up_proj`/`experts.w13` tensor: [E, 2I, H]."""
+    for name in sorted(tensors):
+        shape = tensors[name][0]
+        if len(shape) == 3 and re.search(r"\.experts\.(gate_up_proj|w13)$", name):
+            return name, shape
+    return None
+
+
+def pick_per_expert_gate_up(tensors):
+    """Find a 2-D per-expert gate tensor: `experts.N.gate_proj.weight`."""
+    for name in sorted(tensors):
+        shape = tensors[name][0]
+        if len(shape) == 2 and re.search(r"\.experts\.\d+\.(gate_proj|w1)\.weight$", name):
+            return name, shape
+    return None
+
+
 def load_config(model_dir):
     path = model_dir / "config.json"
     if not path.is_file():
@@ -221,9 +239,24 @@ def main():
             print("  " + name)
             print("      quantized " + str(list(ta[name][0])) + "   |   bf16 " + str(list(tb[name][0])))
 
-    # Verdict, driven by the expert weights specifically.
+    # Verdict. Routed experts are judged on their own, because the two sides may
+    # use different naming schemes (3-D fused `experts.gate_up_proj` vs per-expert
+    # `experts.N.gate_proj.weight`) and then share no tensor names at all.
     hidden = cfg_b.get("hidden_size")
     moe_inter = cfg_b.get("moe_intermediate_size")
+    print("")
+    print("=== routed expert gate/up layout ===")
+    fused_b = pick_fused_gate_up(tb)
+    per_a = pick_per_expert_gate_up(ta)
+    if fused_b:
+        print("  bf16      " + fused_b[0] + " " + str(list(fused_b[1]))
+              + "   -> per expert [" + str(fused_b[1][1]) + ", " + str(fused_b[1][2]) + "] (gate+up fused)")
+    if per_a:
+        print("  quantized " + per_a[0] + " " + str(list(per_a[1])) + "   (one expert, gate only)")
+    expected = [moe_inter, hidden] if moe_inter and hidden else None
+    if expected:
+        print("  vLLM wants one expert's gate to be " + str(expected))
+
     expert_diffs = {p: c for p, c in diffs.items() if "experts" in p and p.endswith(".weight")}
     print("")
     if expert_diffs:
@@ -231,21 +264,28 @@ def main():
         (sa, sb), _ = next(iter(expert_diffs[pat].most_common(1)))
         print("[RED] expert weights were RESHAPED by the quantization step.")
         print("      " + pat + ": bf16 " + str(list(sb)) + " -> quantized " + str(list(sa)) + ".")
-        print("      vLLM expects [moe_intermediate_size, hidden_size] = ["
-              + str(moe_inter) + ", " + str(hidden) + "], which is what the bf16 side has.")
-        print("      The quantized directory is the broken artifact; re-export it or serve the bf16 one.")
+        print("      vLLM expects [moe_intermediate_size, hidden_size] = " + str(expected)
+              + ", which is what the bf16 side has.")
+        return 1
+    if per_a and expected and list(per_a[1]) != expected:
+        rows, cols = per_a[1][0], per_a[1][1]
+        print("[RED] the quantized gate tensor is " + str(list(per_a[1])) + ", not " + str(expected) + ".")
+        if fused_b and [rows, cols] == [fused_b[1][1], fused_b[1][2] // 2]:
+            print("      It is exactly the fused per-expert tensor " + str([fused_b[1][1], fused_b[1][2]]))
+            print("      cut in half along dim 1 - the HIDDEN axis. gate and up live along dim 0")
+            print("      (" + str(fused_b[1][1]) + " = 2 x " + str(moe_inter) + "), so the split axis is wrong:")
+            print("        correct  : chunk(2, dim=0) -> gate [" + str(moe_inter) + ", " + str(hidden) + "]")
+            print("        this file: chunk(2, dim=1) -> " + str(list(per_a[1])) + " holding half of BOTH")
+            print("      Every 'gate_proj' here is really the first half of hidden for gate AND up,")
+            print("      so no loader-side reshape can recover it correctly without re-pairing the")
+            print("      two tensors. The quantized export is the broken artifact.")
+            print("      Confirm on real bytes with:")
+            print("        python3 verify_expert_split_axis.py <quant_path> <bf16_path>")
+        else:
+            print("      config.json and this quantized export disagree about the expert layout.")
         return 1
     if not shared:
         print("[RED] the two directories share no tensor names; they are not the same model export.")
-        return 1
-    bad_anchor = [n for n in shared if EXPERT_RE.search(n) and n.endswith(".weight")
-                  and hidden and moe_inter and list(tb[n][0]) not in ([moe_inter, hidden], [hidden, moe_inter])]
-    if bad_anchor:
-        print("[RED] both checkpoints disagree with config.json for expert weights, e.g.")
-        name = sorted(bad_anchor)[0]
-        print("      " + name + " is " + str(list(tb[name][0])) + ", expected ["
-              + str(moe_inter) + ", " + str(hidden) + "].")
-        print("      config.json does not describe either weight set; the config is the wrong one.")
         return 1
     print("[GREEN] expert weights have identical shapes on both sides and match config.json.")
     print("        The load failure comes from the runtime side, not from these files.")
