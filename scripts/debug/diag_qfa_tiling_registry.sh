@@ -42,7 +42,9 @@ while IFS= read -r so; do
         echo "[OK] no unresolved symbols"
     fi
 done < <(find "$WORKTREE/csrc/build" "$WORKTREE/csrc/build_out" \
-            -name "liboptiling.so" -o -name "libcust_opmaster_rt2.0.so" 2>/dev/null | sort -u)
+            \( -name "liboptiling.so" -o -name "libcust_opmaster_rt2.0.so" \
+               -o -name "libcust_opapi.so" -o -name "libcust_opsproto_rt2.0.so" \) \
+            2>/dev/null | sort -u)
 if [[ $found_so -eq 0 ]]; then
     echo "[WARN] no tiling .so found under csrc/build{,_out} -- build tree already wiped?"
 fi
