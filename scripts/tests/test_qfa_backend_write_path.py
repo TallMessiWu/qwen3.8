@@ -29,7 +29,8 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[2]
-QFA_PY = REPO / "vllm-ascend" / "junlin-qfa" / "vllm_ascend" / "attention" / "attention_qfa.py"
+_WORKTREE = __import__("os").environ.get("QFA_WORKTREE", "junlin-qfa")
+QFA_PY = REPO / "vllm-ascend" / _WORKTREE / "vllm_ascend" / "attention" / "attention_qfa.py"
 GOLDEN_PY = REPO / "scripts" / "debug" / "test_junlin_qfa_npu.py"
 
 GROUP = 32
