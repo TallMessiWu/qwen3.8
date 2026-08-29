@@ -106,10 +106,15 @@ def load_qfa_module():
     fake_v1mod.AscendMetadata = AscendMetadata
     fake_pkg = types.ModuleType("vllm_ascend")
     fake_attn_pkg = types.ModuleType("vllm_ascend.attention")
+    fake_fwd_ctx = types.ModuleType("vllm_ascend.ascend_forward_context")
+    fake_fwd_ctx._EXTRA_CTX = types.SimpleNamespace(
+        capturing=False, is_draft_model=False, is_draft_model_prefill=False,
+        sinks=None)
     sys.modules.update({
         "vllm_ascend": fake_pkg,
         "vllm_ascend.attention": fake_attn_pkg,
         "vllm_ascend.attention.attention_v1": fake_v1mod,
+        "vllm_ascend.ascend_forward_context": fake_fwd_ctx,
     })
 
     spec = importlib.util.spec_from_file_location("attention_qfa", QFA_PY)
@@ -261,6 +266,44 @@ def main() -> int:
     # is fine: K is per-token and never read past seqused_kv. V must match
     # exactly because draft garbage would poison the shared window scale.
     all_ok &= check("MTP-ROLLBACK-V", same)
+
+    # ---- 4) fixed-shape decode variant (M3) == unique-window variant ------
+    if hasattr(qfa.AscendQfaAttentionBackendImpl, "_write_kv_quantized_decode"):
+        base = 90
+        num_reqs, k = 3, 4
+        # three requests on separate blocks, verify step writes k tokens each
+        starts = [90, 128 + 30, 256 + 62]  # last one straddles two windows
+        implA = make_impl(qfa, nkv, d)
+        pA = implA._ensure_planes(alloc_cache(qfa, 4, bs, nkv, d))
+        implB = make_impl(qfa, nkv, d)
+        pB = implB._ensure_planes(alloc_cache(qfa, 4, bs, nkv, d))
+        hist_k = torch.randn(base * 3, nkv, d, dtype=torch.bfloat16)
+        hist_v = torch.randn(base * 3, nkv, d, dtype=torch.bfloat16)
+        hist_slots = torch.cat([torch.arange(s - base, s) for s in starts])
+        implA._write_kv_quantized(hist_k, hist_v, hist_slots)
+        implB._write_kv_quantized(hist_k, hist_v, hist_slots)
+        new_k = torch.randn(num_reqs * k, nkv, d, dtype=torch.bfloat16)
+        new_v = torch.randn(num_reqs * k, nkv, d, dtype=torch.bfloat16)
+        new_slots = torch.cat([torch.arange(s, s + k) for s in starts])
+        implA._write_kv_quantized(new_k, new_v, new_slots)
+        implB._write_kv_quantized_decode(new_k, new_v, new_slots, num_reqs)
+        same = all(
+            torch.equal(a, b) for a, b in (
+                (pA.k_fp8[:3], pB.k_fp8[:3]), (pA.k_scale[:3], pB.k_scale[:3]),
+                (pA.v_fp8[:3], pB.v_fp8[:3]), (pA.v_scale[:3], pB.v_scale[:3]),
+            ))
+        all_ok &= check("DECODE-FIXED-SHAPE", same)
+
+        # padded entries (-1) must land in the trash block and leave every
+        # real block untouched
+        snapshot = pB.v_fp8[:3].clone()
+        pad_k = torch.zeros(2 * k, nkv, d, dtype=torch.bfloat16)
+        pad_slots = torch.cat([new_slots[:k] + k, torch.full((k,), -1, dtype=torch.long)])
+        implB._write_kv_quantized_decode(
+            torch.cat([new_k[:k], pad_k[:k]]), torch.cat([new_v[:k], pad_k[:k]]),
+            pad_slots, 2)
+        untouched = torch.equal(pB.v_fp8[1:3], snapshot[1:3])
+        all_ok &= check("DECODE-PAD-TRASH", untouched)
 
     print(f"[{'GREEN' if all_ok else 'RED'}] QFA backend write path vs golden packing")
     return 0 if all_ok else 1
