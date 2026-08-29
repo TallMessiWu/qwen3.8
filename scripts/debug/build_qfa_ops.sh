@@ -10,11 +10,11 @@
 #
 # Usage (inside the serving container):
 #   bash scripts/debug/build_qfa_ops.sh [worktree_dir]
-# Default worktree: /home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn
+# Default worktree: /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 
 set -uo pipefail
 
-WORKTREE="${1:-/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn}"
+WORKTREE="${1:-/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa}"
 SOC="${QFA_BUILD_SOC:-ascend950}"
 # Keep logs beside the script (root filesystem is tight); logs/ is gitignored.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

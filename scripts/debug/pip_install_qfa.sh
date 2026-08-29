@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-WORKTREE="${1:-/home/hajimi/qwen3.8/vllm-ascend/feat-qfa-mxfp8-attn}"
+WORKTREE="${1:-/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa}"
 export SOC_VERSION="${SOC_VERSION:-ascend950pr_9589}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
