@@ -49,17 +49,29 @@ MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 
-# QFA=1 serves the 16 full-attention layers (and the MTP drafter) from an MXFP8
-# KV cache through the QuantFlashAttn paged path. Graph mode is unchanged -
-# FULL_DECODE_ONLY is the one mode that path is captured under - but prefix
-# caching has to come off: the E8M0 scale planes are not tracked across shared
-# blocks, and the engine refuses the combination at startup anyway.
+# QFA=1 serves the full-attention layers (and the MTP drafter) from an MXFP8
+# KV cache through the vendored QuantFlashAttn backend (junlin-qfa branch,
+# VLLM_ASCEND_ENABLE_QFA). Prefix caching has to come off: the E8M0 scale
+# planes are not tracked across shared blocks.
+# GRAPH=0 turns off aclgraph capture (eager, milestone M1); MTP=0 turns off
+# speculative decoding (milestones M1/M2). Both default to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
-    export VLLM_ASCEND_ENABLE_QFA_PREFILL=1
-    export VLLM_ASCEND_ENABLE_QFA_DECODE=1
+    export VLLM_ASCEND_ENABLE_QFA=1
     qfa_args+=(--no-enable-prefix-caching)
     echo "QFA MXFP8 KV cache enabled; prefix caching disabled (unsupported with it)." >&2
+fi
+
+compilation_config='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}'
+if [[ "${GRAPH:-1}" == "0" ]]; then
+    compilation_config='{"cudagraph_mode":"NONE"}'
+    echo "aclgraph capture disabled (GRAPH=0)." >&2
+fi
+
+spec_args=(--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}')
+if [[ "${MTP:-1}" == "0" ]]; then
+    spec_args=()
+    echo "MTP speculative decoding disabled (MTP=0)." >&2
 fi
 
 exec vllm serve "$MODEL_PATH" \
@@ -73,8 +85,8 @@ exec vllm serve "$MODEL_PATH" \
     --max-num-seqs 32 \
     --gpu-memory-utilization 0.95 \
     --reasoning-parser qwen3 \
-    --compilation-config '{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' \
+    --compilation-config "$compilation_config" \
+    "${spec_args[@]}" \
     --trust-remote-code \
     --async-scheduling \
     --allowed-local-media-path / \
