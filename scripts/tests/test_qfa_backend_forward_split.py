@@ -90,6 +90,10 @@ def run_case(qfa, rec, nq, nkv, d, q_lens_decode, q_lens_prefill, kv_lens):
 def main() -> int:
     torch.manual_seed(1)
     qfa = load_qfa_module()
+    if not hasattr(qfa.AscendQfaAttentionBackendImpl, "_q_descale_n2tgd"):
+        print(f"[SKIP] worktree {os.environ['QFA_WORKTREE']} has no M2 split "
+              f"dispatch (single-call M1 forward); nothing to test here")
+        return 0
     rec = Recorder()
     torch.ops._C_ascend = rec  # process-local stub
 
