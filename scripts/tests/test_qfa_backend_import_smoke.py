@@ -265,6 +265,21 @@ def main() -> int:
         traceback.print_exc()
         ok_all &= check("BACKEND-SURFACE", False, f"{type(e).__name__}: {e}")
 
+    # ---- 3b) the enum lookup vllm's Attention.__init__ does on get_name() ----
+    # vllm 0.27 resolves AttentionBackendEnum[backend.get_name()] while building
+    # every attention layer. The enum is closed; third-party backends must answer
+    # with the registered "CUSTOM" placeholder (see attention_v1's
+    # register_backend call) or the engine dies with "Unknown attention backend"
+    # before the first layer exists.
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        name = backend_cls.get_name()
+        AttentionBackendEnum[name]  # ValueError if not an enum member
+        ok_all &= check("BACKEND-ENUM-NAME", True, f"get_name()={name!r}")
+    except Exception as e:  # noqa: BLE001
+        ok_all &= check("BACKEND-ENUM-NAME", False, f"{type(e).__name__}: {e}")
+
     # ---- 4) envs + platform selector branch (the QFA env gate) ----
     try:
         os.environ["VLLM_ASCEND_ENABLE_QFA"] = "1"
