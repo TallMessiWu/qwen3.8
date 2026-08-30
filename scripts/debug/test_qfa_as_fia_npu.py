@@ -51,22 +51,32 @@ def dequant_along_d(fp8, scale, d):
     return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=-1)).to(torch.bfloat16)
 
 
-def dequant_along_seq(fp8, scale, seq_axis):
+def dequant_along_seq(fp8, scale, seq_lens=None):
     """Undo quant_v_by_sequence: one exponent per 32 positions down the sequence.
 
-    scale arrives as (S//64, N, D, 2) for TND or (Bn, Bs//64, N, D, 2) for
-    PA_BBND; the trailing pair is the second half of each 64-wide window, so
-    folding it back into the sequence axis recovers one exponent per 32 rows.
+    The trailing pair in the scale is the second half of each 64-wide window, so
+    folding it into the sequence axis recovers one exponent per 32 rows. TND is
+    quantized per sequence with the tail padded up to 64 and the fp8 trimmed back
+    afterwards, so walk the sequences rather than expanding the whole thing.
     """
     import torch
 
-    if seq_axis == 0:  # TND (T, N, D), scale (T//64, N, D, 2)
-        w, n, d, _ = scale.shape
-        exp = scale.view(torch.uint8).permute(0, 3, 1, 2).reshape(w * 2, n, d).float() - 127.0
-        return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=0)).to(torch.bfloat16)
-    nb, w, n, d, _ = scale.shape  # PA_BBND (Bn, Bs, N, D), scale (Bn, Bs//64, N, D, 2)
-    exp = scale.view(torch.uint8).permute(0, 1, 4, 2, 3).reshape(nb, w * 2, n, d).float() - 127.0
-    return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=1)).to(torch.bfloat16)
+    if seq_lens is None:  # PA_BBND (Bn, Bs, N, D), scale (Bn, Bs//64, N, D, 2)
+        nb, w, n, d, _ = scale.shape
+        exp = scale.view(torch.uint8).permute(0, 1, 4, 2, 3).reshape(nb, w * 2, n, d).float() - 127.0
+        return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=1)).to(torch.bfloat16)
+
+    n, d = fp8.shape[1], fp8.shape[2]  # TND (T, N, D), scale (sum ceil64(s), N, D, 2)
+    parts, f_at, s_at = [], 0, 0
+    for s_len in seq_lens:
+        w = (s_len + 63) // 64
+        sc = scale[s_at : s_at + w]
+        s_at += w
+        exp = sc.view(torch.uint8).permute(0, 3, 1, 2).reshape(w * 2, n, d).float() - 127.0
+        full = torch.pow(2.0, exp).repeat_interleave(32, dim=0)[:s_len]
+        parts.append(fp8[f_at : f_at + s_len].float() * full)
+        f_at += s_len
+    return torch.cat(parts).to(torch.bfloat16)
 
 
 def compare(name, got, ref):
@@ -243,10 +253,10 @@ def run_case(name: str) -> int:
     q_deq = dequant_along_d(q_fp8, q_descale, D)
     k_deq = dequant_along_d(k_fp8, k_descale, D)
     if paged:
-        v_deq = dequant_along_seq(v_fp8, v_descale, 1).reshape(fia_key.shape)
+        v_deq = dequant_along_seq(v_fp8, v_descale).reshape(fia_key.shape)
         k_deq = k_deq.reshape(fia_key.shape)
     else:
-        v_deq = dequant_along_seq(v_fp8, v_descale, 0)
+        v_deq = dequant_along_seq(v_fp8, v_descale, kv_lens)
     fia_deq_out = run_fia(q_deq, k_deq, v_deq)
 
     l2_raw, cos_raw = compare("vs FIA(bf16)  ", out, fia_out)
