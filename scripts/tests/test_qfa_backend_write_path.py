@@ -269,22 +269,29 @@ def main() -> int:
 
     # ---- 4) fixed-shape decode variant (M3) == unique-window variant ------
     if hasattr(qfa.AscendQfaAttentionBackendImpl, "_write_kv_quantized_decode"):
-        base = 90
         num_reqs, k = 3, 4
-        # three requests on separate blocks, verify step writes k tokens each
-        starts = [90, 128 + 30, 256 + 62]  # last one straddles two windows
+        # Three requests, each confined to its own block: a request's history
+        # must not reach back into the previous block, or the two histories
+        # overlap and one index_put_ gets duplicate targets -- which has no
+        # defined winner and made this case fail intermittently under threads.
+        starts = [90, 128 + 90, 256 + 62]  # last one straddles two windows
+        hist_lens = [90, 90, 62]
         implA = make_impl(qfa, nkv, d)
         pA = implA._ensure_planes(alloc_cache(qfa, 4, bs, nkv, d))
         implB = make_impl(qfa, nkv, d)
         pB = implB._ensure_planes(alloc_cache(qfa, 4, bs, nkv, d))
-        hist_k = torch.randn(base * 3, nkv, d, dtype=torch.bfloat16)
-        hist_v = torch.randn(base * 3, nkv, d, dtype=torch.bfloat16)
-        hist_slots = torch.cat([torch.arange(s - base, s) for s in starts])
+        hist_k = torch.randn(sum(hist_lens), nkv, d, dtype=torch.bfloat16)
+        hist_v = torch.randn(sum(hist_lens), nkv, d, dtype=torch.bfloat16)
+        hist_slots = torch.cat(
+            [torch.arange(s - h, s) for s, h in zip(starts, hist_lens)])
         implA._write_kv_quantized(hist_k, hist_v, hist_slots)
         implB._write_kv_quantized(hist_k, hist_v, hist_slots)
         new_k = torch.randn(num_reqs * k, nkv, d, dtype=torch.bfloat16)
         new_v = torch.randn(num_reqs * k, nkv, d, dtype=torch.bfloat16)
         new_slots = torch.cat([torch.arange(s, s + k) for s in starts])
+        # a real slot_mapping never repeats a slot; keep the fixture honest
+        for name, sl in (("history", hist_slots), ("new", new_slots)):
+            assert sl.unique().numel() == sl.numel(), f"duplicate {name} slots"
         implA._write_kv_quantized(new_k, new_v, new_slots)
         implB._write_kv_quantized_decode(new_k, new_v, new_slots, num_reqs)
         same = all(
