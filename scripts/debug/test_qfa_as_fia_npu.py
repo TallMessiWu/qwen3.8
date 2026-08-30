@@ -43,6 +43,32 @@ DECODE_REQS, DECODE_KV = 4, 300
 CASES = ["dense", "paged"]
 
 
+def dequant_along_d(fp8, scale, d):
+    """Undo _qfa_quant: one e8m0 exponent per 32 elements along D."""
+    import torch
+
+    exp = scale.view(torch.uint8).reshape(*fp8.shape[:-1], d // 32).float() - 127.0
+    return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=-1)).to(torch.bfloat16)
+
+
+def dequant_along_seq(fp8, scale, seq_axis):
+    """Undo quant_v_by_sequence: one exponent per 32 positions down the sequence.
+
+    scale arrives as (S//64, N, D, 2) for TND or (Bn, Bs//64, N, D, 2) for
+    PA_BBND; the trailing pair is the second half of each 64-wide window, so
+    folding it back into the sequence axis recovers one exponent per 32 rows.
+    """
+    import torch
+
+    if seq_axis == 0:  # TND (T, N, D), scale (T//64, N, D, 2)
+        w, n, d, _ = scale.shape
+        exp = scale.view(torch.uint8).permute(0, 3, 1, 2).reshape(w * 2, n, d).float() - 127.0
+        return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=0)).to(torch.bfloat16)
+    nb, w, n, d, _ = scale.shape  # PA_BBND (Bn, Bs, N, D), scale (Bn, Bs//64, N, D, 2)
+    exp = scale.view(torch.uint8).permute(0, 1, 4, 2, 3).reshape(nb, w * 2, n, d).float() - 127.0
+    return (fp8.float() * torch.pow(2.0, exp).repeat_interleave(32, dim=1)).to(torch.bfloat16)
+
+
 def compare(name, got, ref):
     """QFA (MXFP8 K/V) against FIA (bf16 K/V) on the same inputs.
 
@@ -62,14 +88,12 @@ def compare(name, got, ref):
     scale = b.abs().mean().item()
     q = torch.quantile(diff.abs(), torch.tensor([0.5, 0.9, 0.99], dtype=torch.float64))
     print(
-        f"  vs FIA: rel_l2={rel_l2:.5f} cos={cos:.6f} "
+        f"  {name}: rel_l2={rel_l2:.5f} cos={cos:.6f} "
         f"|err| p50={q[0]:.5f} p90={q[1]:.5f} p99={q[2]:.5f} max={diff.abs().max():.4f} "
         f"(ref mean|x|={scale:.5f})",
         flush=True,
     )
-    good = rel_l2 <= 0.05 and cos >= 0.999
-    print(f"  [{name}] numerics {'GREEN' if good else 'RED'}", flush=True)
-    return good
+    return rel_l2, cos
 
 
 def quant_v_by_sequence(value, seq_lens=None):
@@ -192,24 +216,48 @@ def run_case(name: str) -> int:
     # Reference: the operator this call site used to use, same bf16 inputs.
     # attention_v1 passes get_splitfuse_attn_mask(), which is this same
     # triu(2048, diagonal=1) int8 -- so both operators see one mask.
-    fia_out, _ = torch_npu.npu_fused_infer_attention_score(
-        query=q,
-        key=fia_key,
-        value=fia_value,
-        atten_mask=mask,
-        block_table=table,
-        input_layout="TND",
-        block_size=BLOCK,
-        actual_seq_lengths=cum,
-        actual_seq_lengths_kv=kv_lens if paged else cum,
-        num_key_value_heads=NKV,
-        num_heads=NQ,
-        scale=D ** -0.5,
-        sparse_mode=3,
-    )
-    torch.npu.synchronize()
+    def run_fia(qq, kk, vv):
+        out, _ = torch_npu.npu_fused_infer_attention_score(
+            query=qq,
+            key=kk,
+            value=vv,
+            atten_mask=mask,
+            block_table=table,
+            input_layout="TND",
+            block_size=BLOCK,
+            actual_seq_lengths=cum,
+            actual_seq_lengths_kv=kv_lens if paged else cum,
+            num_key_value_heads=NKV,
+            num_heads=NQ,
+            scale=D ** -0.5,
+            sparse_mode=3,
+        )
+        torch.npu.synchronize()
+        return out
+
+    fia_out = run_fia(q, fia_key, fia_value)
     print(f"  fia out={tuple(fia_out.shape)}", flush=True)
-    return 0 if compare(name, out, fia_out) else 1
+
+    # Same operator, fed the dequantized tensors: isolates what QFA computes
+    # from the loss of quantizing at all. QFA should land almost on top of this.
+    q_deq = dequant_along_d(q_fp8, q_descale, D)
+    k_deq = dequant_along_d(k_fp8, k_descale, D)
+    if paged:
+        v_deq = dequant_along_seq(v_fp8, v_descale, 1).reshape(fia_key.shape)
+        k_deq = k_deq.reshape(fia_key.shape)
+    else:
+        v_deq = dequant_along_seq(v_fp8, v_descale, 0)
+    fia_deq_out = run_fia(q_deq, k_deq, v_deq)
+
+    l2_raw, cos_raw = compare("vs FIA(bf16)  ", out, fia_out)
+    l2_deq, cos_deq = compare("vs FIA(deq K/V)", out, fia_deq_out)
+    # The first comparison carries the quantization loss and is informational;
+    # the second one is the verdict -- same inputs, same maths, so anything
+    # beyond rounding means the two operators disagree about the layout.
+    good = cos_deq >= 0.9995
+    print(f"  [{name}] quantization loss {l2_raw * 100:.1f}%, "
+          f"operator agreement cos={cos_deq:.6f} -> {'GREEN' if good else 'RED'}", flush=True)
+    return 0 if good else 1
 
 
 def main() -> int:
@@ -236,9 +284,9 @@ def main() -> int:
         print(f"  {case}: {'GREEN' if ok else 'RED'}")
     print()
     if all(results.values()):
-        print("Both paths run; the swap is shaped the way the operator wants.")
+        print("Both operators agree once the quantization loss is taken out.")
     else:
-        print("Read the failing case above before starting a server.")
+        print("The two operators disagree beyond rounding -- a layout is wrong.")
     return 0 if all(results.values()) else 1
 
 
