@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Burn down what the QFA graph path (6.4) added, without starting the engine.
+
+test_junlin_qfa_npu.py's GRAPH case already proves the D4 shape for the *main
+op*: metadata computed outside into a fixed buffer, quantized payloads prepared
+on the host, capture, replay, in-place batch swap. The engine does something it
+does not cover -- it captures the **quantization** too, because under
+FULL_DECODE_ONLY q is produced by the in-graph QKV projection and the current
+step's K/V is written into the cache in-graph by reshape_and_cache. Neither can
+be hoisted out before the cache is stored as MXFP8.
+
+So these cases exercise the real functions from the plugin
+(_qfa_quant / _qfa_quant_v) inside a capture, in the exact arrangement
+full_graph_qfa + _update_qfa_graph_buffers use:
+
+  VDESCALE-OPT   paged metadata with vs without v_descale -> identical output.
+                 The AICPU only reads its shape, and only under TND
+                 (quant_flash_attn_metadata_aicpu.cpp:230); _attach_qfa_inputs
+                 relies on that to build one plan per step for all layers.
+  QUANT-IN-GRAPH capture npu_dynamic_mx_quant + the main op, with the length /
+                 plan / block-table buffers allocated *inside* the capture and
+                 only ever filled from outside, gated by an ExternalEvent:
+                 A replay with unchanged inputs == eager,
+                 B rewrite the bf16 cache, q and buffers in place, refresh
+                   outside, replay == eager on the new batch.
+                 B is the one that matters: it proves the captured quantization
+                 re-reads the cache instead of baking capture-time values.
+  MAXKV          same, with the capture constant max_seqlen_kv raised to
+                 --max-model-len (133120 by default). It is baked into the
+                 captured op and feeds AdjustSinnerAndSouter, so metadata and
+                 the main op must agree on it -- this asks whether the split
+                 plan still fits the op's fixed 4096-int32 output at that value.
+  POOL-MEM       reports the allocator delta across a capture at --blocks worth
+                 of cache, so "does the in-graph whole-cache quantization fit"
+                 gets a number instead of a guess. Reports only; never RED.
+
+Each case runs in its own subprocess: a device abort poisons everything after
+it, so a shared process could only ever report the first failure. A hang (a
+mis-ordered event) is caught by --case-timeout rather than wedging the run.
+
+Usage (inside the serving container, after pip_install_qfa.sh):
+  python scripts/debug/test_qfa_graph_capture_npu.py
+  python scripts/debug/test_qfa_graph_capture_npu.py --cases QUANT-IN-GRAPH
+  python scripts/debug/test_qfa_graph_capture_npu.py --cases POOL-MEM --blocks 9672
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import subprocess
+import sys
+
+import torch
+
+CASES = ("VDESCALE-OPT", "QUANT-IN-GRAPH", "MAXKV", "POOL-MEM")
+
+
+# --------------------------------------------------------------------------
+# setup
+# --------------------------------------------------------------------------
+def bootstrap():
+    """Register the custom ops and hand back the plugin's own quant helpers.
+
+    Imported rather than copied: a local copy would silently drift from what
+    attention_v1 actually runs, which is the whole thing under test.
+    """
+    import torch_npu  # noqa: F401
+
+    try:
+        from vllm_ascend.utils import bootstrap_custom_op_env
+
+        bootstrap_custom_op_env(include_vendor_lib=True)
+    except Exception:
+        import vllm_ascend
+
+        vendor = os.path.join(
+            os.path.dirname(vllm_ascend.__file__), "_cann_ops_custom", "vendors", "custom_transformer"
+        )
+        if os.path.isdir(vendor):
+            prev = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = vendor + (":" + prev if prev else "")
+        else:
+            print(f"[WARN] custom opp vendor dir missing: {vendor}")
+    import vllm_ascend.vllm_ascend_C  # noqa: F401
+
+    for name in ("npu_quant_flash_attn", "npu_quant_flash_attn_metadata"):
+        assert hasattr(torch.ops._C_ascend, name), f"{name} not registered"
+
+    from vllm_ascend.attention.attention_v1 import _qfa_quant, _qfa_quant_v
+
+    return _qfa_quant, _qfa_quant_v
+
+
+def causal_mask() -> torch.Tensor:
+    # triu(diagonal=1) int8, 1 = masked future: what attention_v1 hands FIA and
+    # what QFA's mask_mode=3 expects. The doc example's tril is wrong.
+    return torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1).npu()
+
+
+# --------------------------------------------------------------------------
+# one decode step, in the shapes the engine actually passes
+# --------------------------------------------------------------------------
+class Step:
+    """A decode batch in engine layout: bf16 paged cache + bf16 q."""
+
+    def __init__(self, args, seed: int):
+        torch.manual_seed(seed)
+        self.nq, self.nkv, self.d = args.num_heads, args.num_kv_heads, args.head_dim
+        self.block_size = args.block_size
+        self.kv_lens = [int(x) for x in args.kv_lens.split(",")]
+        self.b = len(self.kv_lens)
+        self.q_len = args.q_len
+        self.scale = 1.0 / math.sqrt(self.d)
+
+        cols = max(1, (max(self.kv_lens) + self.block_size - 1) // self.block_size)
+        needed = self.b * cols
+        self.num_blocks = max(args.blocks, needed)
+
+        dev = "npu"
+        # _get_fia_params hands attention the cache as (num_blocks, block_size,
+        # N * D); _qfa_paged_call is what splits the heads back out.
+        self.k_cache = torch.randn(
+            self.num_blocks, self.block_size, self.nkv * self.d, dtype=torch.bfloat16, device=dev
+        )
+        self.v_cache = torch.randn_like(self.k_cache)
+        self.q = torch.randn(self.b * self.q_len, self.nq, self.d, dtype=torch.bfloat16, device=dev)
+
+        table = torch.zeros(self.b, cols, dtype=torch.int32)
+        for i in range(self.b):
+            table[i] = torch.arange(i * cols, (i + 1) * cols, dtype=torch.int32)
+        self.block_table = table.to(dev)
+        self.cu_seqlens_q = torch.tensor(
+            [0] + [(i + 1) * self.q_len for i in range(self.b)], dtype=torch.int32, device=dev
+        )
+        self.seqused_kv = torch.tensor(self.kv_lens, dtype=torch.int32, device=dev)
+        self.max_seqlen_q = self.b * self.q_len  # cumulative, as attention_v1 passes it
+
+    def op_kwargs(self, max_seqlen_kv: int, cu=None, seq=None) -> dict:
+        return {
+            "cu_seqlens_q": self.cu_seqlens_q if cu is None else cu,
+            "seqused_kv": self.seqused_kv if seq is None else seq,
+            "mask_mode": 3,
+            "max_seqlen_q": self.max_seqlen_q,
+            "max_seqlen_kv": max_seqlen_kv,
+            "layout_q": "TND",
+            "layout_q_descale": "TND",
+            "layout_kv": "PA_BBND",
+            "layout_out": "TND",
+        }
+
+    def reseed(self, seed: int) -> None:
+        """Rewrite every input in place, the way the next step would.
+
+        Lengths shrink as well as contents, so the refreshed plan differs too --
+        otherwise the replay check would only exercise the cache read.
+        """
+        torch.manual_seed(seed)
+        self.k_cache.copy_(torch.randn_like(self.k_cache))
+        self.v_cache.copy_(torch.randn_like(self.v_cache))
+        self.q.copy_(torch.randn_like(self.q))
+        self.kv_lens = [max(1, length - 37) for length in self.kv_lens]
+        self.seqused_kv.copy_(torch.tensor(self.kv_lens, dtype=torch.int32))
+
+    def metadata(self, max_seqlen_kv: int, v_descale=None) -> torch.Tensor:
+        return torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+            self.nq, self.nkv, self.d, 1, v_descale=v_descale, **self.op_kwargs(max_seqlen_kv)
+        )
+
+
+def qfa_call(step: Step, quant, quant_v, block_table, metadata, op_kwargs, mask) -> torch.Tensor:
+    """Mirrors AscendAttentionBackendImpl._qfa_paged_call exactly."""
+    d = step.d
+    q_fp8, q_descale = quant(step.q, d)
+    nb, bs = step.k_cache.shape[0], step.k_cache.shape[1]
+    k_fp8, k_descale = quant(step.k_cache.reshape(nb, bs, step.nkv, d), d)
+    v_fp8, v_descale = quant_v(step.v_cache.reshape(nb, bs, step.nkv, d))
+    out, _ = torch.ops._C_ascend.npu_quant_flash_attn(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        1,
+        block_table=block_table,
+        attn_mask=mask,
+        metadata=metadata,
+        softmax_scale=step.scale,
+        **op_kwargs,
+    )
+    return out
+
+
+def _exactness(tag: str, got: torch.Tensor, want: torch.Tensor) -> bool:
+    if torch.equal(got, want):
+        print(f"  [{tag}] bit-exact=True")
+        return True
+    diff = (got.to(torch.float32) - want.to(torch.float32)).abs()
+    print(f"  [{tag}] bit-exact=False max_abs_diff={diff.max().item():.6g} mean={diff.mean().item():.6g}")
+    return False
+
+
+# --------------------------------------------------------------------------
+# cases
+# --------------------------------------------------------------------------
+def case_vdescale_opt(args, quant, quant_v) -> bool:
+    """_attach_qfa_inputs drops v_descale for paged steps; prove that is free."""
+    step = Step(args, args.seed)
+    mask = causal_mask()
+    max_kv = args.max_seqlen_kv
+    _, v_descale = quant_v(step.v_cache.reshape(step.num_blocks, step.block_size, step.nkv, step.d))
+
+    with_vd = step.metadata(max_kv, v_descale=v_descale)
+    without_vd = step.metadata(max_kv, v_descale=None)
+    out_with = qfa_call(step, quant, quant_v, step.block_table, with_vd, step.op_kwargs(max_kv), mask)
+    out_without = qfa_call(step, quant, quant_v, step.block_table, without_vd, step.op_kwargs(max_kv), mask)
+    torch.npu.synchronize()
+    ok = _exactness("with v_descale vs without", out_without.cpu(), out_with.cpu())
+    plan_same = torch.equal(with_vd.cpu(), without_vd.cpu())
+    print(f"  [plan identical] {plan_same}")
+    return ok and plan_same
+
+
+def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> bool:
+    """Capture quant + main op; replay unchanged, then after an in-place swap."""
+    import torch_npu
+
+    step = Step(args, args.seed)
+    mask = causal_mask()
+
+    md = step.metadata(max_kv)
+    print(f"  metadata: numel={md.numel()} dtype={md.dtype} max_seqlen_kv={max_kv}")
+
+    # Eager reference for batch 1.
+    ref_a = qfa_call(step, quant, quant_v, step.block_table, md, step.op_kwargs(max_kv), mask).cpu()
+    torch.npu.synchronize()
+
+    for _ in range(2):  # warm the allocator/tiling caches before capture
+        qfa_call(step, quant, quant_v, step.block_table, md, step.op_kwargs(max_kv), mask)
+    torch.npu.synchronize()
+
+    if report_memory:
+        torch.npu.reset_peak_memory_stats()
+        before = torch.npu.memory_reserved()
+
+    stream = torch_npu.npu.current_stream()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        # Allocated inside the capture, exactly like QFAGraphBuffers.like, and
+        # deliberately left unfilled: filling here would record the copies into
+        # the graph and replay would read capture-time sources.
+        g_cu = torch.empty_like(step.cu_seqlens_q)
+        g_seq = torch.empty_like(step.seqused_kv)
+        g_md = torch.empty_like(md)
+        g_bt = torch.empty_like(step.block_table)
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        out_buf = qfa_call(
+            step, quant, quant_v, g_bt, g_md, step.op_kwargs(max_kv, cu=g_cu, seq=g_seq), mask
+        )
+
+    if report_memory:
+        torch.npu.synchronize()
+        grew = torch.npu.memory_reserved() - before
+        print(
+            f"  [pool] reserved +{grew / 2**20:.1f} MiB for {step.num_blocks} blocks "
+            f"({step.k_cache.numel() * 2 / 2**20:.1f} MiB of bf16 K per plane)"
+        )
+
+    update_stream = torch_npu.npu.Stream()
+
+    def release(source_md: torch.Tensor) -> None:
+        """Mirrors _update_qfa_graph_buffers: contents only, then the event."""
+        with torch.npu.stream(update_stream):
+            g_cu.copy_(step.cu_seqlens_q)
+            g_seq.copy_(step.seqused_kv)
+            g_md.copy_(source_md)
+            g_bt.copy_(step.block_table)
+            event.record(update_stream)
+
+    release(md)
+    graph.replay()
+    torch.npu.synchronize()
+    ok = _exactness("A replay(same inputs) vs eager", out_buf.cpu(), ref_a)
+
+    # B: a genuinely different step. The cache is rewritten in place, so a
+    # capture that baked the quantized bytes instead of re-reading would show up
+    # here and nowhere else.
+    step.reseed(args.seed + 1)
+    md_b = step.metadata(max_kv)
+    ref_b = qfa_call(step, quant, quant_v, step.block_table, md_b, step.op_kwargs(max_kv), mask).cpu()
+    torch.npu.synchronize()
+    release(md_b)
+    graph.replay()
+    torch.npu.synchronize()
+    ok &= _exactness("B replay(new cache contents) vs eager", out_buf.cpu(), ref_b)
+
+    if torch.equal(ref_a, ref_b):
+        print("  [WARN] the two batches produced identical eager output; B proves nothing")
+        ok = False
+    return ok
+
+
+def case_quant_in_graph(args, quant, quant_v) -> bool:
+    return _graph_roundtrip(args, quant, quant_v, args.max_seqlen_kv, report_memory=False)
+
+
+def case_maxkv(args, quant, quant_v) -> bool:
+    return _graph_roundtrip(args, quant, quant_v, args.max_model_len, report_memory=False)
+
+
+def case_pool_mem(args, quant, quant_v) -> bool:
+    _graph_roundtrip(args, quant, quant_v, args.max_seqlen_kv, report_memory=True)
+    print("  [POOL-MEM] reports only; read the numbers above")
+    return True
+
+
+RUNNERS = {
+    "VDESCALE-OPT": case_vdescale_opt,
+    "QUANT-IN-GRAPH": case_quant_in_graph,
+    "MAXKV": case_maxkv,
+    "POOL-MEM": case_pool_mem,
+}
+
+
+# --------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--cases", default=",".join(CASES), help="comma-separated subset")
+    parser.add_argument("--case", help=argparse.SUPPRESS)  # child process entry
+    parser.add_argument("--num-heads", type=int, default=24)
+    parser.add_argument("--num-kv-heads", type=int, default=4)
+    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--kv-lens", default="300,257,128,65")
+    parser.add_argument("--q-len", type=int, default=4, help="tokens per request (1 + MTP drafts)")
+    parser.add_argument("--blocks", type=int, default=64, help="cache blocks; raise for POOL-MEM")
+    parser.add_argument("--max-seqlen-kv", type=int, default=2048, help="capture constant")
+    parser.add_argument("--max-model-len", type=int, default=133120, help="MAXKV's capture constant")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--case-timeout", type=float, default=900.0)
+    return parser
+
+
+def run_child(args) -> int:
+    print(f"== {args.case} ==")
+    try:
+        quant, quant_v = bootstrap()
+        ok = RUNNERS[args.case](args, quant, quant_v)
+    except Exception as exc:
+        import traceback
+
+        print(f"  [error] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        ok = False
+    print(f"  [{args.case}] {'GREEN' if ok else 'RED'}")
+    return 0 if ok else 1
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.case:
+        return run_child(args)
+
+    names = [n.strip() for n in args.cases.split(",") if n.strip()]
+    unknown = [n for n in names if n not in RUNNERS]
+    if unknown:
+        print(f"[RED] unknown case(s) {unknown}; known: {list(RUNNERS)}")
+        return 2
+
+    passthrough: list[str] = []
+    skip = False
+    for arg in sys.argv[1:]:
+        if skip:
+            skip = False
+        elif arg == "--cases":
+            skip = True
+        elif not arg.startswith("--cases="):
+            passthrough.append(arg)
+
+    results: dict[str, str] = {}
+    for name in names:
+        command = [sys.executable, os.path.abspath(__file__), "--case", name, *passthrough]
+        try:
+            completed = subprocess.run(command, timeout=args.case_timeout)
+            results[name] = "GREEN" if completed.returncode == 0 else "RED"
+        except subprocess.TimeoutExpired:
+            print(f"  [{name}] TIMEOUT after {args.case_timeout}s -- likely a stalled event handshake")
+            results[name] = "TIMEOUT"
+
+    print("\n=== summary ===")
+    for name in names:
+        print(f"  {name:<16} {results[name]}")
+    return 0 if all(v == "GREEN" for v in results.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
