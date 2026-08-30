@@ -47,8 +47,12 @@ Usage (inside the serving container, after pip_install_qfa.sh):
 from __future__ import annotations
 
 import argparse
+import ast
+import builtins
+import importlib.util
 import math
 import os
+import pathlib
 import subprocess
 import sys
 
@@ -60,12 +64,62 @@ CASES = ("VDESCALE-OPT", "QUANT-IN-GRAPH", "MAXKV", "POOL-MEM")
 # --------------------------------------------------------------------------
 # setup
 # --------------------------------------------------------------------------
-def bootstrap():
-    """Register the custom ops and hand back the plugin's own quant helpers.
+QUANT_HELPERS = ("_qfa_quant", "_qfa_quant_v")
 
-    Imported rather than copied: a local copy would silently drift from what
-    attention_v1 actually runs, which is the whole thing under test.
+
+def find_attention_v1(override: str | None) -> pathlib.Path:
+    """Locate attention_v1.py without executing the package."""
+    if override:
+        return pathlib.Path(override)
+    spec = importlib.util.find_spec("vllm_ascend")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("vllm_ascend is not importable; pass --attention-v1")
+    root = pathlib.Path(list(spec.submodule_search_locations)[0])
+    return root / "attention" / "attention_v1.py"
+
+
+def load_quant_helpers(path: pathlib.Path):
+    """Lift _qfa_quant/_qfa_quant_v out of attention_v1.py's source.
+
+    Importing the module instead pulls in the plugin's whole graph
+    (device_op -> ops/__init__ -> moe_mlp -> device_op) and trips a circular
+    import outside the order the engine happens to import things in. Both
+    helpers are plain torch/torch_npu code, so the file's own source is lifted
+    straight out: the test cannot drift from what the engine runs, and nothing
+    else gets imported. The guard below is what makes that safe -- if either
+    helper ever grows a dependency on the rest of the plugin, this says so
+    instead of quietly testing something stale.
     """
+    import torch_npu
+
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in QUANT_HELPERS]
+    missing = set(QUANT_HELPERS) - {n.name for n in nodes}
+    if missing:
+        raise RuntimeError(f"{path} no longer defines {sorted(missing)} at module level")
+
+    allowed = {"torch", "torch_npu"} | set(dir(builtins))
+    for node in nodes:
+        bound = {arg.arg for arg in node.args.args}
+        bound |= {i.id for i in ast.walk(node) if isinstance(i, ast.Name) and isinstance(i.ctx, ast.Store)}
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
+                if inner.id not in bound and inner.id not in allowed:
+                    raise RuntimeError(
+                        f"{node.name} now references {inner.id!r} from attention_v1; lifting it out "
+                        "of the file no longer works -- import the module instead and fix the cycle"
+                    )
+
+    namespace: dict = {"torch": torch, "torch_npu": torch_npu}
+    module = ast.Module(body=nodes, type_ignores=[])
+    exec(compile(module, str(path), "exec"), namespace)  # noqa: S102
+    print(f"[OK] lifted {list(QUANT_HELPERS)} from {path}")
+    return namespace[QUANT_HELPERS[0]], namespace[QUANT_HELPERS[1]]
+
+
+def bootstrap(args):
+    """Register the custom ops, then hand back the plugin's own quant helpers."""
     import torch_npu  # noqa: F401
 
     try:
@@ -88,9 +142,7 @@ def bootstrap():
     for name in ("npu_quant_flash_attn", "npu_quant_flash_attn_metadata"):
         assert hasattr(torch.ops._C_ascend, name), f"{name} not registered"
 
-    from vllm_ascend.attention.attention_v1 import _qfa_quant, _qfa_quant_v
-
-    return _qfa_quant, _qfa_quant_v
+    return load_quant_helpers(find_attention_v1(args.attention_v1))
 
 
 def causal_mask() -> torch.Tensor:
@@ -343,6 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seqlen-kv", type=int, default=2048, help="capture constant")
     parser.add_argument("--max-model-len", type=int, default=133120, help="MAXKV's capture constant")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
     parser.add_argument("--case-timeout", type=float, default=900.0)
     return parser
 
@@ -350,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_child(args) -> int:
     print(f"== {args.case} ==")
     try:
-        quant, quant_v = bootstrap()
+        quant, quant_v = bootstrap(args)
         ok = RUNNERS[args.case](args, quant, quant_v)
     except Exception as exc:
         import traceback
