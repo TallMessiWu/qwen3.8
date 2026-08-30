@@ -2,9 +2,11 @@
 """Does the FIA-call-site swap actually run on device?
 
 attention_v1 now calls QuantFlashAttn where it used to call FIA, quantizing
-q/k/v on the spot with _qfa_quant (imported here, so this tests the real
-function rather than a copy). Two things about that are worth checking before
-starting a server, both about v_descale:
+q/k/v on the spot with _qfa_quant. That function is mirrored below rather than
+imported: importing attention_v1 on its own trips the device_op <-> fused_moe
+circular import (the engine avoids it by registering the platform first). Keep
+the two in step. Two things are worth checking before starting a server, both
+about v_descale:
 
   * QFA groups V's scales down the sequence -- (T/64, N, D, 2) for TND,
     (Bn, Bs/64, N, D, 2) for PA_BBND -- while _qfa_quant groups along D like it
@@ -71,10 +73,20 @@ def run_case(name: str) -> int:
     import torch
     import torch_npu  # noqa: F401
 
-    from vllm_ascend.attention.attention_v1 import _qfa_quant
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_junlin_qfa_npu import bootstrap_ops
 
     torch.npu.set_device(int(os.environ.get("QFA_DEVICE", "0")))
-    import vllm_ascend.vllm_ascend_C  # noqa: F401
+    bootstrap_ops()
+
+    def _qfa_quant(x, d):
+        """Mirror of attention_v1._qfa_quant."""
+        fp8, scale = torch_npu.npu_dynamic_mx_quant(
+            x.reshape(-1, d), dst_type=torch.float8_e4m3fn, scale_alg=0)
+        return (
+            fp8.reshape(x.shape),
+            scale.view(torch.uint8).reshape(*x.shape[:-1], d // 64, 2).view(torch.float8_e8m0fnu),
+        )
 
     paged = name.startswith("paged")
     as_is = name.endswith("asis")
