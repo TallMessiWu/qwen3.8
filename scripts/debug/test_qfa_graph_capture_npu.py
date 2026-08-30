@@ -33,6 +33,12 @@ full_graph_qfa + _update_qfa_graph_buffers use:
                  captured op and feeds AdjustSinnerAndSouter, so metadata and
                  the main op must agree on it -- this asks whether the split
                  plan still fits the op's fixed 4096-int32 output at that value.
+  PREFILL-MAXKV  the same constant against a prefill's max_seqlen_q (1594 by
+                 default) rather than a decode's handful of tokens. kvSeqSize is
+                 floored at max_seqlen_kv and AdjustSinnerAndSouter takes both,
+                 so this is where a plan that fits for decode can overrun the
+                 op's fixed 4096-int32 output -- which reads back as an AI Core
+                 "invalid GM address". Eager only; prefill is never captured.
   POOL-MEM       reports the allocator delta across a capture at --blocks worth
                  of cache, so "does the in-graph whole-cache quantization fit"
                  gets a number instead of a guess. Reports only; never RED.
@@ -61,7 +67,7 @@ import sys
 
 import torch
 
-CASES = ("VDESCALE-STUB", "QUANT-IN-GRAPH", "MAXKV", "POOL-MEM")
+CASES = ("VDESCALE-STUB", "QUANT-IN-GRAPH", "MAXKV", "PREFILL-MAXKV", "POOL-MEM")
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +430,40 @@ def case_maxkv(args, quant, quant_v) -> bool:
     return _graph_roundtrip(args, quant, quant_v, args.max_model_len, report_memory=False)
 
 
+def case_prefill_maxkv(args, quant, quant_v) -> bool:
+    """Prefill shapes against the capture constant, eagerly.
+
+    Runs the same prefill twice -- once with the tight max_seqlen_kv the engine
+    used before 6.4, once with the constant 6.4 introduced. Prefill is never
+    captured, so nothing here needs a graph; the question is only whether the
+    constant is safe to plan with when max_seqlen_q is a whole prompt.
+
+    A device abort takes the process with it, so the last line printed says
+    which of the two was running.
+    """
+    import copy
+
+    prefill_args = copy.copy(args)
+    prefill_args.kv_lens = str(args.prefill_len)
+    prefill_args.q_len = args.prefill_len
+    step = Step(prefill_args, args.seed)
+    mask = causal_mask()
+    tight = max(step.kv_lens)
+    print(f"  prefill B=1 q={step.q_len} kv={tight} over {step.num_blocks} blocks")
+
+    outs = {}
+    for name, max_kv in (("tight", tight), ("constant", args.max_model_len)):
+        print(f"  running max_seqlen_kv={max_kv} ({name}) ...", flush=True)
+        plan = step.metadata(max_kv)
+        outs[name] = qfa_call(
+            step, quant, quant_v, step.block_table, plan, step.op_kwargs(max_kv), mask
+        ).cpu()
+        torch.npu.synchronize()
+        print(f"  max_seqlen_kv={max_kv} survived")
+
+    return _exactness("constant vs tight max_seqlen_kv", outs["constant"], outs["tight"])
+
+
 def case_pool_mem(args, quant, quant_v) -> bool:
     _graph_roundtrip(args, quant, quant_v, args.max_seqlen_kv, report_memory=True)
     print("  [POOL-MEM] reports only; read the numbers above")
@@ -434,6 +474,7 @@ RUNNERS = {
     "VDESCALE-STUB": case_vdescale_stub,
     "QUANT-IN-GRAPH": case_quant_in_graph,
     "MAXKV": case_maxkv,
+    "PREFILL-MAXKV": case_prefill_maxkv,
     "POOL-MEM": case_pool_mem,
 }
 
@@ -454,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blocks", type=int, default=64, help="cache blocks; raise for POOL-MEM")
     parser.add_argument("--max-seqlen-kv", type=int, default=2048, help="capture constant")
     parser.add_argument("--max-model-len", type=int, default=133120, help="MAXKV's capture constant")
+    parser.add_argument("--prefill-len", type=int, default=1594, help="PREFILL-MAXKV prompt length")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
     parser.add_argument("--case-timeout", type=float, default=300.0)
