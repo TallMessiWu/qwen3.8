@@ -280,6 +280,61 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         ok_all &= check("BACKEND-ENUM-NAME", False, f"{type(e).__name__}: {e}")
 
+    # ---- 3c) the KV pool budget must match the shape the backend carves ----
+    # The engine sizes the cache pool from AscendQfaAttentionSpec.page_size_bytes
+    # while the backend views it through get_kv_cache_shape. If those two drift
+    # apart the pool comes up short and initialize_kv_cache dies on a view()
+    # ("shape is invalid for input of size ..."), so pin them to each other.
+    try:
+        import torch
+        from vllm_ascend.core.kv_cache_interface import AscendQfaAttentionSpec
+
+        bs, nkv, d = 128, 4, 256
+        spec = AscendQfaAttentionSpec(
+            block_size=bs, num_kv_heads=nkv, head_size=d, dtype=torch.bfloat16)
+        shape = backend_cls.get_kv_cache_shape(1, bs, nkv, d)
+        shape_bytes = 1
+        for dim in shape:
+            shape_bytes *= dim
+        shape_bytes *= torch.finfo(torch.bfloat16).bits // 8
+        ok = spec.page_size_bytes == shape_bytes
+        # and it must exceed the plain K/V pair by exactly the two scale planes
+        ok &= spec.page_size_bytes - 2 * bs * nkv * d * 2 == 2 * bs * nkv * (d // 64) * 2
+        ok_all &= check("SPEC-PAGE-BUDGET", ok,
+                        f"page={spec.page_size_bytes} shape={shape}={shape_bytes}B")
+    except Exception as e:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        ok_all &= check("SPEC-PAGE-BUDGET", False, f"{type(e).__name__}: {e}")
+
+    # ---- 3d) the spec swap the model runner performs on QFA layers ----
+    # get_kv_cache_spec() rebuilds the layer's FullAttentionSpec as the QFA one
+    # by copying every init field; the registry must then still resolve it to a
+    # full-attention group, or KV cache grouping asserts at startup.
+    try:
+        from dataclasses import fields
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+        from vllm_ascend.platform import NPUPlatform
+
+        plain = FullAttentionSpec(
+            block_size=bs, num_kv_heads=nkv, head_size=d, dtype=torch.bfloat16)
+        swapped = AscendQfaAttentionSpec(
+            **{f.name: getattr(plain, f.name) for f in fields(plain) if f.init})
+        ok = swapped.page_size_bytes > plain.page_size_bytes
+        with set_current_vllm_config(cfg):
+            NPUPlatform.register_custom_kv_cache_specs(cfg)
+            ok &= KVCacheSpecRegistry.get_uniform_type_base_spec(swapped) is FullAttentionSpec
+        ok_all &= check("SPEC-SWAP", ok,
+                        f"{plain.page_size_bytes} -> {swapped.page_size_bytes} bytes/page")
+    except Exception as e:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        ok_all &= check("SPEC-SWAP", False, f"{type(e).__name__}: {e}")
+
     # ---- 4) envs + platform selector branch (the QFA env gate) ----
     try:
         os.environ["VLLM_ASCEND_ENABLE_QFA"] = "1"
