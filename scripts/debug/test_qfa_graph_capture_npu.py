@@ -13,10 +13,13 @@ So these cases exercise the real functions from the plugin
 (_qfa_quant / _qfa_quant_v) inside a capture, in the exact arrangement
 full_graph_qfa + _update_qfa_graph_buffers use:
 
-  VDESCALE-OPT   paged metadata with vs without v_descale -> identical output.
-                 The AICPU only reads its shape, and only under TND
-                 (quant_flash_attn_metadata_aicpu.cpp:230); _attach_qfa_inputs
-                 relies on that to build one plan per step for all layers.
+  VDESCALE-STUB  paged metadata built with a placeholder v_descale vs the real
+                 one -> identical plan and identical output. quantMode=1 refuses
+                 a null v_descale at the aclnn entry, but under PA_BBND nothing
+                 reads it (the rank check covers only TND/PA_BNBD/PA_NZ, and the
+                 AICPU's dim0 check is guarded on TND). _attach_qfa_inputs leans
+                 on that to build the plan before any layer has quantized
+                 anything, which is what makes the graph path possible at all.
   QUANT-IN-GRAPH capture npu_dynamic_mx_quant + the main op, with the length /
                  plan / block-table buffers allocated *inside* the capture and
                  only ever filled from outside, gated by an ExternalEvent:
@@ -58,7 +61,7 @@ import sys
 
 import torch
 
-CASES = ("VDESCALE-OPT", "QUANT-IN-GRAPH", "MAXKV", "POOL-MEM")
+CASES = ("VDESCALE-STUB", "QUANT-IN-GRAPH", "MAXKV", "POOL-MEM")
 
 
 # --------------------------------------------------------------------------
@@ -145,6 +148,13 @@ def bootstrap(args):
     return load_quant_helpers(find_attention_v1(args.attention_v1))
 
 
+def v_descale_stub() -> torch.Tensor:
+    """What _attach_qfa_inputs hands the metadata op: non-null, PA_BBND's rank,
+    minimal extents. e8m0 is built through a uint8 view -- torch cannot fill a
+    float8 tensor directly."""
+    return torch.zeros(1, 1, 1, 1, 2, dtype=torch.uint8).npu().view(torch.float8_e8m0fnu)
+
+
 def causal_mask() -> torch.Tensor:
     # triu(diagonal=1) int8, 1 = masked future: what attention_v1 hands FIA and
     # what QFA's mask_mode=3 expects. The doc example's tril is wrong.
@@ -216,8 +226,14 @@ class Step:
         self.seqused_kv.copy_(torch.tensor(self.kv_lens, dtype=torch.int32))
 
     def metadata(self, max_seqlen_kv: int, v_descale=None) -> torch.Tensor:
+        # Defaults to the placeholder, the way the builder calls it.
         return torch.ops._C_ascend.npu_quant_flash_attn_metadata(
-            self.nq, self.nkv, self.d, 1, v_descale=v_descale, **self.op_kwargs(max_seqlen_kv)
+            self.nq,
+            self.nkv,
+            self.d,
+            1,
+            v_descale=v_descale_stub() if v_descale is None else v_descale,
+            **self.op_kwargs(max_seqlen_kv),
         )
 
 
@@ -257,21 +273,24 @@ def _exactness(tag: str, got: torch.Tensor, want: torch.Tensor) -> bool:
 # --------------------------------------------------------------------------
 # cases
 # --------------------------------------------------------------------------
-def case_vdescale_opt(args, quant, quant_v) -> bool:
-    """_attach_qfa_inputs drops v_descale for paged steps; prove that is free."""
+def case_vdescale_stub(args, quant, quant_v) -> bool:
+    """The plan is built before any layer quantizes, so it can only pass a
+    placeholder v_descale. Prove that costs nothing under PA_BBND."""
     step = Step(args, args.seed)
     mask = causal_mask()
     max_kv = args.max_seqlen_kv
     _, v_descale = quant_v(step.v_cache.reshape(step.num_blocks, step.block_size, step.nkv, step.d))
+    print(f"  real v_descale shape={tuple(v_descale.shape)} vs stub (1, 1, 1, 1, 2)")
 
-    with_vd = step.metadata(max_kv, v_descale=v_descale)
-    without_vd = step.metadata(max_kv, v_descale=None)
-    out_with = qfa_call(step, quant, quant_v, step.block_table, with_vd, step.op_kwargs(max_kv), mask)
-    out_without = qfa_call(step, quant, quant_v, step.block_table, without_vd, step.op_kwargs(max_kv), mask)
-    torch.npu.synchronize()
-    ok = _exactness("with v_descale vs without", out_without.cpu(), out_with.cpu())
-    plan_same = torch.equal(with_vd.cpu(), without_vd.cpu())
+    plan_real = step.metadata(max_kv, v_descale=v_descale)
+    plan_stub = step.metadata(max_kv)
+    plan_same = torch.equal(plan_real.cpu(), plan_stub.cpu())
     print(f"  [plan identical] {plan_same}")
+
+    out_real = qfa_call(step, quant, quant_v, step.block_table, plan_real, step.op_kwargs(max_kv), mask)
+    out_stub = qfa_call(step, quant, quant_v, step.block_table, plan_stub, step.op_kwargs(max_kv), mask)
+    torch.npu.synchronize()
+    ok = _exactness("stub-planned vs real-planned output", out_stub.cpu(), out_real.cpu())
     return ok and plan_same
 
 
@@ -371,7 +390,7 @@ def case_pool_mem(args, quant, quant_v) -> bool:
 
 
 RUNNERS = {
-    "VDESCALE-OPT": case_vdescale_opt,
+    "VDESCALE-STUB": case_vdescale_stub,
     "QUANT-IN-GRAPH": case_quant_in_graph,
     "MAXKV": case_maxkv,
     "POOL-MEM": case_pool_mem,
