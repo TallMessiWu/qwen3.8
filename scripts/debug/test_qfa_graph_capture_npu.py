@@ -341,7 +341,8 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
 
     if report_memory:
         torch.npu.reset_peak_memory_stats()
-        before = torch.npu.memory_reserved()
+        before_reserved = torch.npu.memory_reserved()
+        before_allocated = torch.npu.memory_allocated()
 
     stream = torch_npu.npu.current_stream()
     graph = torch.npu.NPUGraph()
@@ -364,16 +365,22 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
         # No synchronize here: the captured event wait is still outstanding
         # until release() below, so the device would never come back. Reserved
         # bytes are host-side allocator bookkeeping anyway.
-        grew = torch.npu.memory_reserved() - before
+        # Peak *allocated*, not reserved: reserved only grows when the
+        # allocator has to obtain new segments, and the eager warmup above has
+        # already reserved everything this needs, so it reports a constant few
+        # MiB no matter how big the cache is. Peak allocated is the number that
+        # scales -- it is what one layer's quantization intermediates cost, and
+        # the engine captures its layers into one pool sequentially, so the peak
+        # is what has to fit.
+        peak = torch.npu.max_memory_allocated() - before_allocated
+        reserved = torch.npu.memory_reserved() - before_reserved
         cache_bytes = step.k_cache.numel() * 2 * 2  # K + V, bf16
+        print(f"  [pool] layer bf16 K+V: {cache_bytes / 2**20:.1f} MiB over {step.num_blocks} blocks")
         print(
-            f"  [pool] reserved +{grew / 2**20:.1f} MiB capturing one layer over "
-            f"{step.num_blocks} blocks ({cache_bytes / 2**20:.1f} MiB of bf16 K+V)"
+            f"  [pool] peak tensors during capture: +{peak / 2**20:.1f} MiB "
+            f"= {peak / cache_bytes:.2f}x that cache"
         )
-        print(
-            f"  [pool] ratio {grew / cache_bytes:.2f}x the layer's bf16 KV cache -- multiply by the "
-            "real per-layer cache to size the graph pool"
-        )
+        print(f"  [pool] new segments reserved: +{reserved / 2**20:.1f} MiB")
 
     update_stream = torch_npu.npu.Stream()
 
