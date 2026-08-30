@@ -289,26 +289,34 @@ def case_vdescale_stub(args, quant, quant_v) -> bool:
     _, v_descale = quant_v(step.v_cache.reshape(step.num_blocks, step.block_size, step.nkv, step.d))
     print(f"  real v_descale shape={tuple(v_descale.shape)} vs stub (1, 1, 1, 1, 2)")
 
-    control_a = step.metadata(max_kv, v_descale=v_descale).cpu()
-    control_b = step.metadata(max_kv, v_descale=v_descale).cpu()
-    plan_stub = step.metadata(max_kv)
-    plan_comparable = torch.equal(control_a, control_b)
-    differing = int((control_a != plan_stub.cpu()).sum())
-    print(
-        f"  [control] same arguments twice -> identical plan bytes: {plan_comparable}"
-        f" ({int((control_a != control_b).sum())} of {control_a.numel()} int32 differ)"
-    )
-    print(f"  [stub vs real] {differing} of {control_a.numel()} int32 differ")
-    if not plan_comparable:
-        print("  plan bytes are not comparable (uninitialized tail); judging on the output alone")
-
+    # All three are held at once so each gets its own buffer: released back to
+    # back they would reuse one block and inherit the same leftovers, which
+    # would make the control agree for the wrong reason.
     plan_real = step.metadata(max_kv, v_descale=v_descale)
+    plan_stub = step.metadata(max_kv)
+    plan_real2 = step.metadata(max_kv, v_descale=v_descale)
+    torch.npu.synchronize()
+    a, b, c = plan_real.cpu(), plan_stub.cpu(), plan_real2.cpu()
+    control_diff = int((a != c).sum())
+    stub_diff = int((a != b).sum())
+    print(f"  [control] real vs real, separate buffers: {control_diff} of {a.numel()} int32 differ")
+    print(f"  [stub vs real] {stub_diff} of {a.numel()} int32 differ")
+
     out_real = qfa_call(step, quant, quant_v, step.block_table, plan_real, step.op_kwargs(max_kv), mask)
     out_stub = qfa_call(step, quant, quant_v, step.block_table, plan_stub, step.op_kwargs(max_kv), mask)
     torch.npu.synchronize()
     ok = _exactness("stub-planned vs real-planned output", out_stub.cpu(), out_real.cpu())
-    if plan_comparable and differing:
-        print("  [RED] plans are comparable and the stub changed them; v_descale is not inert here")
+
+    if control_diff:
+        print(
+            "  plan bytes carry buffer leftovers (identical arguments already disagree), "
+            "so only the output is meaningful here"
+        )
+    elif stub_diff:
+        # Deterministic plans that the stub changes: the engine builds its plan
+        # before any layer has a real v_descale, so this would have to be fixed
+        # by handing the builder a correctly shaped placeholder.
+        print("  [RED] plans are deterministic and the stub changed them; v_descale is not inert")
         ok = False
     return ok
 
@@ -357,9 +365,14 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
         # until release() below, so the device would never come back. Reserved
         # bytes are host-side allocator bookkeeping anyway.
         grew = torch.npu.memory_reserved() - before
+        cache_bytes = step.k_cache.numel() * 2 * 2  # K + V, bf16
         print(
-            f"  [pool] reserved +{grew / 2**20:.1f} MiB for {step.num_blocks} blocks "
-            f"({step.k_cache.numel() * 2 / 2**20:.1f} MiB of bf16 K per plane)"
+            f"  [pool] reserved +{grew / 2**20:.1f} MiB capturing one layer over "
+            f"{step.num_blocks} blocks ({cache_bytes / 2**20:.1f} MiB of bf16 K+V)"
+        )
+        print(
+            f"  [pool] ratio {grew / cache_bytes:.2f}x the layer's bf16 KV cache -- multiply by the "
+            "real per-layer cache to size the graph pool"
         )
 
     update_stream = torch_npu.npu.Stream()
