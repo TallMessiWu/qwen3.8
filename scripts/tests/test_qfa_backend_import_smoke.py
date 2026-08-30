@@ -300,8 +300,21 @@ def main() -> int:
         ok = spec.page_size_bytes == shape_bytes
         # and it must exceed the plain K/V pair by exactly the two scale planes
         ok &= spec.page_size_bytes - 2 * bs * nkv * d * 2 == 2 * bs * nkv * (d // 64) * 2
+        # Hybrid models stretch the scheduler block to match the Mamba page, so
+        # the cache is laid out in kernel blocks instead. The operator reads
+        # block_size off the K plane and MXFP8 only accepts 64/128/.../1024, so
+        # the kernel block must stay legal and the stretched page must still
+        # divide into exactly `ratio` kernel blocks (no bytes gained or lost).
+        kernel_bs = backend_cls.get_supported_kernel_block_sizes()[0]
+        ratio = 12  # what unify_kv_cache_specs picks for 27B + GDN
+        stretched = AscendQfaAttentionSpec(
+            block_size=kernel_bs * ratio, num_kv_heads=nkv, head_size=d,
+            dtype=torch.bfloat16)
+        ok &= kernel_bs in (64, 128, 256, 512, 1024) and kernel_bs % 64 == 0
+        ok &= stretched.page_size_bytes == ratio * shape_bytes
         ok_all &= check("SPEC-PAGE-BUDGET", ok,
-                        f"page={spec.page_size_bytes} shape={shape}={shape_bytes}B")
+                        f"page={spec.page_size_bytes} shape={shape}={shape_bytes}B "
+                        f"kernel_bs={kernel_bs} stretched={stretched.page_size_bytes}")
     except Exception as e:  # noqa: BLE001
         import traceback
 
