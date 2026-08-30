@@ -57,14 +57,19 @@ MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 # shared blocks cannot track; a QFA-vs-FIA comparison therefore has to pass
 # --no-enable-prefix-caching to the baseline run as well, or the two differ by
 # more than the attention op.
-# GRAPH=0 turns off aclgraph capture (eager); note decode only reaches QFA with
-# GRAPH=0 -- the captured graph still replays FIA. MTP=0 turns off speculative
-# decoding. Both default to on.
+# GRAPH=0 turns off aclgraph capture (eager). Under QFA=1 the target model's
+# decode graph now captures QuantFlashAttn as well; the MTP drafter still
+# replays FIA there, because its steps share one graph. MTP=0 turns off
+# speculative decoding. Both default to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
+    echo "QFA on: QuantFlashAttn for causal attention; KV cache still bf16 (quantized per step)." >&2
+fi
+# Also settable on its own, so a QFA-vs-FIA comparison can hold it constant.
+if [[ "${QFA:-0}" == "1" || "${NO_PREFIX_CACHE:-0}" == "1" ]]; then
     qfa_args+=(--no-enable-prefix-caching)
-    echo "QFA on: QuantFlashAttn for causal attention; KV cache still bf16 (quantized per step); prefix caching off." >&2
+    echo "prefix caching disabled." >&2
 fi
 
 compilation_config='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}'
