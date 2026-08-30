@@ -49,17 +49,22 @@ MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 
-# QFA=1 serves the full-attention layers (and the MTP drafter) from an MXFP8
-# KV cache through the vendored QuantFlashAttn backend (junlin-qfa branch,
-# VLLM_ASCEND_ENABLE_QFA). Prefix caching has to come off: the E8M0 scale
-# planes are not tracked across shared blocks.
-# GRAPH=0 turns off aclgraph capture (eager, milestone M1); MTP=0 turns off
-# speculative decoding (milestones M1/M2). Both default to on.
+# QFA=1 runs the causal full-attention path on the vendored QuantFlashAttn
+# instead of FIA (junlin-qfa branch, VLLM_ASCEND_ENABLE_QFA). The KV cache is
+# still bf16: K/V are quantized to MXFP8 on every step, so this saves no memory
+# yet -- it is the probe, not the destination. Prefix caching comes off because
+# the MXFP8 cache it is heading for shares E8M0 scales across tokens, which
+# shared blocks cannot track; a QFA-vs-FIA comparison therefore has to pass
+# --no-enable-prefix-caching to the baseline run as well, or the two differ by
+# more than the attention op.
+# GRAPH=0 turns off aclgraph capture (eager); note decode only reaches QFA with
+# GRAPH=0 -- the captured graph still replays FIA. MTP=0 turns off speculative
+# decoding. Both default to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
     qfa_args+=(--no-enable-prefix-caching)
-    echo "QFA MXFP8 KV cache enabled; prefix caching disabled (unsupported with it)." >&2
+    echo "QFA on: QuantFlashAttn for causal attention; KV cache still bf16 (quantized per step); prefix caching off." >&2
 fi
 
 compilation_config='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}'
