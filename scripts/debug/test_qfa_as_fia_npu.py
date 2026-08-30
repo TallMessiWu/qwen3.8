@@ -17,6 +17,13 @@ the platform first -- keep the two in step).
 V is the odd one out in both: QFA groups its scales down the sequence
 ((T/64, N, D, 2) / (Bn, Bs/64, N, D, 2)), not along D like q and k.
 
+Each case then runs FIA on the same bf16 inputs and compares. FIA is the
+reference the swap has to reproduce; QFA reads an MXFP8 copy of the same K/V, so
+the criterion is distributional (pass_rate + cosine, mirroring
+result_compare_method) rather than bit-exact -- and the first token of a sequence
+attends a single KV with no softmax averaging, so its pointwise error is large by
+construction and says nothing about correctness.
+
 Cases use the live 27B prefill/decode shapes (Nq=24 Nkv=4 D=256, block 128).
 Each runs in its own subprocess: an AICPU abort poisons the device.
 
@@ -34,6 +41,27 @@ NQ, NKV, D, BLOCK, WINDOW = 24, 4, 256, 128, 64
 PREFILL_LEN = 1594
 DECODE_REQS, DECODE_KV = 4, 300
 CASES = ["dense", "paged"]
+
+
+def compare(name, got, ref):
+    """Two-per-mille family criterion, same as the single-op script."""
+    import torch
+
+    a = got.float().cpu().reshape(-1)
+    b = ref.float().cpu().reshape(-1)
+    abs_diff = (a - b).abs()
+    rel_diff = abs_diff / b.abs().clamp(min=1.0)
+    ok = (abs_diff <= 1e-3) | (rel_diff <= 0.0078125)
+    pass_rate = ok.float().mean().item()
+    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    print(
+        f"  vs FIA: pass_rate={pass_rate:.6f} cos={cos:.6f} "
+        f"max_abs={abs_diff.max().item():.4f} qfa_mean={a.mean():.6f} fia_mean={b.mean():.6f}",
+        flush=True,
+    )
+    good = pass_rate >= 0.99 and cos >= 0.999
+    print(f"  [{name}] numerics {'GREEN' if good else 'RED'}", flush=True)
+    return good
 
 
 def quant_v_by_sequence(value, seq_lens=None):
@@ -99,6 +127,7 @@ def run_case(name: str) -> int:
         table = torch.arange(1, DECODE_REQS * blocks_per_req + 1, dtype=torch.int32)
         table = table.reshape(DECODE_REQS, blocks_per_req).npu()
         q_lens, kv_lens = [1] * DECODE_REQS, [DECODE_KV] * DECODE_REQS
+        fia_key, fia_value = cache_k, cache_v  # FIA takes the cache view as-is
         k_fp8, k_descale = _qfa_quant(cache_k.reshape(nb, BLOCK, NKV, D), D)
         v_fp8, v_descale = quant_v_by_sequence(cache_v.reshape(nb, BLOCK, NKV, D))
         kv_args = {"seqused_kv": torch.tensor(kv_lens, dtype=torch.int32).npu()}
@@ -109,6 +138,7 @@ def run_case(name: str) -> int:
         value = torch.randn(PREFILL_LEN, NKV, D, dtype=torch.bfloat16).npu()
         table = None
         q_lens, kv_lens = [PREFILL_LEN], [PREFILL_LEN]
+        fia_key, fia_value = key, value
         k_fp8, k_descale = _qfa_quant(key, D)
         v_fp8, v_descale = quant_v_by_sequence(value, kv_lens)
         cum_kv = []
@@ -150,7 +180,28 @@ def run_case(name: str) -> int:
         softmax_scale=D ** -0.5, **args)
     torch.npu.synchronize()
     print(f"  main op ok, out={tuple(out.shape)}", flush=True)
-    return 0
+
+    # Reference: the operator this call site used to use, same bf16 inputs.
+    # attention_v1 passes get_splitfuse_attn_mask(), which is this same
+    # triu(2048, diagonal=1) int8 -- so both operators see one mask.
+    fia_out, _ = torch_npu.npu_fused_infer_attention_score(
+        query=q,
+        key=fia_key,
+        value=fia_value,
+        atten_mask=mask,
+        block_table=table,
+        input_layout="TND",
+        block_size=BLOCK,
+        actual_seq_lengths=cum,
+        actual_seq_lengths_kv=kv_lens if paged else cum,
+        num_key_value_heads=NKV,
+        num_heads=NQ,
+        scale=D ** -0.5,
+        sparse_mode=3,
+    )
+    torch.npu.synchronize()
+    print(f"  fia out={tuple(fia_out.shape)}", flush=True)
+    return 0 if compare(name, out, fia_out) else 1
 
 
 def main() -> int:
