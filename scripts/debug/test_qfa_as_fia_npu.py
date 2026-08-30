@@ -44,22 +44,30 @@ CASES = ["dense", "paged"]
 
 
 def compare(name, got, ref):
-    """Two-per-mille family criterion, same as the single-op script."""
+    """QFA (MXFP8 K/V) against FIA (bf16 K/V) on the same inputs.
+
+    Accumulate in float64: cosine over ~10M float32 elements drifts enough to
+    come back above 1.0. The two-per-mille criterion the single-op script uses
+    does not apply here -- that one compares against a golden computed from the
+    same quantized inputs, whereas this comparison carries the quantization loss
+    itself, so judge by relative L2 and cosine and print the error spread.
+    """
     import torch
 
-    a = got.float().cpu().reshape(-1)
-    b = ref.float().cpu().reshape(-1)
-    abs_diff = (a - b).abs()
-    rel_diff = abs_diff / b.abs().clamp(min=1.0)
-    ok = (abs_diff <= 1e-3) | (rel_diff <= 0.0078125)
-    pass_rate = ok.float().mean().item()
-    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    a = got.float().cpu().reshape(-1).double()
+    b = ref.float().cpu().reshape(-1).double()
+    diff = a - b
+    rel_l2 = (diff.norm() / b.norm()).item()
+    cos = (a @ b / (a.norm() * b.norm())).item()
+    scale = b.abs().mean().item()
+    q = torch.quantile(diff.abs(), torch.tensor([0.5, 0.9, 0.99], dtype=torch.float64))
     print(
-        f"  vs FIA: pass_rate={pass_rate:.6f} cos={cos:.6f} "
-        f"max_abs={abs_diff.max().item():.4f} qfa_mean={a.mean():.6f} fia_mean={b.mean():.6f}",
+        f"  vs FIA: rel_l2={rel_l2:.5f} cos={cos:.6f} "
+        f"|err| p50={q[0]:.5f} p90={q[1]:.5f} p99={q[2]:.5f} max={diff.abs().max():.4f} "
+        f"(ref mean|x|={scale:.5f})",
         flush=True,
     )
-    good = pass_rate >= 0.99 and cos >= 0.999
+    good = rel_l2 <= 0.05 and cos >= 0.999
     print(f"  [{name}] numerics {'GREEN' if good else 'RED'}", flush=True)
     return good
 
