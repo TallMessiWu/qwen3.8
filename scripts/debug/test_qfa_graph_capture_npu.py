@@ -275,23 +275,42 @@ def _exactness(tag: str, got: torch.Tensor, want: torch.Tensor) -> bool:
 # --------------------------------------------------------------------------
 def case_vdescale_stub(args, quant, quant_v) -> bool:
     """The plan is built before any layer quantizes, so it can only pass a
-    placeholder v_descale. Prove that costs nothing under PA_BBND."""
+    placeholder v_descale. Prove that costs nothing under PA_BBND.
+
+    The verdict is the *output*, not the plan bytes: the op allocates its
+    4096-int32 output with at::empty and writes only a header plus sectionNum
+    sections, so the tail is whatever the allocator last left there. The control
+    below shows that directly -- two calls with identical arguments already
+    disagree on those bytes.
+    """
     step = Step(args, args.seed)
     mask = causal_mask()
     max_kv = args.max_seqlen_kv
     _, v_descale = quant_v(step.v_cache.reshape(step.num_blocks, step.block_size, step.nkv, step.d))
     print(f"  real v_descale shape={tuple(v_descale.shape)} vs stub (1, 1, 1, 1, 2)")
 
-    plan_real = step.metadata(max_kv, v_descale=v_descale)
+    control_a = step.metadata(max_kv, v_descale=v_descale).cpu()
+    control_b = step.metadata(max_kv, v_descale=v_descale).cpu()
     plan_stub = step.metadata(max_kv)
-    plan_same = torch.equal(plan_real.cpu(), plan_stub.cpu())
-    print(f"  [plan identical] {plan_same}")
+    plan_comparable = torch.equal(control_a, control_b)
+    differing = int((control_a != plan_stub.cpu()).sum())
+    print(
+        f"  [control] same arguments twice -> identical plan bytes: {plan_comparable}"
+        f" ({int((control_a != control_b).sum())} of {control_a.numel()} int32 differ)"
+    )
+    print(f"  [stub vs real] {differing} of {control_a.numel()} int32 differ")
+    if not plan_comparable:
+        print("  plan bytes are not comparable (uninitialized tail); judging on the output alone")
 
+    plan_real = step.metadata(max_kv, v_descale=v_descale)
     out_real = qfa_call(step, quant, quant_v, step.block_table, plan_real, step.op_kwargs(max_kv), mask)
     out_stub = qfa_call(step, quant, quant_v, step.block_table, plan_stub, step.op_kwargs(max_kv), mask)
     torch.npu.synchronize()
     ok = _exactness("stub-planned vs real-planned output", out_stub.cpu(), out_real.cpu())
-    return ok and plan_same
+    if plan_comparable and differing:
+        print("  [RED] plans are comparable and the stub changed them; v_descale is not inert here")
+        ok = False
+    return ok
 
 
 def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> bool:
@@ -334,7 +353,9 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
         )
 
     if report_memory:
-        torch.npu.synchronize()
+        # No synchronize here: the captured event wait is still outstanding
+        # until release() below, so the device would never come back. Reserved
+        # bytes are host-side allocator bookkeeping anyway.
         grew = torch.npu.memory_reserved() - before
         print(
             f"  [pool] reserved +{grew / 2**20:.1f} MiB for {step.num_blocks} blocks "
@@ -415,7 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=133120, help="MAXKV's capture constant")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
-    parser.add_argument("--case-timeout", type=float, default=900.0)
+    parser.add_argument("--case-timeout", type=float, default=300.0)
     return parser
 
 
