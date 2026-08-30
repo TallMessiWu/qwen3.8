@@ -48,6 +48,13 @@ fi
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
+# Lower this to leave the aclgraph pool room. Capturing QFA needs roughly 1.28x
+# one attention layer's bf16 KV cache in transient tensors (measured by the
+# POOL-MEM case of scripts/debug/test_qfa_graph_capture_npu.py), which 0.95
+# leaves no space for. Both the cache and that requirement shrink together, so
+# giving back a few points frees more than it costs. Goes away with an MXFP8
+# cache, when the per-step quantization does.
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 
 # QFA=1 runs the causal full-attention path on the vendored QuantFlashAttn
 # instead of FIA (junlin-qfa branch, VLLM_ASCEND_ENABLE_QFA). The KV cache is
@@ -93,7 +100,7 @@ exec vllm serve "$MODEL_PATH" \
     --max-model-len 133120 \
     --max-num-batched-tokens 16384 \
     --max-num-seqs 32 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --reasoning-parser qwen3 \
     --compilation-config "$compilation_config" \
     "${spec_args[@]}" \
