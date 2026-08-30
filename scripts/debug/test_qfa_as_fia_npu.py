@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """Does the FIA-call-site swap actually run on device?
 
-attention_v1 now calls QuantFlashAttn where it used to call FIA, quantizing
-q/k/v on the spot with _qfa_quant. That function is mirrored below rather than
-imported: importing attention_v1 on its own trips the device_op <-> fused_moe
-circular import (the engine avoids it by registering the platform first). Keep
-the two in step. Two things are worth checking before starting a server, both
-about v_descale:
+attention_v1 now calls QuantFlashAttn where it used to call FIA. Two shapes to
+check before starting a server, mirroring what the call site builds (the helpers
+are copied rather than imported: importing attention_v1 on its own trips the
+device_op <-> fused_moe circular import, which the engine avoids by registering
+the platform first -- keep the two in step).
 
-  * QFA groups V's scales down the sequence -- (T/64, N, D, 2) for TND,
-    (Bn, Bs/64, N, D, 2) for PA_BBND -- while _qfa_quant groups along D like it
-    does for q and k, giving (T, N, D/64, 2). Different layout, different size.
-  * the paged branch hands over the cache as (num_blocks, block_size, N*D), so
-    the last axis is not D at all and the scale reshape cannot even be formed.
+  dense  PrefillNoCache: this batch's own K/V, no block table, layout TND.
+         The op rejects TND without cu_seqlens_kv ("cuSeqlensKvOptional should
+         be provided"), and actual_seq_lengths_kv is cumulative in this state.
+  paged  everything else: the cache arrives as (num_blocks, block_size, N*D),
+         so the heads get split back out for PA_BBND, and seqused_kv is
+         per-sequence here.
 
-So each shape is tried twice: once exactly as the swap does it today, once with
-V quantized the way the doc specifies. Whichever pairs come back green say what
-the call site has to look like.
+V is the odd one out in both: QFA groups its scales down the sequence
+((T/64, N, D, 2) / (Bn, Bs/64, N, D, 2)), not along D like q and k.
 
 Cases use the live 27B prefill/decode shapes (Nq=24 Nkv=4 D=256, block 128).
 Each runs in its own subprocess: an AICPU abort poisons the device.
 
 Usage (inside the serving container, no server running):
   python scripts/debug/test_qfa_as_fia_npu.py
-  python scripts/debug/test_qfa_as_fia_npu.py --case dense-doc
+  python scripts/debug/test_qfa_as_fia_npu.py --case dense
 """
 
 import argparse
@@ -34,11 +33,11 @@ import sys
 NQ, NKV, D, BLOCK, WINDOW = 24, 4, 256, 128, 64
 PREFILL_LEN = 1594
 DECODE_REQS, DECODE_KV = 4, 300
-CASES = ["dense-asis", "dense-doc", "paged-asis", "paged-doc"]
+CASES = ["dense", "paged"]
 
 
 def quant_v_by_sequence(value, seq_lens=None):
-    """V quantized down the sequence, the layout QFA documents."""
+    """Mirror of attention_v1._qfa_quant_v."""
     import torch
     import torch_npu
 
@@ -88,22 +87,21 @@ def run_case(name: str) -> int:
             scale.view(torch.uint8).reshape(*x.shape[:-1], d // 64, 2).view(torch.float8_e8m0fnu),
         )
 
-    paged = name.startswith("paged")
-    as_is = name.endswith("asis")
+    paged = name == "paged"
     mask = torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1).npu()
 
     if paged:
         nb = 64
         q = torch.randn(DECODE_REQS, NQ, D, dtype=torch.bfloat16).npu()
-        cache_k = torch.randn(nb, BLOCK, NKV, D, dtype=torch.bfloat16).npu()
-        cache_v = torch.randn(nb, BLOCK, NKV, D, dtype=torch.bfloat16).npu()
+        cache_k = torch.randn(nb, BLOCK, NKV * D, dtype=torch.bfloat16).npu()
+        cache_v = torch.randn(nb, BLOCK, NKV * D, dtype=torch.bfloat16).npu()
         blocks_per_req = (DECODE_KV + BLOCK - 1) // BLOCK
         table = torch.arange(1, DECODE_REQS * blocks_per_req + 1, dtype=torch.int32)
         table = table.reshape(DECODE_REQS, blocks_per_req).npu()
         q_lens, kv_lens = [1] * DECODE_REQS, [DECODE_KV] * DECODE_REQS
-        # as-is: the call site receives the cache as (num_blocks, block_size, N*D)
-        key = cache_k.reshape(nb, BLOCK, NKV * D) if as_is else cache_k
-        value = cache_v.reshape(nb, BLOCK, NKV * D) if as_is else cache_v
+        k_fp8, k_descale = _qfa_quant(cache_k.reshape(nb, BLOCK, NKV, D), D)
+        v_fp8, v_descale = quant_v_by_sequence(cache_v.reshape(nb, BLOCK, NKV, D))
+        kv_args = {"seqused_kv": torch.tensor(kv_lens, dtype=torch.int32).npu()}
         layout_kv = "PA_BBND"
     else:
         q = torch.randn(PREFILL_LEN, NQ, D, dtype=torch.bfloat16).npu()
@@ -111,14 +109,17 @@ def run_case(name: str) -> int:
         value = torch.randn(PREFILL_LEN, NKV, D, dtype=torch.bfloat16).npu()
         table = None
         q_lens, kv_lens = [PREFILL_LEN], [PREFILL_LEN]
+        k_fp8, k_descale = _qfa_quant(key, D)
+        v_fp8, v_descale = quant_v_by_sequence(value, kv_lens)
+        cum_kv = []
+        acc = 0
+        for s_len in kv_lens:
+            acc += s_len
+            cum_kv.append(acc)
+        kv_args = {"cu_seqlens_kv": torch.tensor([0] + cum_kv, dtype=torch.int32).npu()}
         layout_kv = "TND"
 
     q_fp8, q_descale = _qfa_quant(q, D)
-    k_fp8, k_descale = _qfa_quant(key, D)
-    if as_is:
-        v_fp8, v_descale = _qfa_quant(value, D)
-    else:
-        v_fp8, v_descale = quant_v_by_sequence(value, None if paged else kv_lens)
     print(f"  q {tuple(q_fp8.shape)} qs {tuple(q_descale.shape)}", flush=True)
     print(f"  k {tuple(k_fp8.shape)} ks {tuple(k_descale.shape)}", flush=True)
     print(f"  v {tuple(v_fp8.shape)} vs {tuple(v_descale.shape)}", flush=True)
@@ -130,7 +131,6 @@ def run_case(name: str) -> int:
         cum.append(acc)
     args = {
         "cu_seqlens_q": torch.tensor([0] + cum, dtype=torch.int32).npu(),
-        "seqused_kv": torch.tensor(kv_lens, dtype=torch.int32).npu(),
         "mask_mode": 3,
         "max_seqlen_q": max(q_lens),
         "max_seqlen_kv": max(kv_lens),
@@ -138,6 +138,7 @@ def run_case(name: str) -> int:
         "layout_q_descale": "TND",
         "layout_kv": layout_kv,
         "layout_out": "TND",
+        **kv_args,
     }
     metadata = torch.ops._C_ascend.npu_quant_flash_attn_metadata(
         NQ, NKV, D, 1, v_descale=v_descale, **args)
@@ -161,8 +162,7 @@ def main() -> int:
 
     results = {}
     for case in CASES:
-        print(f"== {case} " + ("(exactly what attention_v1 does now)" if case.endswith("asis")
-                               else "(V grouped down the sequence, per the doc)"))
+        print(f"== {case}")
         proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--case", case],
                               capture_output=True, text=True)
         results[case] = proc.returncode == 0
@@ -176,14 +176,11 @@ def main() -> int:
     for case, ok in results.items():
         print(f"  {case}: {'GREEN' if ok else 'RED'}")
     print()
-    print("== reading ==")
-    if results["dense-doc"] and not results["dense-asis"]:
-        print("  Prefill needs V grouped down the sequence; quantizing it like q/k is not enough.")
-    if results["paged-doc"] and not results["paged-asis"]:
-        print("  Decode needs the cache as (Bn, Bs, N, D) and the same V treatment.")
     if all(results.values()):
-        print("  Everything runs as written -- the swap needs no further shaping.")
-    return 0 if results["dense-doc"] and results["paged-doc"] else 1
+        print("Both paths run; the swap is shaped the way the operator wants.")
+    else:
+        print("Read the failing case above before starting a server.")
+    return 0 if all(results.values()) else 1
 
 
 if __name__ == "__main__":
