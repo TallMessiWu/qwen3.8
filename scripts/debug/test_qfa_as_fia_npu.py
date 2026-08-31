@@ -254,6 +254,20 @@ def run_case(name: str) -> int:
     torch.npu.synchronize()
     print(f"  main op ok, out={tuple(out.shape)}", flush=True)
 
+    # Same call with no plan. The doc calls metadata an optional scheduling
+    # optimization; if that holds, the graph path can drop it and stop having to
+    # keep two calls' arguments in step across capture and replay.
+    try:
+        out_nometa, _ = torch.ops._C_ascend.npu_quant_flash_attn(
+            q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale, 1,
+            block_table=table, attn_mask=mask, metadata=None,
+            softmax_scale=D ** -0.5, **args)
+        torch.npu.synchronize()
+        nometa_ok = True
+    except Exception as exc:  # noqa: BLE001 -- the answer is "it is not optional"
+        print(f"  no-metadata call FAILED: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        out_nometa, nometa_ok = None, False
+
     # Reference: the operator this call site used to use, same bf16 inputs.
     # attention_v1 passes get_splitfuse_attn_mask(), which is this same
     # triu(2048, diagonal=1) int8 -- so both operators see one mask.
@@ -296,8 +310,14 @@ def run_case(name: str) -> int:
     # the second one is the verdict -- same inputs, same maths, so anything
     # beyond rounding means the two operators disagree about the layout.
     good = cos_deq >= 0.9995
+    if nometa_ok:
+        _, cos_nometa = compare("no-metadata   ", out_nometa, out)
+        exact = torch.equal(out_nometa, out)
+        print(f"  metadata dropped: bit-exact={exact} cos={cos_nometa:.6f}", flush=True)
+        good = good and cos_nometa >= 0.9995
     print(f"  [{name}] quantization loss {l2_raw * 100:.1f}%, "
-          f"operator agreement cos={cos_deq:.6f} -> {'GREEN' if good else 'RED'}", flush=True)
+          f"operator agreement cos={cos_deq:.6f}, "
+          f"no-metadata {'ok' if nometa_ok else 'REJECTED'} -> {'GREEN' if good else 'RED'}", flush=True)
     return 0 if good else 1
 
 
@@ -397,6 +417,12 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
             block_table=table, attn_mask=mask, metadata=metadata,
             softmax_scale=D ** -0.5, **args)
 
+    def call_qfa_nometa():
+        torch.ops._C_ascend.npu_quant_flash_attn(
+            q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale, 1,
+            block_table=table, attn_mask=mask, metadata=None,
+            softmax_scale=D ** -0.5, **args)
+
     def call_fia():
         torch_npu.npu_fused_infer_attention_score(
             query=q, key=fia_key, value=fia_value, atten_mask=mask,
@@ -416,6 +442,9 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
         "kv_len": kv_len,
         "fia_ms": _time(call_fia, iters, warmup) * 1e3,
         "qfa_ms": _time(call_qfa, iters, warmup) * 1e3,
+        # What the plan buys. If this is close to qfa_ms, the graph path can
+        # drop metadata and stop straddling the doc's consistency requirement.
+        "qfa_nometa_ms": _time(call_qfa_nometa, iters, warmup) * 1e3,
         "quant_ms": _time(call_quant, iters, warmup) * 1e3,
         "metadata_ms": _time(call_metadata, iters, warmup) * 1e3,
     }
@@ -451,7 +480,10 @@ def run_bench_sweep(args) -> int:
 
 
 def _print_bench_table(rows: list) -> None:
-    head = f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'speedup':>9}{'quant ms':>10}{'today ms':>10}{'meta ms':>9}"
+    head = (
+        f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'no-meta':>9}{'speedup':>9}"
+        f"{'quant ms':>10}{'today ms':>10}{'meta ms':>9}"
+    )
     print("\n" + head)
     print("-" * len(head))
     for row in rows:
@@ -460,9 +492,10 @@ def _print_bench_table(rows: list) -> None:
             continue
         today = row["qfa_ms"] + row["quant_ms"]
         speedup = row["fia_ms"] / row["qfa_ms"] if row["qfa_ms"] else float("nan")
+        nometa = row.get("qfa_nometa_ms", float("nan"))
         print(
-            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}{speedup:>8.2f}x"
-            f"{row['quant_ms']:>10.3f}{today:>10.3f}{row['metadata_ms']:>9.3f}"
+            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}{nometa:>9.3f}"
+            f"{speedup:>8.2f}x{row['quant_ms']:>10.3f}{today:>10.3f}{row['metadata_ms']:>9.3f}"
         )
     print(
         "\nspeedup = FIA / QFA, per attention layer -- this is the post-6.3 number,\n"
@@ -470,7 +503,12 @@ def _print_bench_table(rows: list) -> None:
         "quant ms = quantizing the whole KV cache on the fly, per layer per step.\n"
         "  It is what makes 'today ms' worse than FIA, and it disappears once the\n"
         "  cache is stored as MXFP8. Not part of the operator; never subtract it.\n"
-        "meta ms = the AICPU plan, paid once per step for all layers, not per layer."
+        "meta ms = the AICPU plan, paid once per step for all layers, not per layer.\n"
+        "no-meta = the same op with metadata=None. The doc calls the plan an optional\n"
+        "  scheduling optimization; if this column is close to QFA ms, the graph path can\n"
+        "  drop it -- and with it the requirement that two calls' arguments stay in step,\n"
+        "  which capture/replay cannot honour and which the doc says ends in illegal\n"
+        "  memory access."
     )
 
 
