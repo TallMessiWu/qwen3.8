@@ -64,10 +64,12 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 # shared blocks cannot track; a QFA-vs-FIA comparison therefore has to pass
 # --no-enable-prefix-caching to the baseline run as well, or the two differ by
 # more than the attention op.
-# GRAPH=0 turns off aclgraph capture (eager). Under QFA=1 the target model's
-# decode graph now captures QuantFlashAttn as well; the MTP drafter still
-# replays FIA there, because its steps share one graph. MTP=0 turns off
-# speculative decoding. Both default to on.
+# GRAPH=0 turns off aclgraph capture (eager). QFA=1 covers prefill and eager
+# decode only: on this branch the captured decode graph still replays FIA, for
+# the target model as well as for the MTP drafter. Getting QuantFlashAttn into
+# the graph is the open subgoal -- the junlin-qfa-graph branch is where that is
+# being chased, and it crashes. MTP=0 turns off speculative decoding. Both
+# default to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
