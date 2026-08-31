@@ -365,9 +365,15 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
         before_reserved = torch.npu.memory_reserved()
         before_allocated = torch.npu.memory_allocated()
 
-    stream = torch_npu.npu.current_stream()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
+        # Inside the capture on purpose: torch.npu.graph runs the block on a
+        # side stream, and only the stream that is capturing turns wait/reset
+        # into graph nodes. Taken outside, the wait lands on the real default
+        # stream and nothing releases it until replay -- the next capture's
+        # implicit synchronize then hangs. The engine gets this right for free:
+        # full_graph_qfa is called from inside the captured forward.
+        stream = torch_npu.npu.current_stream()
         # Allocated inside the capture, exactly like QFAGraphBuffers.like, and
         # deliberately left unfilled: filling here would record the copies into
         # the graph and replay would read capture-time sources.
@@ -383,9 +389,7 @@ def _graph_roundtrip(args, quant, quant_v, max_kv: int, report_memory: bool) -> 
         )
 
     if report_memory:
-        # No synchronize here: the captured event wait is still outstanding
-        # until release() below, so the device would never come back. Reserved
-        # bytes are host-side allocator bookkeeping anyway.
+        # Allocator bookkeeping is host-side, so no synchronize is needed here.
         # Peak *allocated*, not reserved: reserved only grows when the
         # allocator has to obtain new segments, and the eager warmup above has
         # already reserved everything this needs, so it reports a constant few
@@ -501,7 +505,6 @@ def _engine_shaped(args, quant, quant_v, buffers_in_pool: bool) -> bool:
     print(f"  {layers} layers x sizes {sizes}, buffers {'inside' if buffers_in_pool else 'outside'} capture")
 
     mask = causal_mask()
-    stream = torch_npu.npu.current_stream()
     captured = {}
 
     for size in sizes:
@@ -529,6 +532,13 @@ def _engine_shaped(args, quant, quant_v, buffers_in_pool: bool) -> bool:
         events = []
         outs = []
         with torch.npu.graph(graph, pool=pool) if pool is not None else torch.npu.graph(graph):
+            # Inside the capture on purpose: torch.npu.graph runs the block on a
+            # side stream, and only the stream that is capturing turns wait/reset
+            # into graph nodes. Taken outside, the wait lands on the real default
+            # stream and nothing releases it until replay -- the next capture's
+            # implicit synchronize then hangs. The engine gets this right for free:
+            # full_graph_qfa is called from inside the captured forward.
+            stream = torch_npu.npu.current_stream()
             if buffers_in_pool:
                 cu_buf, seq_buf, bt_buf, plan_buf = make_buffers()
             for layer in range(layers):
