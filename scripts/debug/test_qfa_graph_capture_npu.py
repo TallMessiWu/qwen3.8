@@ -39,6 +39,13 @@ full_graph_qfa + _update_qfa_graph_buffers use:
                  so this is where a plan that fits for decode can overrun the
                  op's fixed 4096-int32 output -- which reads back as an AI Core
                  "invalid GM address". Eager only; prefill is never captured.
+  ENGINE-INPOOL  the engine's shape: --layers ops per graph, --sizes graph sizes,
+  ENGINE-OUTPOOL all captured into one shared pool, one buffer set per size,
+                 that size's events all released after a single refresh. The two
+                 differ only in where the buffers are allocated -- inside the
+                 capture (what full_graph_qfa does, so pool memory) or before it
+                 (what the older single-op GRAPH case does). If INPOOL fails and
+                 OUTPOOL passes, that is the bug and the fix is twenty lines.
   POOL-MEM       reports the allocator delta across a capture at --blocks worth
                  of cache, so "does the in-graph whole-cache quantization fit"
                  gets a number instead of a guess. Reports only; never RED.
@@ -67,7 +74,15 @@ import sys
 
 import torch
 
-CASES = ("VDESCALE-STUB", "QUANT-IN-GRAPH", "MAXKV", "PREFILL-MAXKV", "POOL-MEM")
+CASES = (
+    "VDESCALE-STUB",
+    "QUANT-IN-GRAPH",
+    "MAXKV",
+    "PREFILL-MAXKV",
+    "ENGINE-INPOOL",
+    "ENGINE-OUTPOOL",
+    "POOL-MEM",
+)
 
 
 # --------------------------------------------------------------------------
@@ -464,6 +479,116 @@ def case_prefill_maxkv(args, quant, quant_v) -> bool:
     return _exactness("constant vs tight max_seqlen_kv", outs["constant"], outs["tight"])
 
 
+def _engine_shaped(args, quant, quant_v, buffers_in_pool: bool) -> bool:
+    """Capture --layers QFA ops into each of --sizes graphs, one shared pool.
+
+    Mirrors full_graph_qfa + _update_qfa_graph_buffers: every layer of a size
+    reads the same buffer set, nothing is written to them during capture, and
+    replay refreshes contents once and then releases every event of that size.
+    """
+    import copy
+
+    import torch_npu
+
+    sizes = [int(x) for x in args.sizes.split(",")]
+    layers = args.layers
+    try:
+        pool = torch.npu.graph_pool_handle()
+        print(f"  shared graph pool: {pool}")
+    except Exception as exc:  # noqa: BLE001
+        pool = None
+        print(f"  [WARN] no shared pool ({type(exc).__name__}); captures will not share memory")
+    print(f"  {layers} layers x sizes {sizes}, buffers {'inside' if buffers_in_pool else 'outside'} capture")
+
+    mask = causal_mask()
+    stream = torch_npu.npu.current_stream()
+    captured = {}
+
+    for size in sizes:
+        batch = max(1, size // args.q_len)
+        step_args = copy.copy(args)
+        step_args.kv_lens = ",".join([str(args.kv_len_each)] * batch)
+        step = Step(step_args, args.seed + size)
+        # One q per layer, as the engine has: each layer projects its own.
+        qs = [step.q] + [torch.randn_like(step.q) for _ in range(layers - 1)]
+        plan = step.metadata(args.max_seqlen_kv)
+
+        def make_buffers():
+            # Plain tensors, mirroring what full_graph_qfa keeps per graph size.
+            return (
+                torch.empty_like(step.cu_seqlens_q),
+                torch.empty_like(step.seqused_kv),
+                torch.empty_like(step.block_table),
+                torch.empty_like(plan),
+            )
+
+        if not buffers_in_pool:
+            cu_buf, seq_buf, bt_buf, plan_buf = make_buffers()
+
+        graph = torch.npu.NPUGraph()
+        events = []
+        outs = []
+        with torch.npu.graph(graph, pool=pool) if pool is not None else torch.npu.graph(graph):
+            if buffers_in_pool:
+                cu_buf, seq_buf, bt_buf, plan_buf = make_buffers()
+            for layer in range(layers):
+                event = torch.npu.ExternalEvent()
+                event.wait(stream)
+                event.reset(stream)
+                events.append(event)
+                kwargs = step.op_kwargs(args.max_seqlen_kv, cu=cu_buf, seq=seq_buf)
+                step.q = qs[layer]
+                outs.append(qfa_call(step, quant, quant_v, bt_buf, plan_buf, kwargs, mask))
+            step.q = qs[0]
+        captured[size] = (step, qs, (cu_buf, seq_buf, bt_buf, plan_buf), graph, events, outs)
+        print(f"  captured size={size} batch={batch}", flush=True)
+
+    ok = True
+    update_stream = torch_npu.npu.Stream()
+    for size in sizes:
+        step, qs, (cu_buf, seq_buf, bt_buf, plan_buf), graph, events, outs = captured[size]
+        # A different step, the way the next decode would be.
+        step.reseed(args.seed + size + 1000)
+        for layer in range(1, layers):
+            qs[layer].copy_(torch.randn_like(qs[layer]))
+        plan = step.metadata(args.max_seqlen_kv)
+
+        refs = []
+        for layer in range(layers):
+            step.q = qs[layer]
+            refs.append(
+                qfa_call(
+                    step, quant, quant_v, step.block_table, plan,
+                    step.op_kwargs(args.max_seqlen_kv), mask,
+                ).cpu()
+            )
+        step.q = qs[0]
+        torch.npu.synchronize()
+
+        with torch.npu.stream(update_stream):
+            cu_buf.copy_(step.cu_seqlens_q)
+            seq_buf.copy_(step.seqused_kv)
+            bt_buf.copy_(step.block_table)
+            plan_buf.copy_(plan)
+            for event in events:
+                event.record(update_stream)
+        graph.replay()
+        torch.npu.synchronize()
+
+        bad = [i for i in range(layers) if not torch.equal(outs[i].cpu(), refs[i])]
+        print(f"  [size={size}] {layers - len(bad)}/{layers} layers bit-exact" + (f", first bad={bad[0]}" if bad else ""))
+        ok &= not bad
+    return ok
+
+
+def case_engine_inpool(args, quant, quant_v) -> bool:
+    return _engine_shaped(args, quant, quant_v, buffers_in_pool=True)
+
+
+def case_engine_outpool(args, quant, quant_v) -> bool:
+    return _engine_shaped(args, quant, quant_v, buffers_in_pool=False)
+
+
 def case_pool_mem(args, quant, quant_v) -> bool:
     _graph_roundtrip(args, quant, quant_v, args.max_seqlen_kv, report_memory=True)
     print("  [POOL-MEM] reports only; read the numbers above")
@@ -475,6 +600,8 @@ RUNNERS = {
     "QUANT-IN-GRAPH": case_quant_in_graph,
     "MAXKV": case_maxkv,
     "PREFILL-MAXKV": case_prefill_maxkv,
+    "ENGINE-INPOOL": case_engine_inpool,
+    "ENGINE-OUTPOOL": case_engine_outpool,
     "POOL-MEM": case_pool_mem,
 }
 
@@ -496,6 +623,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seqlen-kv", type=int, default=2048, help="capture constant")
     parser.add_argument("--max-model-len", type=int, default=133120, help="MAXKV's capture constant")
     parser.add_argument("--prefill-len", type=int, default=1594, help="PREFILL-MAXKV prompt length")
+    parser.add_argument("--layers", type=int, default=16, help="ENGINE-*: QFA ops per graph")
+    parser.add_argument("--sizes", default="4,8,16", help="ENGINE-*: graph sizes sharing one pool")
+    parser.add_argument("--kv-len-each", type=int, default=300, help="ENGINE-*: kv length per request")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
     parser.add_argument("--case-timeout", type=float, default=300.0)
