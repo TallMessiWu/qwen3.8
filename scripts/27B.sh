@@ -48,28 +48,26 @@ fi
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
-# Lower this to leave the aclgraph pool room. Capturing QFA needs roughly 1.28x
-# one attention layer's bf16 KV cache in transient tensors (measured by the
-# POOL-MEM case of scripts/debug/test_qfa_graph_capture_npu.py), which 0.95
-# leaves no space for. Both the cache and that requirement shrink together, so
-# giving back a few points frees more than it costs. Goes away with an MXFP8
-# cache, when the per-step quantization does.
+# 0.85 was needed while QFA quantized the whole KV cache on every step, which
+# cost the aclgraph pool about 1.28x one attention layer's bf16 cache in
+# transient tensors (POOL-MEM in scripts/debug/test_qfa_graph_capture_npu.py).
+# On junlin-qfa-graph that quantization is gone -- the cache is stored as MXFP8
+# -- so 0.95 may well fit again. Nobody has measured it since; if capture
+# reports no available memory, drop to 0.85 and say so.
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 
 # QFA=1 runs the causal full-attention path on the vendored QuantFlashAttn
-# instead of FIA (junlin-qfa branch, VLLM_ASCEND_ENABLE_QFA). The KV cache is
-# still bf16: K/V are quantized to MXFP8 on every step, so this saves no memory
-# yet -- it is the probe, not the destination. Prefix caching comes off because
-# the MXFP8 cache it is heading for shares E8M0 scales across tokens, which
-# shared blocks cannot track; a QFA-vs-FIA comparison therefore has to pass
-# --no-enable-prefix-caching to the baseline run as well, or the two differ by
-# more than the attention op.
-# GRAPH=0 turns off aclgraph capture (eager). QFA=1 covers prefill and eager
-# decode only: on this branch the captured decode graph still replays FIA, for
-# the target model as well as for the MTP drafter. Getting QuantFlashAttn into
-# the graph is the open subgoal -- the junlin-qfa-graph branch is where that is
-# being chased, and it crashes. MTP=0 turns off speculative decoding. Both
-# default to on.
+# instead of FIA (VLLM_ASCEND_ENABLE_QFA). It only takes effect on a C8-MXFP KV
+# cache -- the checkpoint's quant description has to say
+# kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL and carry a per-layer
+# v_proj.kv_cache_scale -- because that cache is the only thing QFA can read.
+# With a bf16 cache the flag is ignored and the run is the FIA baseline.
+# Prefix caching comes off because the MXFP8 cache shares E8M0 scales across
+# tokens, which shared blocks cannot track; a QFA-vs-FIA comparison therefore
+# has to pass --no-enable-prefix-caching to the baseline run as well, or the
+# two differ by more than the attention op.
+# GRAPH=0 turns off aclgraph capture (eager). MTP=0 turns off speculative
+# decoding. Both default to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
