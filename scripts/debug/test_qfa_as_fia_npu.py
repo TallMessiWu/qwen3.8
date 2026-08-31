@@ -27,9 +27,22 @@ construction and says nothing about correctness.
 Cases use the live 27B prefill/decode shapes (Nq=24 Nkv=4 D=256, block 128).
 Each runs in its own subprocess: an AICPU abort poisons the device.
 
+--bench times the two operators instead of comparing them, over the shapes the
+27B config actually produces. What it answers is "what will QFA be worth once
+the cache is MXFP8", which is measurable today: QFA reads MXFP8 whatever wrote
+it, so its main-op time is already the post-migration number. The on-the-fly
+quantization is timed separately rather than subtracted -- it is the cost that
+disappears, not part of the operator.
+
+Attention decode is bound by KV bandwidth and QFA reads half the bytes, so the
+interesting output is how the ratio moves with context length, not any single
+number.
+
 Usage (inside the serving container, no server running):
   python scripts/debug/test_qfa_as_fia_npu.py
   python scripts/debug/test_qfa_as_fia_npu.py --case dense
+  python scripts/debug/test_qfa_as_fia_npu.py --bench
+  python scripts/debug/test_qfa_as_fia_npu.py --bench --shape decode-b32-16k
 """
 
 import argparse
@@ -41,6 +54,24 @@ NQ, NKV, D, BLOCK, WINDOW = 24, 4, 256, 128, 64
 PREFILL_LEN = 1594
 DECODE_REQS, DECODE_KV = 4, 300
 CASES = ["dense", "paged"]
+
+# The shapes the live 27B config produces. Prefill is one request at a time with
+# q == kv (PrefillNoCache, TND); 16384 is max_num_batched_tokens, the largest
+# single chunk, and 1594 is the multimodal prompt that first exercised this.
+# Decode carries 1 + 3 MTP tokens per request, up to max_num_seqs=32, with kv
+# running out to max_model_len=133120.
+BENCH_SHAPES = [
+    ("prefill-512", "dense", 1, 512, 512),
+    ("prefill-1594", "dense", 1, PREFILL_LEN, PREFILL_LEN),
+    ("prefill-4k", "dense", 1, 4096, 4096),
+    ("prefill-16k", "dense", 1, 16384, 16384),
+    ("decode-b32-1k", "paged", 32, 4, 1024),
+    ("decode-b32-4k", "paged", 32, 4, 4096),
+    ("decode-b32-16k", "paged", 32, 4, 16384),
+    ("decode-b8-32k", "paged", 8, 4, 32768),
+    ("decode-b1-128k", "paged", 1, 4, 131072),
+]
+BENCH_NAMES = [row[0] for row in BENCH_SHAPES]
 
 
 def dequant_along_d(fp8, scale, d):
@@ -270,12 +301,194 @@ def run_case(name: str) -> int:
     return 0 if good else 1
 
 
+def _time(fn, iters: int, warmup: int) -> float:
+    """Mean seconds per call, timed as a block so launch overhead amortizes."""
+    import time
+
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.npu.synchronize()
+    return (time.perf_counter() - start) / iters
+
+
+def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters: int, warmup: int) -> int:
+    """Time FIA, QFA, the throwaway quantization, and the per-step metadata."""
+    import json
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_junlin_qfa_npu import bootstrap_ops
+
+    torch.npu.set_device(int(os.environ.get("QFA_DEVICE", "0")))
+    bootstrap_ops()
+
+    def _qfa_quant(x, d):
+        """Mirror of attention_v1._qfa_quant (see run_case)."""
+        fp8, scale = torch_npu.npu_dynamic_mx_quant(
+            x.reshape(-1, d), dst_type=torch.float8_e4m3fn, scale_alg=0)
+        return (
+            fp8.reshape(x.shape),
+            scale.view(torch.uint8).reshape(*x.shape[:-1], d // 64, 2).view(torch.float8_e8m0fnu),
+        )
+
+    paged = kind == "paged"
+    mask = torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1).npu()
+    total_q = batch * q_len
+    q = torch.randn(total_q, NQ, D, dtype=torch.bfloat16).npu()
+    cum_q = [(i + 1) * q_len for i in range(batch)]
+    kv_lens = [kv_len] * batch
+
+    if paged:
+        blocks_per_req = (kv_len + BLOCK - 1) // BLOCK
+        nb = batch * blocks_per_req
+        cache_k = torch.randn(nb, BLOCK, NKV * D, dtype=torch.bfloat16).npu()
+        cache_v = torch.randn(nb, BLOCK, NKV * D, dtype=torch.bfloat16).npu()
+        table = torch.arange(nb, dtype=torch.int32).reshape(batch, blocks_per_req).npu()
+        fia_key, fia_value = cache_k, cache_v
+        k_src = cache_k.reshape(nb, BLOCK, NKV, D)
+        v_src = cache_v.reshape(nb, BLOCK, NKV, D)
+        quant_kv = lambda: (_qfa_quant(k_src, D), quant_v_by_sequence(v_src))  # noqa: E731
+        kv_args = {"seqused_kv": torch.tensor(kv_lens, dtype=torch.int32).npu()}
+        layout_kv = "PA_BBND"
+        fia_kvlen = kv_lens
+    else:
+        key = torch.randn(total_q, NKV, D, dtype=torch.bfloat16).npu()
+        value = torch.randn(total_q, NKV, D, dtype=torch.bfloat16).npu()
+        table = None
+        fia_key, fia_value = key, value
+        quant_kv = lambda: (_qfa_quant(key, D), quant_v_by_sequence(value, kv_lens))  # noqa: E731
+        cum_kv = [(i + 1) * kv_len for i in range(batch)]
+        kv_args = {"cu_seqlens_kv": torch.tensor([0] + cum_kv, dtype=torch.int32).npu()}
+        layout_kv = "TND"
+        fia_kvlen = cum_kv
+
+    (k_fp8, k_descale), (v_fp8, v_descale) = quant_kv()
+    q_fp8, q_descale = _qfa_quant(q, D)
+    args = {
+        "cu_seqlens_q": torch.tensor([0] + cum_q, dtype=torch.int32).npu(),
+        "mask_mode": 3,
+        "max_seqlen_q": max(cum_q),
+        "max_seqlen_kv": kv_len,
+        "layout_q": "TND",
+        "layout_q_descale": "TND",
+        "layout_kv": layout_kv,
+        "layout_out": "TND",
+        **kv_args,
+    }
+
+    def call_metadata():
+        return torch.ops._C_ascend.npu_quant_flash_attn_metadata(
+            NQ, NKV, D, 1, v_descale=v_descale, **args)
+
+    metadata = call_metadata()
+    torch.npu.synchronize()
+
+    def call_qfa():
+        torch.ops._C_ascend.npu_quant_flash_attn(
+            q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale, 1,
+            block_table=table, attn_mask=mask, metadata=metadata,
+            softmax_scale=D ** -0.5, **args)
+
+    def call_fia():
+        torch_npu.npu_fused_infer_attention_score(
+            query=q, key=fia_key, value=fia_value, atten_mask=mask,
+            block_table=table, input_layout="TND", block_size=BLOCK,
+            actual_seq_lengths=cum_q, actual_seq_lengths_kv=fia_kvlen,
+            num_key_value_heads=NKV, num_heads=NQ, scale=D ** -0.5, sparse_mode=3)
+
+    def call_quant():
+        _qfa_quant(q, D)
+        quant_kv()
+
+    result = {
+        "shape": label,
+        "kind": kind,
+        "batch": batch,
+        "q_len": q_len,
+        "kv_len": kv_len,
+        "fia_ms": _time(call_fia, iters, warmup) * 1e3,
+        "qfa_ms": _time(call_qfa, iters, warmup) * 1e3,
+        "quant_ms": _time(call_quant, iters, warmup) * 1e3,
+        "metadata_ms": _time(call_metadata, iters, warmup) * 1e3,
+    }
+    print("BENCH-RESULT " + json.dumps(result), flush=True)
+    return 0
+
+
+def run_bench_sweep(args) -> int:
+    """One subprocess per shape: the big ones can OOM, and losing the whole
+    sweep to the last row would be a waste of a 20-minute setup."""
+    import json
+
+    rows = []
+    for label, *_rest in BENCH_SHAPES:
+        print(f"== {label}", flush=True)
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--shape", label,
+             "--iters", str(args.iters), "--warmup", str(args.warmup)],
+            capture_output=True, text=True,
+        )
+        line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("BENCH-RESULT ")), None)
+        if line:
+            rows.append(json.loads(line[len("BENCH-RESULT "):]))
+            last = rows[-1]
+            print(f"   FIA {last['fia_ms']:.3f} ms   QFA {last['qfa_ms']:.3f} ms", flush=True)
+        else:
+            tail = (proc.stdout + proc.stderr).strip().splitlines()
+            reason = tail[-1][:44] if tail else f"exit {proc.returncode}"
+            rows.append({"shape": label, "error": reason})
+            print(f"   FAILED: {reason}", flush=True)
+    _print_bench_table(rows)
+    return 0 if any("error" not in r for r in rows) else 1
+
+
+def _print_bench_table(rows: list) -> None:
+    head = f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'speedup':>9}{'quant ms':>10}{'today ms':>10}{'meta ms':>9}"
+    print("\n" + head)
+    print("-" * len(head))
+    for row in rows:
+        if row.get("error"):
+            print(f"{row['shape']:<16}{row['error']:>46}")
+            continue
+        today = row["qfa_ms"] + row["quant_ms"]
+        speedup = row["fia_ms"] / row["qfa_ms"] if row["qfa_ms"] else float("nan")
+        print(
+            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}{speedup:>8.2f}x"
+            f"{row['quant_ms']:>10.3f}{today:>10.3f}{row['metadata_ms']:>9.3f}"
+        )
+    print(
+        "\nspeedup = FIA / QFA, per attention layer -- this is the post-6.3 number,\n"
+        "  QFA reads MXFP8 whoever wrote it.\n"
+        "quant ms = quantizing the whole KV cache on the fly, per layer per step.\n"
+        "  It is what makes 'today ms' worse than FIA, and it disappears once the\n"
+        "  cache is stored as MXFP8. Not part of the operator; never subtract it.\n"
+        "meta ms = the AICPU plan, paid once per step for all layers, not per layer."
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", choices=CASES)
+    ap.add_argument("--bench", action="store_true", help="time the two operators instead of comparing")
+    ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
+    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
     if args.case:
         return run_case(args.case)
+    if args.shape:
+        row = next(r for r in BENCH_SHAPES if r[0] == args.shape)
+        return run_bench(*row, iters=args.iters, warmup=args.warmup)
+    if args.bench:
+        return run_bench_sweep(args)
 
     results = {}
     for case in CASES:
