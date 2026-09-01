@@ -50,6 +50,12 @@ Cases -- each changes exactly one thing against REAL:
                cache, then QFA reading that same cache -- all inside the one
                capture. Write-then-read of the same memory in one graph is
                the last structural difference the cases above leave out.
+  TILING-CHURN  --tiling-churn rounds of unrelated ops between capture and
+               replay. A captured kernel keeps the host tiling pointer it saw
+               at capture; FIA rebinds every replay via graph_task_update,
+               QFA cannot. Every other case here replays the same QFA call it
+               captured, so the tiling storage still holds capture's values --
+               the engine runs a whole model between the two.
   STALE-TABLE  the block table's unused columns carry real block ids rather
                than zeros, the way vLLM's reused buffer does. Zeros send any
                stray read to block 0, which is mapped and harmless.
@@ -120,6 +126,7 @@ CASES = (
     "INGRAPH-CACHE",
     "WRITE-IDEMPOTENT",
     "STALE-TABLE",
+    "TILING-CHURN",
 )
 
 # 27B.sh's default CAPTURE_SIZES.
@@ -715,6 +722,36 @@ def capture_size(
                 mask=mask, padding=padding, cache_write=cache_write)
 
 
+def churn_tiling(args) -> None:
+    """Run unrelated ops between capture and replay, to recycle CANN's host-side
+    tiling storage.
+
+    The fault dump names `tiling` at a host address (0x1200...) and carries an
+    argument word of 0xa5a5a5a5<junk> -- a freed-memory poison pattern. A
+    captured kernel keeps the tiling pointer it saw at capture time: FIA rebinds
+    its parameters every replay through graph_task_update, QFA has no .out()
+    variant and no task handle and cannot. If that storage is recycled in
+    between, replay reads someone else's tiling, and the per-core split
+    parameters become garbage -- which is what the fault addresses look like,
+    179MB to 748MB past a pool whose every legitimate argument sits within 64KB
+    of its base.
+
+    This has to be *other* ops. The eager reference above replays the very same
+    QFA call with the very same arguments, so it leaves the tiling storage
+    holding exactly what capture put there -- which is the most likely reason
+    every case here has been green while the engine, whose graph is preceded by
+    a whole model's worth of MoE/GDN/norm kernels, crashes.
+    """
+    if not args.tiling_churn:
+        return
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="npu")
+    for _ in range(args.tiling_churn):
+        y = torch.matmul(x, x)
+        y = torch.softmax(y.to(torch.float32), dim=-1)
+        x = (y.to(torch.bfloat16) + x) * 0.5
+    torch.npu.synchronize()
+
+
 def release_and_replay(step, buffers, events, graph, update_stream) -> list[tuple]:
     """One replay: refresh what the captured ops read, release them, replay.
 
@@ -851,6 +888,7 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
     # Cheap enough to keep on the green path: it is the only thing that says
     # whether the graph wrote where eager did.
     ks_before = cache.k_scale.clone() if cache_write is not None else None
+    churn_tiling(args)
 
     pairs = release_and_replay(step, buffers, events, graph, update_stream)
     mismatched = [p for p in pairs if p[0] != p[1]]
@@ -1002,6 +1040,13 @@ def case_ingraph_cache(args, quant_q) -> bool:
     return engine_repro(args, quant_q)
 
 
+def case_tiling_churn(args, quant_q) -> bool:
+    args = copy.copy(args)
+    args.tiling_churn = args.tiling_churn or 200
+    args.write_cache = True
+    return engine_repro(args, quant_q)
+
+
 def case_stale_table(args, quant_q) -> bool:
     args = copy.copy(args)
     args.stale_table = True
@@ -1096,6 +1141,7 @@ RUNNERS = {
     "INGRAPH-CACHE": case_ingraph_cache,
     "WRITE-IDEMPOTENT": case_write_idempotent,
     "STALE-TABLE": case_stale_table,
+    "TILING-CHURN": case_tiling_churn,
 }
 
 
@@ -1118,6 +1164,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seqlen-kv", type=int, default=133120, help="the constant baked at capture")
     parser.add_argument("--v-scale-fill", type=int, default=127, help="static V scale byte (127 = neutral)")
     parser.add_argument("--pool-pad-mb", type=int, default=0, help="live padding held inside the capture")
+    parser.add_argument(
+        "--tiling-churn",
+        type=int,
+        default=0,
+        help="rounds of unrelated ops between capture and replay, to recycle CANN's tiling storage",
+    )
     parser.add_argument("--tight-table", action="store_true", help="block table sized to kv_len only")
     parser.add_argument(
         "--stale-table",
