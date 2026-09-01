@@ -74,8 +74,9 @@ Usage (in the serving container, on the junlin-qfa-graph checkout):
   python scripts/debug/test_qfa_fullgraph_repro_npu.py --cases REAL
   python scripts/debug/test_qfa_fullgraph_repro_npu.py --cases POOL-FAT --pool-pad-mb 512
 
---model-config matters: num_heads is a shape the op tiles on, and guessing it
-tests a model nobody runs. Without it the default below is used and said so.
+--model-config is required: num_heads is a shape the op tiles on, and guessing
+it tests a model nobody serves. Pass --num-heads / --num-kv-heads / --head-dim
+instead only to sweep a shape deliberately.
 """
 
 from __future__ import annotations
@@ -193,27 +194,44 @@ def bootstrap(args):
     return lift_quant_q(find_attention_v1(args.attention_v1))
 
 
+HEAD_SHAPES = ("num_heads", "num_kv_heads", "head_dim")
+
+
 def apply_model_config(args) -> None:
-    """Take num_heads / num_kv_heads / head_dim from the checkpoint if given."""
+    """Fill the head shapes from the checkpoint. No defaults -- they are the model's.
+
+    A guessed head count tests a model nobody serves, and the op tiles on it, so
+    a missing --model-config is an error rather than a fallback. Explicit flags
+    still win, for sweeping a shape the checkpoint does not have.
+    """
+    given = {name: getattr(args, name) for name in HEAD_SHAPES if getattr(args, name) is not None}
     if not args.model_config:
-        print(
-            f"  [WARN] no --model-config: using num_heads={args.num_heads} "
-            f"num_kv_heads={args.num_kv_heads} head_dim={args.head_dim}, "
-            "which may not be the served model"
-        )
+        missing = [name for name in HEAD_SHAPES if name not in given]
+        if missing:
+            raise SystemExit(
+                f"pass --model-config <checkpoint>/config.json, or give {['--' + m.replace('_', '-') for m in missing]} "
+                "explicitly; these are the served model's shapes and there is no sane default"
+            )
+        print(f"  head shapes from flags only: {given}")
         return
+
     cfg = json.loads(pathlib.Path(args.model_config).read_text(encoding="utf-8"))
     # Qwen3.5 keeps the attention shapes under text_config on multimodal checkpoints.
     for key in ("text_config", "language_config", "llm_config"):
         if isinstance(cfg.get(key), dict):
             cfg = {**cfg, **cfg[key]}
-    args.num_heads = int(cfg.get("num_attention_heads", args.num_heads))
-    args.num_kv_heads = int(cfg.get("num_key_value_heads", args.num_kv_heads))
-    if cfg.get("head_dim"):
-        args.head_dim = int(cfg["head_dim"])
+    if args.num_heads is None:
+        args.num_heads = int(cfg["num_attention_heads"])
+    if args.num_kv_heads is None:
+        args.num_kv_heads = int(cfg["num_key_value_heads"])
+    if args.head_dim is None:
+        head_dim = cfg.get("head_dim") or cfg["hidden_size"] // int(cfg["num_attention_heads"])
+        args.head_dim = int(head_dim)
+    overridden = {name: value for name, value in given.items()}
     print(
         f"  from {args.model_config}: num_heads={args.num_heads} "
         f"num_kv_heads={args.num_kv_heads} head_dim={args.head_dim}"
+        + (f" (overridden on the command line: {overridden})" if overridden else "")
     )
 
 
@@ -723,10 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cases", default="EAGER-REF,REAL", help=f"comma-separated subset of {list(CASES)}")
     parser.add_argument("--case", help=argparse.SUPPRESS)  # child process entry
-    parser.add_argument("--model-config", help="checkpoint config.json; sets the head counts")
-    parser.add_argument("--num-heads", type=int, default=32)
-    parser.add_argument("--num-kv-heads", type=int, default=2)
-    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--model-config", help="checkpoint config.json; required unless the shapes below are given")
+    parser.add_argument("--num-heads", type=int, help="default: the checkpoint's")
+    parser.add_argument("--num-kv-heads", type=int, help="default: the checkpoint's")
+    parser.add_argument("--head-dim", type=int, help="default: the checkpoint's")
     parser.add_argument("--block-size", type=int, default=512, help="kernel block size (refresh_block_size)")
     parser.add_argument("--kv-len", type=int, default=1553, help="kv length per request")
     parser.add_argument("--q-len", type=int, default=1, help="tokens per request (1 + MTP drafts)")
@@ -771,6 +789,9 @@ def main() -> int:
     if unknown:
         print(f"[RED] unknown case(s) {unknown}; known: {list(RUNNERS)}")
         return 2
+    # Resolve the head shapes once here so a missing --model-config is one
+    # error, not the same error from every child.
+    apply_model_config(copy.copy(args))
 
     passthrough: list[str] = []
     skip = False
