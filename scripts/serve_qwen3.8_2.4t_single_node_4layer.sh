@@ -65,7 +65,19 @@ if ! grep -Fq '_uses_multimodal_rope' "$active_qwen_patch"; then
 fi
 echo "QWEN38_ROPE_DISPATCH=GREEN active_patch=$active_qwen_patch"
 if [[ "$QUANTIZATION" == "ascend" ]]; then
-    active_modelslim_config="${active_vllm_ascend_root}/quantization/modelslim_config.py"
+    # PR #14030 moved modelslim_config.py under quantization/configs/; keep the
+    # pre-refactor path as a fallback for older installs.
+    active_modelslim_config=""
+    for candidate in "configs/modelslim_config.py" "modelslim_config.py"; do
+        if [[ -r "${active_vllm_ascend_root}/quantization/${candidate}" ]]; then
+            active_modelslim_config="${active_vllm_ascend_root}/quantization/${candidate}"
+            break
+        fi
+    done
+    if [[ -z "$active_modelslim_config" ]]; then
+        echo "ERROR: cannot find modelslim_config.py under ${active_vllm_ascend_root}/quantization/." >&2
+        exit 2
+    fi
     if ! grep -Fq '"qwen3_5_moe_text"' "$active_modelslim_config"; then
         echo "ERROR: active vLLM-Ascend lacks the qwen3_5_moe_text ModelSlim packed mapping." >&2
         echo "Active config: $active_modelslim_config" >&2
