@@ -695,10 +695,88 @@ def capture_size(
                 mask=mask, padding=padding, cache_write=cache_write)
 
 
+def release_and_replay(step, buffers, events, graph, update_stream) -> list[tuple]:
+    """One replay: refresh what the captured ops read, release them, replay.
+
+    Returns the (buffer, source) shape pairs, since a batch replaying at a
+    different request count than it was captured at shows up there.
+    """
+    with torch.npu.stream(update_stream):
+        # The AICPU plan op ran on the default stream; without this the copy can
+        # outrun it and the captured op reads a half-written plan (253dd1d42).
+        update_stream.wait_event(step.plan_ready)
+        pairs = buffers.refresh(step)
+        for event in events:
+            event.record(update_stream)
+    # What AclGraphWrapper does before replay in FULL mode.
+    torch.npu.current_stream().synchronize()
+    graph.replay()
+    torch.npu.synchronize()
+    return pairs
+
+
+def eager_pass(args, layer_fn, cache: Cache, captured: dict) -> list[torch.Tensor]:
+    """Every layer's write-then-read, in capture order, run eagerly."""
+    step, qs, mask = captured["step"], captured["qs"], captured["mask"]
+    cache_write = captured["cache_write"]
+    out = []
+    for index, q in enumerate(qs):
+        if cache_write is not None:
+            # The engine's order: this step's K/V are quantized and written into
+            # the cache, then QFA reads that same cache.
+            cache_write.run(index, cache)
+        out.append(layer_fn(q, cache, step.block_table, step.metadata, step.op_kwargs(), mask).cpu())
+    torch.npu.synchronize()
+    return out
+
+
+def diagnose_mismatch(args, layer_fn, cache: Cache, captured, refs, bad, update_stream) -> None:
+    """Say which kind of RED this is. Three outcomes, three different bugs.
+
+    A moving eager baseline means the harness is at fault: the layers share one
+    cache, so each write has to land on exactly the slots the previous layer's
+    did. A nondeterministic replay means a race inside the graph. Both stable
+    but disagreeing means the graph and eager genuinely compute different
+    things -- the only one of the three that is about the engine.
+    """
+    step, outs = captured["step"], captured["outs"]
+    layer = bad[0]
+
+    got = outs[layer].cpu().to(torch.float32)
+    want = refs[layer].to(torch.float32)
+    diff = (got - want).abs()
+    per_token = diff.reshape(diff.shape[0], -1).max(dim=1).values
+    off = (per_token > 0).nonzero().flatten()
+    scale = want.abs().max().item() or 1.0
+    print(
+        f"      layer {layer}: max_abs_diff={diff.max().item():.6g} "
+        f"({diff.max().item() / scale:.3%} of peak), "
+        f"tokens differing {off.numel()}/{diff.shape[0]}"
+        + (f", first={off[0].item()}" if off.numel() else "")
+    )
+
+    second = eager_pass(args, layer_fn, cache, captured)
+    drift = [i for i in range(args.layers) if not torch.equal(second[i], refs[i])]
+    print(
+        f"      eager rerun: {args.layers - len(drift)}/{args.layers} match the first pass"
+        + ("  <- the baseline moves; a write is not landing idempotently" if drift else "")
+    )
+
+    first_replay = [o.cpu() for o in outs]
+    release_and_replay(step, captured["buffers"], captured["events"], captured["graph"], update_stream)
+    unstable = [i for i in range(args.layers) if not torch.equal(outs[i].cpu(), first_replay[i])]
+    print(
+        f"      replay rerun: {args.layers - len(unstable)}/{args.layers} match the first replay"
+        + ("  <- the graph is nondeterministic" if unstable else "")
+    )
+    if not drift and not unstable:
+        print("      both sides stable and disagreeing -- the graph computes something else")
+
+
 def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, update_stream) -> bool:
     """Mirror _update_qfa_graph_buffers + replay, then check against eager."""
     step, qs, buffers = captured["step"], captured["qs"], captured["buffers"]
-    graph, events, outs, mask = captured["graph"], captured["events"], captured["outs"], captured["mask"]
+    graph, events, outs = captured["graph"], captured["events"], captured["outs"]
     cache_write = captured["cache_write"]
 
     # A different step, the way the next decode would be.
@@ -711,33 +789,18 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
 
     # The eager reference runs the same in-graph cache writes, in the same
     # order, so both sides read a cache in the same state.
-    refs = []
-    for index, q in enumerate(qs):
-        if cache_write is not None:
-            cache_write.run(index, cache)
-        refs.append(layer_fn(q, cache, step.block_table, step.metadata, step.op_kwargs(), mask).cpu())
-    torch.npu.synchronize()
+    refs = eager_pass(args, layer_fn, cache, captured)
     # Proof the replay below actually re-runs the kernels rather than leaving
     # the capture-time outputs in place.
     before = outs[0].to(torch.float32).abs().sum().item()
 
-    with torch.npu.stream(update_stream):
-        # The AICPU plan op ran on the default stream; without this the copy can
-        # outrun it and the captured op reads a half-written plan (253dd1d42).
-        update_stream.wait_event(step.plan_ready)
-        pairs = buffers.refresh(step)
-        for event in events:
-            event.record(update_stream)
+    pairs = release_and_replay(step, buffers, events, graph, update_stream)
     mismatched = [p for p in pairs if p[0] != p[1]]
     print(
         f"    replay size={step.num_tokens} header={step.header()} "
         f"copy shapes {'ok' if not mismatched else mismatched}",
         flush=True,
     )
-    # What AclGraphWrapper does before replay in FULL mode.
-    torch.npu.current_stream().synchronize()
-    graph.replay()
-    torch.npu.synchronize()
 
     after = outs[0].to(torch.float32).abs().sum().item()
     print(
@@ -747,6 +810,8 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
     bad = [i for i in range(args.layers) if not torch.equal(outs[i].cpu(), refs[i])]
     print(f"    size={step.num_tokens}: {args.layers - len(bad)}/{args.layers} layers bit-exact"
           + (f", first bad={bad[0]}" if bad else ""))
+    if bad:
+        diagnose_mismatch(args, layer_fn, cache, captured, refs, bad, update_stream)
     return not bad
 
 
