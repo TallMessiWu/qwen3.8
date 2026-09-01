@@ -79,6 +79,15 @@ if [[ "${QFA:-0}" == "1" || "${NO_PREFIX_CACHE:-0}" == "1" ]]; then
     echo "prefix caching disabled." >&2
 fi
 
+# MAX_MODEL_LEN is what _qfa_max_seqlen_kv reads, and the captured
+# QuantFlashAttn bakes that constant in -- AdjustSinnerAndSouter tiles on it.
+# Lowering it is the only way to move that constant without touching code, and
+# the graph-capture crash reproduces nowhere else, so single-variable
+# experiments have to run here rather than in a standalone script.
+# MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+
 # CAPTURE_SIZES and CUDAGRAPH_MODE exist for single-variable graph experiments:
 # capturing one size answers whether a failure needs several graphs sharing a
 # pool, and PIECEWISE keeps attention out of the graph entirely.
@@ -104,9 +113,9 @@ exec vllm serve "$MODEL_PATH" \
     --port "$VLLM_PORT" \
     --data-parallel-size 1 \
     --tensor-parallel-size 1 \
-    --max-model-len 133120 \
+    --max-model-len "$MAX_MODEL_LEN" \
     --max-num-batched-tokens 16384 \
-    --max-num-seqs 32 \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --reasoning-parser qwen3 \
     --compilation-config "$compilation_config" \
