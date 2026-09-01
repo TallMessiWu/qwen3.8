@@ -119,6 +119,9 @@ SERVING_SIZES = (
     "96,100,104,108,112,116,120,124,128"
 )
 
+# 27B.sh's default, and not a detail: it visibly compacts the graph pool.
+DEFAULT_ALLOC_CONF = "expandable_segments:True"
+
 # mxfp_kv_cache.py's constants, restated so a mismatch surfaces as a shape
 # error here instead of as silent garbage.
 MXFP8_GROUP_SIZE = 32
@@ -913,6 +916,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tight-table", action="store_true", help="block table sized to kv_len only")
     parser.add_argument("--compiled", action="store_true", help="wrap the layer in torch.compile")
     parser.add_argument("--write-cache", action="store_true", help="write the cache inside the capture too")
+    parser.add_argument(
+        "--alloc-conf",
+        default=DEFAULT_ALLOC_CONF,
+        help="PYTORCH_NPU_ALLOC_CONF for the children; 27B.sh's value, and it moves the pool",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
     parser.add_argument("--case-timeout", type=float, default=900.0)
@@ -959,11 +967,28 @@ def main() -> int:
         elif not arg.startswith("--cases="):
             passthrough.append(arg)
 
+    # The allocator mode is not a detail here: this script exists to compare
+    # pool addresses against the server's, and 27B.sh exports
+    # expandable_segments:True, which visibly compacts them (the same four
+    # sizes spanned 57MB without it and 4MB with it). Set for the children
+    # rather than in-process, so it is in place before torch_npu initializes
+    # the allocator. An inherited value wins -- this only supplies the default.
+    env = dict(os.environ)
+    inherited = env.get("PYTORCH_NPU_ALLOC_CONF")
+    env.setdefault("PYTORCH_NPU_ALLOC_CONF", args.alloc_conf)
+    if inherited:
+        origin = "inherited from the environment"
+    elif args.alloc_conf != DEFAULT_ALLOC_CONF:
+        origin = "--alloc-conf"
+    else:
+        origin = "27B.sh's default"
+    print(f"  PYTORCH_NPU_ALLOC_CONF={env['PYTORCH_NPU_ALLOC_CONF']} ({origin})")
+
     results: dict[str, str] = {}
     for name in names:
         command = [sys.executable, os.path.abspath(__file__), "--case", name, *passthrough]
         try:
-            completed = subprocess.run(command, timeout=args.case_timeout)
+            completed = subprocess.run(command, timeout=args.case_timeout, env=env)
             results[name] = "GREEN" if completed.returncode == 0 else "RED"
         except subprocess.TimeoutExpired:
             print(f"  [{name}] TIMEOUT after {args.case_timeout}s -- likely a stalled event handshake")
