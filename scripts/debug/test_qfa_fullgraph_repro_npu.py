@@ -59,6 +59,11 @@ Cases -- each changes exactly one thing against REAL:
   STALE-TABLE  the block table's unused columns carry real block ids rather
                than zeros, the way vLLM's reused buffer does. Zeros send any
                stray read to block 0, which is mapped and harmless.
+  OUT-VARIANT  the new npu_quant_flash_attn.out overload: same bytes as the
+               allocating one, capturable inside graph_task_group, and
+               re-issuable before replay through graph_task_update. That is
+               the mechanism FIA replays through and QFA never had. Needs a
+               csrc rebuild; no kernel changed, so KEEP_BUILD=1 is enough.
   WRITE-IDEMPOTENT  no graph and no QFA: just the two cache writers, run
                twice on the same K/V and slots, then again after another
                layer overwrote them. Isolates "the eager baseline moves"
@@ -127,6 +132,7 @@ CASES = (
     "WRITE-IDEMPOTENT",
     "STALE-TABLE",
     "TILING-CHURN",
+    "OUT-VARIANT",
 )
 
 # 27B.sh's default CAPTURE_SIZES.
@@ -1074,6 +1080,113 @@ def _slot_snapshot(cache: Cache, slots: torch.Tensor, block_size: int) -> dict[s
     }
 
 
+def case_out_variant(args, quant_q) -> bool:
+    """Does the new .out overload work, and can it be replayed via task update?
+
+    Three checks in order, each worthless if the one before it failed:
+
+      1. .out() writes the same bytes the allocating overload returns.
+      2. It can be captured between graph_task_group_begin/end and yield a
+         handle -- that is what makes a captured call re-issuable at all.
+      3. graph_task_update re-runs it before replay against a *different* step,
+         and the replayed output matches that step run eagerly.
+
+    Step 3 is the point. It is the mechanism FIA replays through
+    (attention_v1.py:1288) and QFA has never had, and it needs no capture-owned
+    buffers: the update hands the graph this step's real tensors, so the
+    address-stability dance QFAGraphBuffers does becomes unnecessary.
+
+    Requires the .out overload -- rebuild csrc first (KEEP_BUILD=1 is enough,
+    no kernel changed).
+    """
+    import torch_npu
+
+    packet = torch.ops._C_ascend.npu_quant_flash_attn
+    if "out" not in packet.overloads():
+        print(f"    [RED] no .out overload registered; overloads={packet.overloads()}")
+        print("    rebuild: KEEP_BUILD=1 bash scripts/debug/pip_install_qfa.sh <worktree>")
+        return False
+    print(f"    overloads: {packet.overloads()}")
+
+    size = max(int(x) for x in args.sizes.split(",") if x.strip())
+    table_cols = math.ceil(args.max_model_len / args.block_size)
+    batch = max(1, size // args.q_len)
+    num_blocks = max(args.blocks, batch * math.ceil(args.kv_len / args.block_size) + 1)
+    cache = Cache(args, quant_q, num_blocks, args.seed)
+    step = DecodeStep(args, size, table_cols, num_blocks, args.seed + size)
+    mask = causal_mask()
+    q = torch.randn(step.num_tokens, args.num_heads, args.head_dim, dtype=torch.bfloat16, device="npu")
+
+    def call_out(step_, q_, out, lse):
+        q_fp8, q_descale = quant_q(q_, args.head_dim)
+        packet.out(
+            q_fp8,
+            cache.k,
+            cache.v,
+            q_descale,
+            cache.k_scale.view(torch.float8_e8m0fnu),
+            cache.v_scale.view(torch.float8_e8m0fnu),
+            1,
+            block_table=step_.block_table,
+            attn_mask=mask,
+            metadata=step_.metadata,
+            softmax_scale=1.0 / math.sqrt(args.head_dim),
+            attn_out=out,
+            softmax_lse=lse,
+            **step_.op_kwargs(),
+        )
+
+    # 1. same bytes as the allocating overload
+    want = qfa_call(args, quant_q, q, cache, step.block_table, step.metadata, step.op_kwargs(), mask)
+    out = torch.empty_like(want)
+    lse = torch.empty(0, dtype=torch.float32, device="npu")
+    call_out(step, q, out, lse)
+    torch.npu.synchronize()
+    if not torch.equal(out.cpu(), want.cpu()):
+        diff = (out.cpu().to(torch.float32) - want.cpu().to(torch.float32)).abs()
+        print(f"    [RED] .out differs from the allocating overload, max_abs_diff={diff.max().item():.6g}")
+        return False
+    print("    .out matches the allocating overload, bit-exact")
+
+    # 2. capture it inside a task group
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(graph, pool=pool):
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        torch.npu.graph_task_group_begin(stream)
+        call_out(step, q, out, lse)
+        handle = torch.npu.graph_task_group_end(stream)
+    print(f"    captured into a task group, handle={type(handle).__name__}")
+
+    # 3. rebind to a different step, then replay
+    cache.rewrite(quant_q, args, args.seed + 1000)
+    q.copy_(torch.randn_like(q))
+    step.advance(args.seed + 1000)
+    want2 = qfa_call(args, quant_q, q, cache, step.block_table, step.metadata, step.op_kwargs(), mask).cpu()
+    torch.npu.synchronize()
+
+    update_stream = torch_npu.npu.Stream()
+    with torch.npu.stream(update_stream):
+        update_stream.wait_event(step.plan_ready)
+        torch.npu.graph_task_update_begin(update_stream, handle)
+        call_out(step, q, out, lse)
+        torch.npu.graph_task_update_end(update_stream)
+        event.record(update_stream)
+    torch.npu.current_stream().synchronize()
+    graph.replay()
+    torch.npu.synchronize()
+
+    if torch.equal(out.cpu(), want2):
+        print("    replay after graph_task_update is bit-exact against eager")
+        return True
+    diff = (out.cpu().to(torch.float32) - want2.to(torch.float32)).abs()
+    print(f"    [RED] replay differs, max_abs_diff={diff.max().item():.6g}")
+    return False
+
+
 def case_write_idempotent(args, quant_q) -> bool:
     """Does a layer's cache write land identically when repeated? No graph, no QFA.
 
@@ -1140,6 +1253,7 @@ RUNNERS = {
     "COMPILED": case_compiled,
     "INGRAPH-CACHE": case_ingraph_cache,
     "WRITE-IDEMPOTENT": case_write_idempotent,
+    "OUT-VARIANT": case_out_variant,
     "STALE-TABLE": case_stale_table,
     "TILING-CHURN": case_tiling_churn,
 }
