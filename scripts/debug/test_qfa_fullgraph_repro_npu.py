@@ -45,6 +45,11 @@ Cases -- each changes exactly one thing against REAL:
                past the furthest buffer; a small pool may not reach far enough
                to fault at all.
   SIZES-ALL    every capture size 27B.sh passes, sharing one pool.
+  INGRAPH-CACHE the engine's real per-layer order: this step's K/V quantized,
+               reshape_and_cache and scatter_mxfp_k_scale_cache writing the
+               cache, then QFA reading that same cache -- all inside the one
+               capture. Write-then-read of the same memory in one graph is
+               the last structural difference the cases above leave out.
   COMPILED     the QFA call wrapped in torch.compile(backend="eager") before
                capture. vllm-ascend sets use_inductor=False, so eager-backend
                Dynamo is the honest approximation of the compiled region -- an
@@ -105,6 +110,7 @@ CASES = (
     "POOL-FAT",
     "SIZES-ALL",
     "COMPILED",
+    "INGRAPH-CACHE",
 )
 
 # 27B.sh's default CAPTURE_SIZES.
@@ -195,6 +201,101 @@ def bootstrap(args):
 
 
 HEAD_SHAPES = ("num_heads", "num_kv_heads", "head_dim")
+
+
+def load_cache_writers():
+    """The two cache writers the engine runs inside the graph, ahead of QFA.
+
+    mxfp_kv_cache is plain torch/torch_npu and imports cleanly. DeviceOperator
+    does not always -- device_op -> ops/__init__ -> moe_mlp -> device_op is a
+    cycle outside the engine's import order -- so its K/V writer falls back to
+    the op BaseDeviceAdaptor calls, which is what an A5 resolves to anyway.
+    """
+    import torch_npu
+    from vllm_ascend.device.mxfp_kv_cache import scatter_mxfp_k_scale_cache
+
+    try:
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        write_kv = DeviceOperator.reshape_and_cache
+        print("  cache writer: DeviceOperator.reshape_and_cache")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  cache writer: npu_scatter_pa_kv_cache (DeviceOperator unimportable: {type(exc).__name__})")
+
+        def write_kv(key, value, key_cache, value_cache, slot_mapping):
+            torch_npu.npu_scatter_pa_kv_cache(
+                key=key.contiguous(),
+                value=value.contiguous(),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mapping=slot_mapping.contiguous(),
+                cache_mode="Norm",
+            )
+
+    return write_kv, scatter_mxfp_k_scale_cache
+
+
+class InGraphCacheWrite:
+    """What the engine does inside the graph before QFA reads the cache.
+
+    forward() quantizes this step's K and V, calls reshape_and_cache and
+    scatter_mxfp_k_scale_cache, and only then reaches full_graph_qfa -- all in
+    one captured region, writing and reading the same cache memory. The V scale
+    plane is not written: save_v_scale_flag makes that a one-off at load time.
+
+    slot_mapping is a capture-owned buffer for the same reason the lengths are:
+    the graph fixes its address, and replay only refreshes the contents.
+    """
+
+    def __init__(self, args, step, layers: int, writers):
+        self.args = args
+        self.write_kv, self.scatter_k_scale = writers
+        n, d = args.num_kv_heads, args.head_dim
+        # One K/V per layer, as the engine has: each layer projects its own.
+        self.keys = [
+            torch.randn(step.num_tokens, n, d, dtype=torch.bfloat16, device="npu") for _ in range(layers)
+        ]
+        self.values = [torch.randn_like(k) for k in self.keys]
+        # v_cache_scale_float_reciprocal, flat because the cache's V scale is
+        # the neutral 127 -- see Cache.
+        self.v_recip = torch.ones(n * d, dtype=torch.float32, device="npu")
+        self.slot_buf: torch.Tensor | None = None
+
+    def allocate(self, step) -> None:
+        """Inside the capture, next to the other buffers.
+
+        Zeroed rather than empty like the others: capture records without
+        executing, so the contents never matter there -- but these are indices,
+        and slot 0 is at least in range if anything ever does read them.
+        """
+        self.slot_buf = torch.zeros_like(step.slot_mapping())
+
+    def run(self, layer: int, cache: Cache) -> None:
+        """Inside the capture, once per layer, before that layer's QFA call."""
+        import torch_npu
+
+        key = self.keys[layer]
+        key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(key, dst_type=torch.float8_e4m3fn)
+        value = self.values[layer]
+        value_mxfp8 = torch_npu.npu_quantize(
+            value.view(value.shape[0], -1), self.v_recip, None, torch.float8_e4m3fn, -1, False
+        )
+        self.write_kv(
+            key=key_mxfp8,
+            value=value_mxfp8.view(value.shape),
+            key_cache=cache.k,
+            value_cache=cache.v,
+            slot_mapping=self.slot_buf,
+        )
+        # Byte view: index_put_ on float8 errors or falls back to AICPU.
+        self.scatter_k_scale(key_scale.view(torch.uint8), cache.k_scale, self.slot_buf, self.args.block_size)
+
+    def refresh(self, step) -> None:
+        """Before replay: new K/V and the slots this step writes them to."""
+        self.slot_buf.copy_(step.slot_mapping())
+        for key, value in zip(self.keys, self.values):
+            key.copy_(torch.randn_like(key))
+            value.copy_(torch.randn_like(value))
 
 
 def apply_model_config(args) -> None:
@@ -393,6 +494,17 @@ class DecodeStep:
         """(sectionNum, isFd, mBaseSize, s2BaseSize) -- quant_flash_attn_metadata.h."""
         return tuple(self.metadata[:4].tolist())
 
+    def slot_mapping(self) -> torch.Tensor:
+        """Where this step's K/V land: the last q_len positions of each sequence."""
+        table = self.block_table.cpu()
+        block_size = self.args.block_size
+        slots = []
+        for i in range(self.batch):
+            for j in range(self.args.q_len):
+                pos = max(0, self.kv_lens[i] - self.args.q_len + j)
+                slots.append(int(table[i, pos // block_size]) * block_size + pos % block_size)
+        return torch.tensor(slots, dtype=torch.int32, device="npu")
+
 
 def qfa_call(args, quant_q, q, cache: Cache, block_table, metadata, op_kwargs, mask) -> torch.Tensor:
     """Mirrors AscendC8MXFPAttentionBackendImpl._qfa_paged_call.
@@ -491,10 +603,11 @@ def report_graph_breaks() -> None:
 
 
 def capture_size(
-    args, quant_q, cache: Cache, layer_fn, pool, size: int, table_cols: int, num_blocks: int
+    args, quant_q, cache: Cache, layer_fn, pool, size: int, table_cols: int, num_blocks: int, writers=None
 ):
     """Capture --layers QFA ops for one graph size, the way full_graph_qfa does."""
     step = DecodeStep(args, size, table_cols, num_blocks, args.seed + size)
+    cache_write = InGraphCacheWrite(args, step, args.layers, writers) if writers else None
     qs = [
         torch.randn(step.num_tokens, args.num_heads, args.head_dim, dtype=torch.bfloat16, device="npu")
         for _ in range(args.layers)
@@ -521,6 +634,8 @@ def capture_size(
         # full_graph_qfa is called from inside the captured forward.
         stream = torch.npu.current_stream()
         buffers = Buffers(step)
+        if cache_write is not None:
+            cache_write.allocate(step)
         if args.pool_pad_mb:
             # Held, not dropped: the point is to push q and the output far away
             # from the buffers inside the pool, the way a whole model's worth of
@@ -537,6 +652,11 @@ def capture_size(
         # the graph, and at replay they would read capture-time sources that are
         # long gone.
         for index in range(args.layers):
+            if cache_write is not None:
+                # The engine's order: this step's K/V are quantized and written
+                # into the cache, then QFA reads that same cache -- both inside
+                # the graph.
+                cache_write.run(index, cache)
             outs.append(
                 layer_fn(
                     qs[index],
@@ -555,25 +675,34 @@ def capture_size(
         flush=True,
     )
     return dict(step=step, qs=qs, buffers=buffers, graph=graph, events=events, outs=outs,
-                mask=mask, padding=padding)
+                mask=mask, padding=padding, cache_write=cache_write)
 
 
 def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, update_stream) -> bool:
     """Mirror _update_qfa_graph_buffers + replay, then check against eager."""
     step, qs, buffers = captured["step"], captured["qs"], captured["buffers"]
     graph, events, outs, mask = captured["graph"], captured["events"], captured["outs"], captured["mask"]
+    cache_write = captured["cache_write"]
 
     # A different step, the way the next decode would be.
     cache.rewrite(quant_q, args, args.seed + step.num_tokens + 1000)
     for q in qs:
         q.copy_(torch.randn_like(q))
     step.advance(args.seed + step.num_tokens + 1000)
+    if cache_write is not None:
+        cache_write.refresh(step)
 
-    refs = [
-        layer_fn(q, cache, step.block_table, step.metadata, step.op_kwargs(), mask).cpu()
-        for q in qs
-    ]
+    # The eager reference runs the same in-graph cache writes, in the same
+    # order, so both sides read a cache in the same state.
+    refs = []
+    for index, q in enumerate(qs):
+        if cache_write is not None:
+            cache_write.run(index, cache)
+        refs.append(layer_fn(q, cache, step.block_table, step.metadata, step.op_kwargs(), mask).cpu())
     torch.npu.synchronize()
+    # Proof the replay below actually re-runs the kernels rather than leaving
+    # the capture-time outputs in place.
+    before = outs[0].to(torch.float32).abs().sum().item()
 
     with torch.npu.stream(update_stream):
         # The AICPU plan op ran on the default stream; without this the copy can
@@ -593,6 +722,11 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
     graph.replay()
     torch.npu.synchronize()
 
+    after = outs[0].to(torch.float32).abs().sum().item()
+    print(
+        f"    replay rewrote out[0]: {before:.8g} -> {after:.8g}"
+        + ("" if before != after else "  [WARN] unchanged -- did anything get captured?")
+    )
     bad = [i for i in range(args.layers) if not torch.equal(outs[i].cpu(), refs[i])]
     print(f"    size={step.num_tokens}: {args.layers - len(bad)}/{args.layers} layers bit-exact"
           + (f", first bad={bad[0]}" if bad else ""))
@@ -620,6 +754,7 @@ def engine_repro(args, quant_q) -> bool:
     )
 
     layer_fn = make_layer_fn(args, quant_q, args.compiled)
+    writers = load_cache_writers() if args.write_cache else None
     try:
         pool = torch.npu.graph_pool_handle()
         print(f"    shared graph pool: {pool}")
@@ -629,7 +764,9 @@ def engine_repro(args, quant_q) -> bool:
 
     captured = {}
     for size in sizes:
-        captured[size] = capture_size(args, quant_q, cache, layer_fn, pool, size, table_cols, num_blocks)
+        captured[size] = capture_size(
+            args, quant_q, cache, layer_fn, pool, size, table_cols, num_blocks, writers
+        )
 
     update_stream = torch.npu.Stream()
     ok = True
@@ -717,6 +854,12 @@ def case_sizes_all(args, quant_q) -> bool:
     return engine_repro(args, quant_q)
 
 
+def case_ingraph_cache(args, quant_q) -> bool:
+    args = copy.copy(args)
+    args.write_cache = True
+    return engine_repro(args, quant_q)
+
+
 def case_compiled(args, quant_q) -> bool:
     args = copy.copy(args)
     args.compiled = True
@@ -733,6 +876,7 @@ RUNNERS = {
     "POOL-FAT": case_pool_fat,
     "SIZES-ALL": case_sizes_all,
     "COMPILED": case_compiled,
+    "INGRAPH-CACHE": case_ingraph_cache,
 }
 
 
@@ -757,6 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pool-pad-mb", type=int, default=0, help="live padding held inside the capture")
     parser.add_argument("--tight-table", action="store_true", help="block table sized to kv_len only")
     parser.add_argument("--compiled", action="store_true", help="wrap the layer in torch.compile")
+    parser.add_argument("--write-cache", action="store_true", help="write the cache inside the capture too")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--attention-v1", help="path to attention_v1.py (default: the installed one)")
     parser.add_argument("--case-timeout", type=float, default=900.0)
