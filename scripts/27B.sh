@@ -79,10 +79,17 @@ if [[ "${QFA:-0}" == "1" || "${NO_PREFIX_CACHE:-0}" == "1" ]]; then
     echo "prefix caching disabled." >&2
 fi
 
-compilation_config='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128],"cudagraph_mode":"FULL_DECODE_ONLY"}'
+# CAPTURE_SIZES and CUDAGRAPH_MODE exist for single-variable graph experiments:
+# capturing one size answers whether a failure needs several graphs sharing a
+# pool, and PIECEWISE keeps attention out of the graph entirely.
+capture_sizes="${CAPTURE_SIZES:-1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128}"
+cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\"}"
 if [[ "${GRAPH:-1}" == "0" ]]; then
     compilation_config='{"cudagraph_mode":"NONE"}'
     echo "aclgraph capture disabled (GRAPH=0)." >&2
+else
+    echo "aclgraph: mode=$cudagraph_mode sizes=[$capture_sizes]" >&2
 fi
 
 spec_args=(--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}')
