@@ -50,6 +50,10 @@ Cases -- each changes exactly one thing against REAL:
                cache, then QFA reading that same cache -- all inside the one
                capture. Write-then-read of the same memory in one graph is
                the last structural difference the cases above leave out.
+  WRITE-IDEMPOTENT  no graph and no QFA: just the two cache writers, run
+               twice on the same K/V and slots, then again after another
+               layer overwrote them. Isolates "the eager baseline moves"
+               from anything the graph or the attention op does.
   COMPILED     the QFA call wrapped in torch.compile(backend="eager") before
                capture. vllm-ascend sets use_inductor=False, so eager-backend
                Dynamo is the honest approximation of the compiled region -- an
@@ -111,6 +115,7 @@ CASES = (
     "SIZES-ALL",
     "COMPILED",
     "INGRAPH-CACHE",
+    "WRITE-IDEMPOTENT",
 )
 
 # 27B.sh's default CAPTURE_SIZES.
@@ -765,11 +770,16 @@ def diagnose_mismatch(args, layer_fn, cache: Cache, captured, refs, bad, update_
     first_replay = [o.cpu() for o in outs]
     release_and_replay(step, captured["buffers"], captured["events"], captured["graph"], update_stream)
     unstable = [i for i in range(args.layers) if not torch.equal(outs[i].cpu(), first_replay[i])]
+    # The eager rerun above wrote the cache too, so once the baseline moves
+    # this comparison inherits the same contamination and proves nothing.
     print(
         f"      replay rerun: {args.layers - len(unstable)}/{args.layers} match the first replay"
-        + ("  <- the graph is nondeterministic" if unstable else "")
+        + ("  (not conclusive while the baseline moves)" if drift else "")
+        + ("  <- the graph is nondeterministic" if unstable and not drift else "")
     )
-    if not drift and not unstable:
+    if drift:
+        print("      fix the baseline first: run the WRITE-IDEMPOTENT case")
+    elif not unstable:
         print("      both sides stable and disagreeing -- the graph computes something else")
 
 
@@ -948,6 +958,75 @@ def case_compiled(args, quant_q) -> bool:
     return engine_repro(args, quant_q)
 
 
+def _slot_snapshot(cache: Cache, slots: torch.Tensor, block_size: int) -> dict[str, torch.Tensor]:
+    """The three planes a cache write touches, at just this step's slots.
+
+    Byte views for K and V: indexing float8 either errors or falls back to
+    AICPU. v_scale is left out because nothing writes it after load
+    (save_v_scale_flag).
+    """
+    blocks, offsets = slots // block_size, slots % block_size
+    return {
+        "k": cache.k.view(torch.uint8)[blocks, offsets].clone().cpu(),
+        "v": cache.v.view(torch.uint8)[blocks, offsets].clone().cpu(),
+        "k_scale": cache.k_scale[blocks, offsets].clone().cpu(),
+    }
+
+
+def case_write_idempotent(args, quant_q) -> bool:
+    """Does a layer's cache write land identically when repeated? No graph, no QFA.
+
+    INGRAPH-CACHE's eager baseline moves between two identical passes, and the
+    only thing that can do that is a write not landing where the previous one
+    did. This isolates it: same K/V, same slots, no capture, no attention --
+    just the two writers the engine runs, and the three planes they touch.
+
+    Two comparisons, because the harness does two different things:
+      repeat   run(0) twice in a row -- plain idempotence.
+      overwrite  run(0), run(1), run(0) -- what eager_pass actually does, since
+                 every layer here shares one cache and writes the same slots.
+                 The engine never does this: each of its layers owns a cache.
+    A RED on `repeat` alone is about the writers; a RED only on `overwrite` is
+    about that shared-cache simplification and nothing else.
+    """
+    args = copy.copy(args)
+    args.write_cache = True
+    writers = load_cache_writers()
+    size = max(int(x) for x in args.sizes.split(",") if x.strip())
+    table_cols = math.ceil(args.max_model_len / args.block_size)
+    batch = max(1, size // args.q_len)
+    num_blocks = max(args.blocks, batch * math.ceil(args.kv_len / args.block_size) + 1)
+
+    cache = Cache(args, quant_q, num_blocks, args.seed)
+    step = DecodeStep(args, size, table_cols, num_blocks, args.seed + size)
+    writer = InGraphCacheWrite(args, step, args.layers, writers)
+    # No capture here, so allocate is just where the slot buffer comes from.
+    writer.allocate(step)
+    writer.refresh(step)
+    slots = step.slot_mapping().to(torch.long)
+    print(f"    size={size} batch={batch} slots={slots.numel()} distinct={slots.unique().numel()}")
+
+    writer.run(0, cache)
+    torch.npu.synchronize()
+    first = _slot_snapshot(cache, slots, args.block_size)
+
+    writer.run(0, cache)
+    torch.npu.synchronize()
+    repeat = _slot_snapshot(cache, slots, args.block_size)
+
+    writer.run(1, cache)
+    writer.run(0, cache)
+    torch.npu.synchronize()
+    overwrite = _slot_snapshot(cache, slots, args.block_size)
+
+    ok = True
+    for name, later in (("repeat", repeat), ("overwrite", overwrite)):
+        bad = [plane for plane in first if not torch.equal(first[plane], later[plane])]
+        print(f"    {name}: {'all planes identical' if not bad else 'differs in ' + ','.join(bad)}")
+        ok &= not bad
+    return ok
+
+
 RUNNERS = {
     "EAGER-REF": case_eager_ref,
     "REAL": case_real,
@@ -959,6 +1038,7 @@ RUNNERS = {
     "SIZES-ALL": case_sizes_all,
     "COMPILED": case_compiled,
     "INGRAPH-CACHE": case_ingraph_cache,
+    "WRITE-IDEMPOTENT": case_write_idempotent,
 }
 
 
