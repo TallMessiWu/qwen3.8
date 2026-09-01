@@ -264,11 +264,17 @@ class InGraphCacheWrite:
     def allocate(self, step) -> None:
         """Inside the capture, next to the other buffers.
 
+        Sized, not computed: the slots are a host-side derivation and building
+        them here used to read the block table back, which a capturing stream
+        refuses outright (EE1016, "operation not permitted when a stream is
+        capturing"). The length is num_tokens either way, and refresh() fills
+        it before every replay.
+
         Zeroed rather than empty like the others: capture records without
         executing, so the contents never matter there -- but these are indices,
         and slot 0 is at least in range if anything ever does read them.
         """
-        self.slot_buf = torch.zeros_like(step.slot_mapping())
+        self.slot_buf = torch.zeros(step.num_tokens, dtype=torch.int32, device="npu")
 
     def run(self, layer: int, cache: Cache) -> None:
         """Inside the capture, once per layer, before that layer's QFA call."""
@@ -436,6 +442,7 @@ class DecodeStep:
         for i in range(self.batch):
             start = (i * used) % max(1, num_blocks - used)
             table[i, :used] = torch.arange(start, start + used, dtype=torch.int32)
+        self.block_table_cpu = table
         self.block_table = table.to(dev)
 
         self.cu_seqlens_q = torch.tensor(
@@ -495,8 +502,12 @@ class DecodeStep:
         return tuple(self.metadata[:4].tolist())
 
     def slot_mapping(self) -> torch.Tensor:
-        """Where this step's K/V land: the last q_len positions of each sequence."""
-        table = self.block_table.cpu()
+        """Where this step's K/V land: the last q_len positions of each sequence.
+
+        Reads the host-side copy of the table rather than the device one: a D2H
+        read is a stream synchronize, and a capturing stream refuses it.
+        """
+        table = self.block_table_cpu
         block_size = self.args.block_size
         slots = []
         for i in range(self.batch):
