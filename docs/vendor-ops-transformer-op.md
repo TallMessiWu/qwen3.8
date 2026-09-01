@@ -227,16 +227,66 @@ inline char *InternedLayout(c10::string_view layout)
 
 同样的坑在 `msa_index_score_torch_adpt.h` 里也有注释记录，是个反复出现的模式。
 
+**坑五：只写分配式重载，图捕获就没有退路。** aclnn 接口本来就是 out 语义——
+`aclnnXxxGetWorkspaceSize` 末尾那几个 tensor 参数就是输出，由调用者提供
+（QFA 是 `attnOut` / `softmaxLseOptional`，FIA 是 `attentionOut` / `softmaxLse`）。
+在 adpt 里用 `at::empty` 替调用者分配当然能跑，但那样 torch 侧就只剩一个「返回新张量」的
+重载，而 `torch.npu.graph_task_group` / `graph_task_update`——aclgraph 里 replay 时重发
+调用、**连 tiling 一起换**的唯一手段——要求输出是调用者（也就是图）持有的内存。没有 out
+重载就用不了它。
+
+QFA 就栽在这：vendor 时只写了分配式重载，后来为了让捕获的算子读到新数据，自己发明了
+「捕获期自持 buffer + 每步 `copy_` 刷内容」的替代方案。那套在真机上必崩
+（AI Core 野指针，故障地址在图池基址 +179MB~748MB，而所有合法入参都在 +64KB 以内），
+排查了很多轮才发现问题在 binding 不在算子——期间一度准备把「QFA 可能不支持 aclgraph」
+当结论去问算子团队，方向完全错了。
+
+补 out 变体是 20 行薄封装，不碰 kernel，跳过 shape 推导直接下发：
+
+```cpp
+std::tuple<at::Tensor, at::Tensor> npu_xxx_out(
+    /* 与分配式重载完全相同的入参 */,
+    at::Tensor &attn_out, at::Tensor &softmax_lse)
+{
+    /* 同样的 TORCH_CHECK 与 InternedLayout */
+    EXEC_NPU_CMD(aclnnXxx, ..., attn_out, softmax_lse);
+    return std::make_tuple(attn_out, softmax_lse);
+}
+```
+
+⇒ **vendor 任何可能进图的算子，binding 一开始就出两个重载**：分配式给 eager 用，
+out 变体给图捕获用，共用同一行 `EXEC_NPU_CMD`。这是个主动检查项，别等撞了图捕获才发现。
+参考：torch_npu 里 49 个 attention 算子只有 4 个有 out 变体，恰好都是要进 aclgraph 的
+（`npu_fused_infer_attention_score{,_v2}`、`npu_fusion_attention{,_grad}_v3`）。
+
 ### `torch_binding.cpp`
 
 include 头文件 + `ops.def` 写 schema + `ops.impl` 绑到 `torch::kPrivateUse1`。
 schema 里可选参数一律 `Tensor?`，带默认值的放 `*,` 之后。
+
+要进图的算子再 def 一个 `.out` overload（见坑五）：out 张量放最后、标 `Tensor(a!)`
+表示原地写，返回同样的别名。
+
+```cpp
+ops.def(
+    "npu_xxx.out(Tensor q, ..., bool return_softmax_lse=False,"
+    "            Tensor(a!) attn_out, Tensor(b!) softmax_lse)"
+    " -> (Tensor(a!), Tensor(b!))"
+);
+ops.impl("npu_xxx.out", torch::kPrivateUse1, &vllm_ascend::npu_xxx_out);
+```
+
+之后 Python 侧 `torch.ops._C_ascend.npu_xxx.out(...)` 可用，
+`torch.ops._C_ascend.npu_xxx.overloads()` 会多出 `'out'`——这是最快的自检。
 
 ### `torch_binding_meta.cpp`
 
 meta 实现（只算 shape、不碰数据）+ `ops.impl` 绑到 `Meta`。
 **图模式必需**——没有 meta 实现，torch.compile / ACL graph 追踪会直接失败。
 逻辑就是 adpt 里 shape 计算部分的 symint 版本，用 `sym_size` / `at::empty_symint`。
+
+出了 out 重载就要一并给它 meta 实现，注册到 `"npu_xxx.out"`。它没有 shape 要推——
+输出是调用者给的，原样返回即可。
 
 ---
 
@@ -268,23 +318,53 @@ else:
     attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(...)
 ```
 
-3. **图捕获路径**（`full_graph_qfa` + `_update_qfa_graph_buffers`）。
-   QFA 与 FIA 的图捕获机制不同：FIA 靠 `graph_task_update` 在 replay 时重绑参数，
-   QFA 不需要 workspace、不需要 task-group handle，只要在 replay 前把 capture 持有的
-   buffer 内容刷新掉，再放 event 闸门。
+3. **图捕获路径**（`full_graph_qfa` + `_update_qfa_graph_params`）。
+   **与 FIA 用同一套机制**，别另起炉灶（我们试过，见坑五）：捕获时把 `.out()` 调用包进
+   `graph_task_group_begin/end` 拿 handle，把这次调用的张量记进 `graph_params.qfa_params`；
+   replay 前 `graph_task_update_begin(update_stream, handle)` → 用**本步的**张量重发整个
+   调用 → `graph_task_update_end` → `event.record`。aclnn 每次调用都重算 tiling，所以这样
+   连 tiling 一起换掉了，而不只是重绑地址。
+
+   只有那些图内每步自己重算的中间量（QFA 的 `q_fp8` / `q_descale`，由图内量化从本步 query
+   产出）原样回传——它们的地址本就该固定。
+
+   **draft 模型走同一条路**。MTP 把 N 个 draft 步并进一张图，捕获顺序是「第 0 步的各层、
+   第 1 步的各层……」，replay 时把 `draft_attn_metadatas` 按 `(draft_step, key)` 展平就能
+   逐个对上（`_qfa_steps_per_op`）。两处必须注意：graph params 要按 `is_draft_model` /
+   `is_draft_model_prefill` 选对应注册表（读 target 的会释放没人 record 的 event，
+   表现为死锁）；每个 draft 步有自己的 plan，等 `plan_ready` 要放进循环里。
 
 ### `vllm_ascend/compilation/acl_graph.py`
 
-`GraphParams` 加字段存 capture 持有的 buffer 和 event，**带默认值**，
+`GraphParams` 加字段存捕获下来的 params / handles / events，**带默认值**，
 免得改到已有的位置构造调用：
 
 ```python
-qfa_buffers: dict[int, Any] = field(default_factory=dict)
+qfa_params: dict[int, list[Any]] = field(default_factory=dict)
+qfa_handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]] = field(default_factory=dict)
 qfa_events: dict[int, list[torch.npu.ExternalEvent]] = field(default_factory=dict)
 ```
 
-> **当前状态提醒**：`junlin-qfa` 上 prefill 与 eager decode 走 QFA，**图里跑的仍是 FIA**。
-> 进图实验在 `junlin-qfa-graph`，会崩，未解决。图捕获那部分代码可以读，别当成已验证的样板。
+自带一套而不是复用 FIA 的 `attn_params` / `handles` / `events`，是因为那三个的 tuple
+布局是 FIA 的。QFA 不需要 `workspaces`。
+
+> **当前状态**：`junlin-qfa-graph` 上 QFA + MXFP8 KV cache + MTP + FULL 图**全开可服务**
+> （2026-09-01 实机，Qwen3.5-35B-A3B-mxfp4-c8）。prefill、eager decode、图内 decode
+> 全部走 QFA，draft 也走。这部分代码可以当样板读。
+
+### 怎么确认算子真的进了图
+
+`_qfa_serves` 那种「条件判断通过」的日志**证明不了**捕获发生——它在 eager 路径上也会打。
+早期有一次就是这样：服务正常、日志好看，而 QFA 从头到尾没进过图，子目标其实没达成。
+要一行只有捕获路径才可能打出来的，放在拿到 task handle 之后：
+
+```
+[qfa] captured op #7 into task group at tokens=32 draft=False (state=...)
+[qfa] update tokens=32 draft=False -> updating {'ops': 10, 'handles': 10, 'events': 10}
+```
+
+两条都要有，且 `ops` 等于捕获计数（target = 全注意力层数，draft = 步数 × draft 层数）。
+去重键里记得带 `is_draft_model`，否则 draft 的行会被 target 同尺寸的吃掉。
 
 ---
 
@@ -411,9 +491,9 @@ FIA 的 `op_api/` 有 `aclnn_fused_infer_attention_score{,_v2,_v3,_v4,_v5}.h` �
 | `csrc/attention/<op>/op_host/CMakeLists.txt` | 删共享 common 依赖，加 opbase 兼容源文件 |
 | `csrc/attention/<op>_metadata/op_kernel_aicpu/CMakeLists.txt` | 适配 csrc 的旧 AICPU 签名 |
 | `csrc/attention/<op>/op_host/*_ops_base_compat.cpp` | 新增 ~56 行，补 `Ops::Base::ToString` |
-| `csrc/attention/<op>/<op>_torch_adpt.h` | 新增 ~194 行，手写 |
-| `csrc/torch_binding.cpp` | +36 行 |
-| `csrc/torch_binding_meta.cpp` | +103 行 |
+| `csrc/attention/<op>/<op>_torch_adpt.h` | 新增 ~240 行，手写；**含 out 变体**（坑五） |
+| `csrc/torch_binding.cpp` | +60 行，两个重载各一份 schema + impl |
+| `csrc/torch_binding_meta.cpp` | +125 行，两个重载各一份 meta |
 | `.pre-commit-config.yaml` | +4 个 typos 白名单词 |
 | `vllm_ascend/envs.py` | +6 行开关 |
 | `vllm_ascend/attention/attention_v1.py` | +447 行 |
