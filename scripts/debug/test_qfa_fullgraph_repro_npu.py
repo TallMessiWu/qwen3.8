@@ -783,6 +783,36 @@ def diagnose_mismatch(args, layer_fn, cache: Cache, captured, refs, bad, update_
         print("      both sides stable and disagreeing -- the graph computes something else")
 
 
+def report_graph_writes(args, cache: Cache, before: torch.Tensor, step) -> None:
+    """Where did the replayed graph write, against where this step's slots are?
+
+    The eager pass has already written the same slots with the same values, so
+    a graph that writes identically leaves nothing here. Anything that does
+    show up is the graph writing where eager did not -- a slot buffer that the
+    refresh never reached being the obvious way that happens, since capture
+    allocates it zeroed and would then send every layer's K/V to slot 0.
+
+    K's scale plane stands in for all three: one slot_mapping drives both
+    writers, and it is the small one (13MiB against 422MiB for K itself).
+    """
+    changed = cache.k_scale != before
+    while changed.dim() > 2:
+        changed = changed.any(-1)
+    hits = changed.nonzero().cpu()
+    if not hits.numel():
+        print("    graph writes: landed exactly where eager did")
+        return
+    slots = step.slot_mapping().cpu().to(torch.long)
+    want = {(int(s) // args.block_size, int(s) % args.block_size) for s in slots}
+    got = {(int(block), int(offset)) for block, offset in hits.tolist()}
+    stray = sorted(got - want)
+    print(
+        f"    graph writes: {len(got)} (block,offset) differ from eager's, "
+        f"{len(stray)} of them outside this step's slots"
+        + (f", first stray={stray[0]}" if stray else "")
+    )
+
+
 def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, update_stream) -> bool:
     """Mirror _update_qfa_graph_buffers + replay, then check against eager."""
     step, qs, buffers = captured["step"], captured["qs"], captured["buffers"]
@@ -803,6 +833,9 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
     # Proof the replay below actually re-runs the kernels rather than leaving
     # the capture-time outputs in place.
     before = outs[0].to(torch.float32).abs().sum().item()
+    # Cheap enough to keep on the green path: it is the only thing that says
+    # whether the graph wrote where eager did.
+    ks_before = cache.k_scale.clone() if cache_write is not None else None
 
     pairs = release_and_replay(step, buffers, events, graph, update_stream)
     mismatched = [p for p in pairs if p[0] != p[1]]
@@ -817,6 +850,8 @@ def refresh_and_replay(args, quant_q, cache: Cache, layer_fn, captured: dict, up
         f"    replay rewrote out[0]: {before:.8g} -> {after:.8g}"
         + ("" if before != after else "  [WARN] unchanged -- did anything get captured?")
     )
+    if ks_before is not None:
+        report_graph_writes(args, cache, ks_before, step)
     bad = [i for i in range(args.layers) if not torch.equal(outs[i].cpu(), refs[i])]
     print(f"    size={step.num_tokens}: {args.layers - len(bad)}/{args.layers} layers bit-exact"
           + (f", first bad={bad[0]}" if bad else ""))
