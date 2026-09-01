@@ -50,6 +50,9 @@ Cases -- each changes exactly one thing against REAL:
                cache, then QFA reading that same cache -- all inside the one
                capture. Write-then-read of the same memory in one graph is
                the last structural difference the cases above leave out.
+  STALE-TABLE  the block table's unused columns carry real block ids rather
+               than zeros, the way vLLM's reused buffer does. Zeros send any
+               stray read to block 0, which is mapped and harmless.
   WRITE-IDEMPOTENT  no graph and no QFA: just the two cache writers, run
                twice on the same K/V and slots, then again after another
                layer overwrote them. Isolates "the eager baseline moves"
@@ -116,6 +119,7 @@ CASES = (
     "COMPILED",
     "INGRAPH-CACHE",
     "WRITE-IDEMPOTENT",
+    "STALE-TABLE",
 )
 
 # 27B.sh's default CAPTURE_SIZES.
@@ -452,7 +456,15 @@ class DecodeStep:
         # is never touched. Unique block ids only where they matter keeps the
         # cache at the server's size instead of batch * 260 blocks.
         used = math.ceil(args.kv_len / args.block_size)
-        table = torch.zeros(self.batch, table_cols, dtype=torch.int32)
+        if args.stale_table:
+            # vLLM reuses one block-table buffer across batches, so the columns
+            # past this step's length hold the previous batch's block ids --
+            # real ids, just not this request's. Zeros made every stray read
+            # land on block 0, which is mapped and therefore harmless; that is
+            # a property of this harness, not of the engine.
+            table = torch.randint(0, num_blocks, (self.batch, table_cols), dtype=torch.int32)
+        else:
+            table = torch.zeros(self.batch, table_cols, dtype=torch.int32)
         for i in range(self.batch):
             start = (i * used) % max(1, num_blocks - used)
             table[i, :used] = torch.arange(start, start + used, dtype=torch.int32)
@@ -990,6 +1002,12 @@ def case_ingraph_cache(args, quant_q) -> bool:
     return engine_repro(args, quant_q)
 
 
+def case_stale_table(args, quant_q) -> bool:
+    args = copy.copy(args)
+    args.stale_table = True
+    return engine_repro(args, quant_q)
+
+
 def case_compiled(args, quant_q) -> bool:
     args = copy.copy(args)
     args.compiled = True
@@ -1077,6 +1095,7 @@ RUNNERS = {
     "COMPILED": case_compiled,
     "INGRAPH-CACHE": case_ingraph_cache,
     "WRITE-IDEMPOTENT": case_write_idempotent,
+    "STALE-TABLE": case_stale_table,
 }
 
 
@@ -1100,6 +1119,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v-scale-fill", type=int, default=127, help="static V scale byte (127 = neutral)")
     parser.add_argument("--pool-pad-mb", type=int, default=0, help="live padding held inside the capture")
     parser.add_argument("--tight-table", action="store_true", help="block table sized to kv_len only")
+    parser.add_argument(
+        "--stale-table",
+        action="store_true",
+        help="fill the block table's unused columns with real block ids, as vLLM's reused buffer does",
+    )
     parser.add_argument("--compiled", action="store_true", help="wrap the layer in torch.compile")
     parser.add_argument("--write-cache", action="store_true", help="write the cache inside the capture too")
     parser.add_argument(
