@@ -260,8 +260,11 @@ class InGraphCacheWrite:
         ]
         self.values = [torch.randn_like(k) for k in self.keys]
         # v_cache_scale_float_reciprocal, flat because the cache's V scale is
-        # the neutral 127 -- see Cache.
-        self.v_recip = torch.ones(n * d, dtype=torch.float32, device="npu")
+        # the neutral 127 -- see Cache. bf16, not fp32: mxfp_c8.py builds it as
+        # 1 / exp2(exponent).to(model_config.dtype), and npu_quantize refuses a
+        # scale whose dtype differs from x's ("dtype of input x:DT_BFLOAT16 is
+        # not compatible with scale:DT_FLOAT", EZ1001).
+        self.v_recip = torch.ones(n * d, dtype=torch.bfloat16, device="npu")
         self.slot_buf: torch.Tensor | None = None
 
     def allocate(self, step) -> None:
