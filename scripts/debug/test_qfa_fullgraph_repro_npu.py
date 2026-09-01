@@ -281,11 +281,14 @@ class InGraphCacheWrite:
         capturing"). The length is num_tokens either way, and refresh() fills
         it before every replay.
 
-        Zeroed rather than empty like the others: capture records without
-        executing, so the contents never matter there -- but these are indices,
-        and slot 0 is at least in range if anything ever does read them.
+        Empty, never zeros: torch.zeros records the fill as a graph node, so
+        every replay would wipe the slots refresh() just wrote and send the
+        whole step to slot 0. That is not hypothetical -- it is what this case
+        did until report_graph_writes named the stray write as (0, 0).
+        torch.empty allocates without recording a kernel, which is why the
+        other capture-owned buffers use empty_like and are fine.
         """
-        self.slot_buf = torch.zeros(step.num_tokens, dtype=torch.int32, device="npu")
+        self.slot_buf = torch.empty(step.num_tokens, dtype=torch.int32, device="npu")
 
     def run(self, layer: int, cache: Cache) -> None:
         """Inside the capture, once per layer, before that layer's QFA call."""
