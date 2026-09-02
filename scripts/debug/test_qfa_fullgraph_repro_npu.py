@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Reproduce the FULL-graph QuantFlashAttn crash outside the engine.
 
-Why another graph-capture script. test_qfa_graph_capture_npu.py's
-ENGINE-INPOOL / ENGINE-OUTPOOL are cited as having cleared "the engine's
-structure", but they cleared it for code that no longer exists: they lift
-`_qfa_quant` / `_qfa_quant_v` out of attention_v1.py and quantize a bf16 cache
-inside the capture. `c85c545ec` deleted both helpers along with the whole bf16
-QFA path, so on junlin-qfa-graph that script cannot even bootstrap. What the
-engine runs now is `_qfa_paged_call`: a four-plane MXFP8 cache read straight,
-with only q quantized. Those green lights also ran at max_seqlen_kv=2048,
-block_size=128, num_kv_heads=4 and a three-column block table -- none of which
-is what the server runs.
+Why a dedicated graph-capture script. The earlier one lifted `_qfa_quant` /
+`_qfa_quant_v` out of attention_v1.py and quantized a bf16 cache inside the
+capture, so its ENGINE-INPOOL / ENGINE-OUTPOOL green lights -- cited as having
+cleared "the engine's structure" -- covered code that `c85c545ec` deleted along
+with the whole bf16 QFA path, at max_seqlen_kv=2048, block_size=128,
+num_kv_heads=4 and a three-column block table, none of which is what the server
+runs. What the engine runs now is `_qfa_paged_call`: a four-plane MXFP8 cache
+read straight, with only q quantized.
 
 So this rebuilds the same structure -- L layers sharing one capture-owned
 buffer set per graph size, several sizes in one pool, every layer's event
@@ -91,7 +89,7 @@ it, and a mis-ordered event hangs rather than fails, so --case-timeout applies.
 Verdict: GREEN when every layer's replayed output is bit-exact against the same
 call run eagerly, RED when it differs, crashes or times out.
 
-Usage (in the serving container, on the junlin-qfa-graph checkout):
+Usage (in the serving container, on the junlin-qfa checkout):
   python scripts/debug/test_qfa_fullgraph_repro_npu.py \
       --model-config /mnt/share/weight/Qwen3.5-35B-A3B-mxfp4-c8/config.json
   python scripts/debug/test_qfa_fullgraph_repro_npu.py --cases REAL

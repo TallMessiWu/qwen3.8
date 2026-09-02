@@ -1,15 +1,85 @@
-# Script runtime helpers and tests
+# Scripts
 
-The service launchers and their local regression tests share two supporting
-directories:
+Everything here runs on the server unless it says otherwise. Nothing in this
+repository serves the model by itself -- the plugin-side adaptation lives in
+`vllm-ascend`, and these are the assets used to launch, diagnose and regress it.
+
+## Service launchers
+
+- `27B.sh` -- single-node 8-NPU Qwen3.8-27B-MXFP8 baseline, the current
+  workhorse. Cleans the devices through `npu-cleaner.sh`, applies the host
+  tuning, and exposes `QFA` / `GRAPH` / `MTP` / `GPU_MEM_UTIL` /
+  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
+- `serve_qwen3.8_2.4t_4node.sh` -- the four-node 32-NPU launcher for the
+  ModelSlim mxfp8 Qwen3.8-2.4T-A95B checkpoint. `2.4T-0.sh` through `2.4T-3.sh`
+  are per-machine wrappers that only pin `NODE_RANK`, the IPs and the NIC.
+- `serve_qwen3.8_2.4t_single_node_4layer.sh` -- four-layer weight smoke test on
+  one node. Refuses a quant description whose entries are all FLOAT, i.e. a
+  checkpoint that was never actually quantized.
+- `curl.sh` -- serves the test images over a local `http.server` and sends two
+  multimodal chat requests, so the payload stays a URL instead of base64.
+- `npu-cleaner.sh` -- kills leftover processes on the given device ids.
+
+## Container and install
+
+- `create-container.sh` -- creates the privileged A5 serving container on the
+  host and installs the host-mounted vLLM-Ascend checkout into it.
+- `install-vllm-ascend.sh` -- the in-container half: editable install from a
+  mounted checkout, or a requested package version.
+- `debug/pip_install_qfa.sh` -- full editable install with the log captured and
+  the real errors extracted from the TBE cascade noise.
+- `debug/build_qfa_ops.sh` -- fast-iteration build of the two QFA custom ops
+  only, with readable ninja error extraction.
+- `debug/diag_qfa_tiling_registry.sh` -- read-only triage for the mass
+  "do not registe tiling struct" build failures.
+
+## Checkpoint diagnostics
+
+Pure stdlib, read-only, never import torch/vllm, never touch the NPU. Written
+for the 2.4T weight failures; run them before trusting any new weight
+directory, whatever its name says.
+
+- `debug/check_quant_desc_qwen35_moe_text.py` -- replays vLLM Ascend's
+  load-time packed-module lookup against `quant_model_description.json`.
+- `debug/compare_checkpoint_shapes.py` -- diffs tensor names and shapes between
+  a quantized checkpoint and its BF16 original, from safetensors headers alone.
+- `debug/check_moe_expert_shapes.py` -- explains a MoE `w13` load failure:
+  the load branch is chosen from the tensor name, not the shape.
+- `debug/verify_expert_split_axis.py` -- proves on the real bytes which axis a
+  fused `gate_up` export was split along, by sign-bit correlation.
+
+## QFA operator and graph validation (NPU required)
+
+- `debug/test_junlin_qfa_npu.py` -- numeric smoke test of the vendored
+  QuantFlashAttn against a CPU golden ported from the official test assets.
+- `debug/run_doc_examples_qfa_npu.py` -- the two official doc call examples
+  ported 1:1 onto the vendored API.
+- `debug/test_qfa_as_fia_npu.py` -- checks the FIA-call-site swap on device for
+  both shapes the call site builds.
+- `debug/diag_qfa_metadata_size.py` -- sweeps `num_blocks` across the int32
+  plane-offset ceiling that killed the metadata op on a real prefill.
+- `debug/test_qfa_fullgraph_repro_npu.py` -- reproduces the full-graph capture
+  arrangement outside the engine and sweeps one dimension at a time.
+
+Build logs land in `debug/logs/`, which is gitignored.
+
+## Benchmark
+
+- `bench_qfa_vs_fia.py` -- `--auto` brings `27B.sh` up twice (baseline
+  `QFA=0 NO_PREFIX_CACHE=1`, candidate `QFA=1`), measures both and prints the
+  table. Keeping the two configurations symmetric is the script's job.
+
+## Runtime helper
 
 - `runtime/qwen38_checkpoint_layer_filter/` skips checkpoint tensors above the
   four-layer smoke-test limit before lazy safetensors loading. The single-node
   four-layer launcher loads it through `PYTHONPATH`.
-- `tests/` contains the checkpoint-filter contract test, the HTTP image payload
-  regression test, and service/container default-value tests.
 
-Run all local regression tests without creating Python bytecode caches:
+## Local regression tests
+
+`tests/` holds the checkpoint-filter contract test, the HTTP image payload
+regression test, and the service/container default-value tests. They need
+neither an NPU nor a running server, so they run on any machine:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \

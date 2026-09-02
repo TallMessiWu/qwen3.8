@@ -50,10 +50,9 @@ VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
 # 0.85 was needed while QFA quantized the whole KV cache on every step, which
 # cost the aclgraph pool about 1.28x one attention layer's bf16 cache in
-# transient tensors (POOL-MEM in scripts/debug/test_qfa_graph_capture_npu.py).
-# On junlin-qfa-graph that quantization is gone -- the cache is stored as MXFP8
-# -- so 0.95 may well fit again. Nobody has measured it since; if capture
-# reports no available memory, drop to 0.85 and say so.
+# transient tensors. On junlin-qfa that quantization is gone -- the cache is
+# stored as MXFP8 -- so 0.95 may well fit again. Nobody has measured it since;
+# if capture reports no available memory, drop to 0.85 and say so.
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 
 # QFA=1 runs the causal full-attention path on the vendored QuantFlashAttn
