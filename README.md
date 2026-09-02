@@ -2,6 +2,14 @@
 
 在昇腾 NPU 上调试和测试 Qwen3.8 的工作区，服务栈为 `vllm` + `vllm-ascend`。
 
+## 文档入口
+
+| 文档 | 内容 |
+| --- | --- |
+| `AGENTS.md`（`CLAUDE.md` 是它的符号链接） | 仓库硬性约束、worktree 工作流、vllm-ascend 架构要点 |
+| `scripts/README.md` | 每个服务、诊断、压测、回归脚本的用途与运行方式 |
+| `docs/vendor-ops-transformer-op.md` | 以 QFA 为样板，把 ops-transformer 算子接进 `vllm-ascend/csrc` 的完整路径，含 FIA 差异清单 |
+
 ## 一键初始化仓库
 
 在 Linux 服务器执行下面整段命令。它会克隆或更新主仓，初始化 `vllm` 和
@@ -230,15 +238,22 @@ bash scripts/create-container.sh \
     ├── skills-lock.json
     ├── pics/                        # 架构页面使用的图片
     ├── qwen3.8-architecture.html
+    ├── docs/                        # 长文档，见开头的「文档入口」
     ├── scripts/
-    │   ├── README.md                # 运行时辅助和本地测试说明
+    │   ├── README.md                # 每个脚本的用途与运行方式
     │   ├── create-container.sh      # 宿主机容器创建入口
     │   ├── install-vllm-ascend.sh   # 容器内 Python 包安装入口
-    │   ├── 27B.sh                   # 单机服务入口
+    │   ├── 27B.sh                   # 单机 8 卡服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
     │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
+    │   ├── serve_qwen3.8_2.4t_single_node_4layer.sh # 单机裁层冒烟
+    │   ├── npu-cleaner.sh           # 清理残留在指定卡上的进程
+    │   ├── curl.sh                  # 多模态请求冒烟
+    │   ├── bench_qfa_vs_fia.py      # QFA / FIA 对比压测
+    │   ├── debug/                   # 服务器上跑的诊断与复现脚本
     │   ├── runtime/                 # 裁层 checkpoint 运行时过滤器
     │   └── tests/                   # 脚本静态回归测试
+    ├── ops-transformer/             # CANN 算子源码克隆，被 gitignore，不属于本仓
     ├── vllm/                        # 上游 vLLM submodule，只读参考
     └── vllm-ascend/
         ├── main/                    # 个人 fork submodule，跟踪 origin/main
