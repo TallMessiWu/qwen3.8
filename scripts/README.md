@@ -47,6 +47,11 @@ directory, whatever its name says.
   the load branch is chosen from the tensor name, not the shape.
 - `debug/verify_expert_split_axis.py` -- proves on the real bytes which axis a
   fused `gate_up` export was split along, by sign-bit correlation.
+- `debug/plan_hbm_budget.py` -- answers "does this many machines have enough
+  HBM": per-rank weight bytes from the safetensors headers under a given
+  TP/DP/EP layout, per-token KV and per-sequence GDN state from `config.json`,
+  and the resulting KV headroom. Feed it the `Available KV cache memory` value
+  of a failed run via `--observed-kv-gib` to back out the non-weight footprint.
 
 ## QFA operator and graph validation (NPU required)
 
