@@ -8,6 +8,11 @@ Two questions, answered separately:
      kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL.  Anything else and the
      run silently falls back to a bf16 cache served by FIA -- which, at head_dim
      256, then dies with EZ0010.  A missing key is therefore a hard RED.
+     Three KV-cache recipes share that file and only this one is readable by
+     QFA, so the report names which recipe the checkpoint actually selected:
+     one carrying FAKQuant's fa_k/fa_v scale+offset, or int8 C8, *did* quantize
+     its KV cache, just into a layout QFA cannot use.  Saying "unquantized"
+     there would be wrong, and the difference decides what to do about it.
 
   2. Are the V scales actually usable?  V is quantized with a *static*
      per-channel E8M0 scale read from the checkpoint (K stays dynamic).  Three
@@ -118,23 +123,39 @@ def describe_scale(raw_bytes):
 
 
 def check_kv_cache_type(model_path, failures):
-    """Section 1: the flag modelslim_config.py actually reads."""
+    """Section 1: which KV-cache quantization recipe the framework will pick.
+
+    Three recipes share this file and only one of them is the MXFP8 C8 that QFA
+    can read, so report which one the description actually selects instead of
+    only saying "not MXFP8":
+      kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL -> mxfp_c8.py, the one we want
+      kv_cache_type=C8                                   -> kv_c8.py, int8 dense C8
+      fa_quant_type=<non-empty>                          -> kv_c8.py FAKQuant path
+    """
     print()
-    print("--- 1. kv_cache_type (decides whether C8 is enabled) ---")
+    print("--- 1. which KV-cache recipe does the description select? ---")
     desc = load_json(model_path / "quant_model_description.json")
     if desc is None:
         print("  quant_model_description.json: MISSING")
         failures.append("quant_model_description.json missing -> C8 never enables")
         return
     kv_cache_type = desc.get("kv_cache_type", "")
-    print(f"  kv_cache_type = {kv_cache_type!r}")
+    fa_quant_type = desc.get("fa_quant_type", "")
+    print(f"  kv_cache_type  = {kv_cache_type!r}")
+    print(f"  fa_quant_type  = {fa_quant_type!r}")
     if kv_cache_type == REQUIRED_KV_CACHE_TYPE:
-        print("  OK: matches what modelslim_config.py requires")
-    else:
-        print(f"  expected: {REQUIRED_KV_CACHE_TYPE!r}")
-        failures.append(
-            f"kv_cache_type != {REQUIRED_KV_CACHE_TYPE} -> C8 stays off, run falls back to bf16+FIA"
-        )
+        print("  OK: selects the MXFP8 C8 path (mxfp_c8.py) -- the one QFA can read")
+        return
+
+    print(f"  expected: kv_cache_type == {REQUIRED_KV_CACHE_TYPE!r}")
+    failures.append(f"kv_cache_type != {REQUIRED_KV_CACHE_TYPE} -> C8 stays off, run falls back to bf16+FIA")
+    if fa_quant_type:
+        print("  note: fa_quant_type is set, so enable_fa_quant wins instead. That is the")
+        print("        FAKQuant path in kv_c8.py, which on A5 caches K/V as float8_e4m3 with a")
+        print("        static per-channel scale+offset -- a different cache layout from MXFP8's")
+        print("        per-32-element E8M0 scale planes. QFA cannot read it.")
+    elif kv_cache_type == "C8":
+        print("  note: this selects the int8 dense-attention C8 path (kv_c8.py), not MXFP8.")
 
 
 def expected_channel_width(model_path):
@@ -242,6 +263,13 @@ def report_naming_candidates(found):
         print("    scale-ish tensors (excluding *.weight_scale), by name suffix:")
         for suffix, count in sorted(scale_like.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
             print(f"      {suffix}  x{count}")
+        if any(s.startswith(("fa_k.", "fa_v.", "fa_q.")) for s in scale_like):
+            print()
+            print("    ^ those fa_* names are the FAKQuant recipe (kv_c8.py), NOT MXFP8 C8.")
+            print("      Tell them apart by the offset: MXFP8 scales are powers of two (E8M0)")
+            print("      and need none, and its recipe is K_DYNAMIC so only V carries a static")
+            print("      scale. A checkpoint with fa_k/fa_v scale+offset did quantize its KV")
+            print("      cache -- just into a layout QFA cannot read. It is not 'unquantized'.")
     else:
         print("    no scale-like tensors anywhere outside *.weight_scale")
 
