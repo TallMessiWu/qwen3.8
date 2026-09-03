@@ -83,7 +83,14 @@ fi
 # Lowering it is the only way to move that constant without touching code, and
 # the graph-capture crash reproduces nowhere else, so single-variable
 # experiments have to run here rather than in a standalone script.
-# MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split.
+# MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split. It
+# also decides which decode batches get a graph at all: a uniform decode step
+# is num_reqs * uniform_decode_query_len tokens (4 here, MTP's 3 draft tokens
+# plus one), and CudagraphDispatcher.dispatch falls back to eager the moment
+# that exceeds the largest CAPTURE_SIZES entry. The 128 ceiling below is
+# exactly 32 * 4, so past 32 concurrent requests the decode runs eager --
+# graphing the full 100 means raising CAPTURE_SIZES to 400, which costs
+# capture time and pool memory. Left at 128 until somebody measures both.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-100}"
 
