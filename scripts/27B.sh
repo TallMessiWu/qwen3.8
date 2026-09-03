@@ -66,13 +66,27 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 # has to pass --no-enable-prefix-caching to the baseline run as well, or the
 # two differ by more than the attention op.
 # GRAPH=0 turns off aclgraph capture (eager); it defaults to on.
+#
+# C8=0 forces the MXFP8 KV cache off (VLLM_ASCEND_DISABLE_C8_MXFP), serving a
+# quantized checkpoint on a bf16 cache through plain FIA. That is the only
+# baseline an end-to-end accuracy or memory comparison can use: with the C8
+# cache on, the FIA path hits EZ0010 at head_dim 256, so "MXFP8 cache + FIA"
+# does not exist as a configuration. QFA cannot read a bf16 cache, so C8=0
+# implies QFA off. C8=1 (default) honours whatever the checkpoint asks for.
 qfa_args=()
-if [[ "${QFA:-0}" == "1" ]]; then
+if [[ "${C8:-1}" == "0" ]]; then
+    export VLLM_ASCEND_DISABLE_C8_MXFP=1
+    if [[ "${QFA:-0}" == "1" ]]; then
+        echo "C8=0 forces a bf16 KV cache, which QFA cannot read; QFA=1 has no effect." >&2
+    fi
+    echo "C8 MXFP8 KV cache disabled: bf16 cache served by FIA." >&2
+elif [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
-    echo "QFA on: QuantFlashAttn for causal attention; KV cache still bf16 (quantized per step)." >&2
+    echo "QFA on: QuantFlashAttn reads the MXFP8 KV cache directly." >&2
 fi
 # Also settable on its own, so a QFA-vs-FIA comparison can hold it constant.
-if [[ "${QFA:-0}" == "1" || "${NO_PREFIX_CACHE:-0}" == "1" ]]; then
+# C8=0 turns it off too, so the baseline run matches the C8 run here.
+if [[ "${QFA:-0}" == "1" || "${C8:-1}" == "0" || "${NO_PREFIX_CACHE:-0}" == "1" ]]; then
     qfa_args+=(--no-enable-prefix-caching)
     echo "prefix caching disabled." >&2
 fi
