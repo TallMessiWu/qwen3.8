@@ -116,6 +116,10 @@ cmd=(
     --seed 1024
     --enable-prefix-caching
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+    # Armed, not on: the wrapper is only built when /start_profile is posted.
+    # Each node resolves ./profiling against its own CWD, so one profile run
+    # leaves four directories, one per machine, eight ranks each.
+    --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./profiling", "torch_profiler_with_stack": false}'
     --additional-config "{\"enable_cpu_binding\":true,\"enable_flashcomm1\":false,\"enable_fused_mc2\":$ENABLE_FUSED_MC2}"
 )
 

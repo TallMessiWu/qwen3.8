@@ -149,6 +149,12 @@ if [[ "${THINKING:-1}" == "0" ]]; then
     echo "thinking disabled (THINKING=0)." >&2
 fi
 
+# Profiling is armed, not on: NPUWorker.profile() only builds the
+# TorchNPUProfilerWrapper when /start_profile is posted, so carrying the config
+# costs nothing until somebody asks for a trace. The path is relative and
+# _validate_profiler_config abspath's it against the CWD, so launching from a
+# different directory puts the traces somewhere else. with_stack is off because
+# the Python stacks dwarf the op timeline that a kernel-level look is after.
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
@@ -162,6 +168,7 @@ exec vllm serve "$MODEL_PATH" \
     --reasoning-parser qwen3 \
     --default-chat-template-kwargs "{\"enable_thinking\": $enable_thinking}" \
     --compilation-config "$compilation_config" \
+    --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./profiling", "torch_profiler_with_stack": false}' \
     "${spec_args[@]}" \
     --trust-remote-code \
     --async-scheduling \

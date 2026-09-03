@@ -18,6 +18,9 @@ repository serves the model by itself -- the plugin-side adaptation lives in
   overrides the list outright. `THINKING` writes
   `--default-chat-template-kwargs '{"enable_thinking": ...}'`, on by default;
   a request that carries its own `chat_template_kwargs` still overrides it.
+  Both launchers carry `--profiler-config` for the torch/NPU profiler, armed
+  but idle until `/start_profile` is posted; traces land in `./profiling`
+  relative to wherever the launcher was started.
 - `serve_qwen3.8_2.4t_4node.sh` -- the four-node 32-NPU launcher for the
   ModelSlim mxfp8 Qwen3.8-2.4T-A95B checkpoint. `2.4T-0.sh` through `2.4T-3.sh`
   are per-machine wrappers that only pin `NODE_RANK`, the IPs and the NIC.
