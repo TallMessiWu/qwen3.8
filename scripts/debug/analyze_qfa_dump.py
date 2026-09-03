@@ -57,6 +57,19 @@ def e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
     return torch.pow(torch.tensor(2.0, dtype=torch.float64), exponent.to(torch.float64))
 
 
+def dequant_along_last(values: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """FP8 + E8M0 grouped along the last axis -> float64, same leading shape.
+
+    Used for q, whose scale is [..., D//64, 2] per token: one exponent per
+    QUANT_GROUP_SIZE consecutive head_dim elements, the same grouping K uses.
+    """
+    lead = values.shape[:-1]
+    d = values.shape[-1]
+    scales = e8m0_to_float(scale).reshape(*lead, d // QUANT_GROUP_SIZE)
+    scales = scales.repeat_interleave(QUANT_GROUP_SIZE, dim=-1)
+    return values.to(torch.float64) * scales
+
+
 def dequant_k_cache(key_cache: torch.Tensor, key_scale_cache: torch.Tensor) -> torch.Tensor:
     """[nb, bs, N, D] FP8 + [nb, bs, N, D//64, 2] E8M0 -> float64 [nb, bs, N, D]."""
     nb, bs, n, d = key_cache.shape
@@ -210,11 +223,18 @@ def analyze_pair(cache_write: dict, qfa_call: dict, label: str) -> dict:
         print("                 (cache holds history whose bf16 truth was never dumped)")
 
     # --- 2. compute loss: same dequantized inputs, float reference ----------
-    ref_from_cache = reference_attention(query_bf16, k_cache_seq, v_cache_seq, softmax_scale)
+    # The reference has to be fed the *quantized* q, not query_bf16: QFA never
+    # sees the bf16 query, and q's quantization error is amplified through
+    # softmax's exp, so mixing it in here would be charged to the operator.
+    q_deq = dequant_along_last(qfa_call["q_fp8"], qfa_call["q_descale"])
+    results["q_quant"] = rel_l2(q_deq, query_bf16)
+    print(f"  [quantization] q  rel_l2 = {results['q_quant'] * 100:.3f}%   (dynamic per-32 E8M0, recomputed each step)")
+
+    ref_from_cache = reference_attention(q_deq, k_cache_seq, v_cache_seq, softmax_scale)
     out = attn_output.reshape(-1, num_heads, head_size)
     results["compute"] = rel_l2(out, ref_from_cache)
     results["compute_cos"] = cosine(out, ref_from_cache)
-    print("  [compute]      QFA vs float64 on identical (dequantized) inputs:")
+    print("  [compute]      QFA vs float64 on identical (dequantized q/K/V):")
     print(f"                 rel_l2 = {results['compute'] * 100:.3f}%   cos = {results['compute_cos']:.6f}")
 
     # --- 3. end-to-end, only meaningful when bf16 covers the whole sequence -
@@ -353,6 +373,7 @@ def main() -> int:
 
     print("\n=== summary across layers ===")
     for key, title in (
+        ("q_quant", "q quantization"),
         ("k_quant", "K quantization"),
         ("v_quant", "V quantization (static scale)"),
         ("v_quant_optimal", "V quantization (optimal scale)"),
