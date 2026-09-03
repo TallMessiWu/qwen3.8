@@ -33,7 +33,14 @@ DP_SIZE="${DP_SIZE:-4}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
+# 0.85 could not start at all: profiling measured 78.31 GiB of weights plus
+# 8.19 GiB of activation peak + non-torch per rank, so the 81.60 GiB that 0.85
+# requests out of 96 GiB was already 4.90 GiB short before any KV block existed
+# ("Available KV cache memory: -4.90 GiB").  0.95 requests 91.20 GiB and leaves
+# roughly 4.70 GiB for KV.  Do not push this past ~0.96: the npugraph pool is
+# captured AFTER the KV cache is allocated and is not counted in the profiling
+# result (worker.py:573), so it has to fit in whatever util leaves unclaimed.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 ENABLE_FUSED_MC2="${ENABLE_FUSED_MC2:-1}"
 
