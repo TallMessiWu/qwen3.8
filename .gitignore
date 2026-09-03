@@ -25,3 +25,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本机开发环境：vllm v0.27.1 只读 worktree + uv 缓存产物
+/.dev/

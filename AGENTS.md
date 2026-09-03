@@ -11,7 +11,7 @@ This file provides guidance to coding agents (Claude Code, Codex CLI, …) when 
 ## 硬性约束（每次动手前先确认）
 
 1. **`vllm/` 是只读参考。** 上游 vLLM 的克隆，用来查源码、确认被 patch 的函数签名与调用点。不要修改、不要提交、不要推送。需要改上游行为时，在 `vllm-ascend` 里写 patch。
-2. **本机没有 NPU，跑不了推理。** 本机只能写代码、读代码、做静态分析。有一块 5080 GPU，可以跑纯 PyTorch 的小脚本做数值等价性 / 算法逻辑的模拟验证（不能 import `torch_npu`）。
+2. **本机没有 NPU，跑不了推理。** 本机只能写代码、读代码、做静态分析。有一块 5080 GPU，可以跑纯 PyTorch 的小脚本做数值等价性 / 算法逻辑的模拟验证（不能 import `torch_npu`）。本机已有一套对齐真机的 uv 环境（`.venv/`，见 `scripts/local/`），推真机之前先用它跑 patch 目标体检和 CPU 单测。
 3. **验证闭环靠脚本。** 需要在真机确认权重、代码、环境或其他本机拿不到的信息时，优先把聚焦、非交互式的诊断脚本写进 `scripts/debug/`；其他真机验证脚本写进 `scripts/`。脚本要自带打印/断言和明确的 RED/GREEN 判据，输出能直接回传判读，并避免打印凭据、加载无关权重或占用 NPU，除非该验证阶段确实需要。
 4. **推送只走自己的 fork。** `vllm-ascend` 的 `origin` 是本人的 fork（`TallMessiWu/vllm-ascend`，可自由推送），`upstream` 是上游官方仓（`vllm-project/vllm-ascend`）——upstream 只 fetch，永远不 push。注意这个 fork 是 public 的（fork 公开仓无法转为 private），推上去的内容对外可见。
 5. **修改完成后直接提交并推送。** 在完成范围内验证后，直接生成提交信息、提交并使用普通 `git push` 推送当前分支，无需先向用户确认提交信息；主仓和子仓有改动时分别在各自仓库提交、推送。默认禁止任何强推；但如果 rebase、amend、reset 或分支历史重写使普通推送必然无法成功，应立即说明原因、目标远端分支和预期 lease，主动询问用户是否允许强推，不要为了回避询问而合并旧历史、改写方案或反复尝试无关规避手段。获得该次明确授权后，只能在刷新并核对远端分支后使用 `git push --force-with-lease`，永远禁止普通 `--force`。TLS、认证、代理等传输故障不是强推场景，合理重试后直接报告。
@@ -23,7 +23,9 @@ qwen3.8/                   # 主仓（git，分支 main）
 ├── AGENTS.md              # 本文件
 ├── .agents/skills/        # 技能目录
 ├── skills-lock.json       # 外部技能来源与哈希（mattpocock/skills），由技能自身维护，勿手改
+├── pyproject.toml         # 本机 uv 环境的依赖清单（venv 在 .venv/，不进主仓）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
+│   └── local/             # 例外：只在本机跑的环境搭建与静态检查脚本
 ├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
     ├── main/              # submodule「vllm-ascend」→ 个人 fork，跟踪 origin/main
@@ -64,6 +66,24 @@ git worktree remove ../feat-xxx                        # 收尾清理
 分支名不用斜杠，直接 `feat-xxx`、`bugfix-yyy` 这种扁平写法，目录名与分支名保持一致。
 
 同步上游：在 `upstream-main` 执行 `git fetch upstream && git pull --ff-only`。不要顺手把官方主线合入 `main`；`main` 保持跟踪个人 fork 的 `origin/main`，需要同步 fork 时再明确执行合并与推送。
+
+## 本机验证环境（推真机之前先过一遍）
+
+`scripts/local/setup-devenv.sh` 在本机建一套刻意对齐真机容器的 venv：Python 3.11 +
+vllm 0.27.1（`VLLM_TARGET_DEVICE=empty`，不编译 kernel）+ torch 2.10.0（带 CUDA，
+吃 5080）+ editable 的 `vllm-ascend/junlin-qfa`。`torch_npu` 不装，由 vllm-ascend 自己的
+`tests/ut/conftest.py` 在探测不到 `npu-smi` 时注入 MagicMock——跟 CI 的 CPU runner 同一口径。
+
+```bash
+bash scripts/local/setup-devenv.sh              # 建/重建环境
+python scripts/local/check_patch_targets.py     # patch 目标还在不在、参数列表有没有漂
+bash scripts/local/run_cpu_ut.sh                # CPU 单测 + 跟已知基线比对
+```
+
+vllm 源码取自 `.dev/vllm-0.27.1`（从 `vllm/` submodule 派生的只读 worktree），
+**不要拿 `vllm/` 的工作区当真机参考**——它现在停在 v0.28.1rc0，比真机装的 0.27.1
+领先 1300+ commit，照着它查函数签名会得出跟真机对不上的结论。
+能拦什么、拦不住什么、已知的 4 条基线失败，见 `scripts/local/README.md`。
 
 ## 常用命令（全部在某个 vllm-ascend worktree 目录内执行）
 

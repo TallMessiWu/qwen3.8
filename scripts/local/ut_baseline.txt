@@ -1,0 +1,18 @@
+# 本机（无 NPU，torch_npu 由 tests/ut/conftest.py mock）跑 tests/ut CPU 部分的已知失败。
+# 建立于 2026-09-03，vllm 0.27.1 + torch 2.10.0 + vllm-ascend junlin-qfa。
+# 用途是识别【新增】失败——这几条本来就红，不代表你的改动有问题。
+#
+# 已定性：
+#   test_config_modules_do_not_load_vllm_config
+#     测试自己起了子进程跑 `python -c "import vllm_ascend.config_utils"`，
+#     子进程不继承 conftest 注入的 mock，直接 ModuleNotFoundError: torch_npu。
+#     真机有真 torch_npu，不会失败。属于本机固有短板。
+#
+# 未定性（要跟真机 CI 结果比对才能确认是本机假象还是真问题）：
+#   test_check_and_update_config_cache_config_block_size  断言 block_size==128，实得 512
+#   test_eplb_controller 的两条                            assert_close 差 1
+#
+tests/ut/test_ascend_config.py::test_config_modules_do_not_load_vllm_config
+tests/ut/test_platform.py::TestNPUPlatform::test_check_and_update_config_cache_config_block_size
+tests/ut/worker/v2/test_eplb_controller.py::TestAscendEPLBController::test_closed_window_clears_every_registered_model
+tests/ut/worker/v2/test_eplb_controller.py::TestAscendEPLBController::test_nonmatching_phase_is_forwarded_as_dummy

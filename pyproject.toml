@@ -1,0 +1,66 @@
+[project]
+name = "qwen3-8-devenv"
+version = "0.1.0"
+description = "本机（x86_64 + RTX 5080，无 NPU）的 Qwen3.8 静态检查与数值模拟环境"
+# 对齐真机容器 vllm-ascend:dev-...-py311-openEuler24.03-lts-aarch64
+requires-python = "==3.11.*"
+
+# 只声明能从 PyPI 可靠解析的部分。
+# vllm 与 vllm-ascend 需要构建期环境变量（VLLM_TARGET_DEVICE=empty /
+# SOC_VERSION+COMPILE_CUSTOM_KERNELS=0）和 --no-deps，由 scripts/setup-devenv.sh 安装。
+dependencies = [
+    # 与真机 requirements.txt 对齐；本机走 PyPI 默认 wheel（自带 CUDA，可吃 5080）
+    "torch==2.10.0",
+    # transformers 的 qwen2_vl 图像处理器在 import 期就要它（patch_qwen3_5 会连带触发）
+    "torchvision",
+    # vllm-ascend 运行期真正 import 到的纯 Python 依赖
+    "decorator",
+    "einops",
+    "numpy",
+    "packaging",
+    "pyyaml",
+    "regex",
+    "scipy",
+    "pandas",
+    "psutil",
+    "compressed_tensors>=0.11.0",
+    "msgpack",
+    # vllm 把它放在 cuda.txt（N-gram 投机采样），empty target 不会带上，
+    # 但 tests/ut 有几个文件 import 期就要它
+    "numba",
+    # vllm 0.27.1 common.txt 里 import 期就会碰到的
+    "transformers>=5.5.3",
+    "pydantic>=2.12.0",
+    "cachetools",
+    "sentencepiece",
+    "tokenizers>=0.21.1",
+    "safetensors>=0.6.2",
+    "huggingface_hub",
+    "openai>=2.0.0",
+    "cloudpickle",
+    "pyzmq",
+]
+
+[dependency-groups]
+# 跑 tests/ut 需要的测试工具（对应真机 requirements-dev.txt 的可移植子集）
+test = [
+    "pytest>=6.0,<9.0.0",
+    "pytest-asyncio",
+    "pytest-mock",
+    "pytest-cov",
+]
+# 静态检查：用真 torch-npu wheel 的类型信息查算子名/参数名，MagicMock 查不出这类错
+lint = [
+    "mypy",
+    "ruff",
+    "types-pyyaml",
+    "types-psutil",
+]
+
+[tool.ruff]
+# 对齐 vllm-ascend 的口径，省得两边来回改格式
+line-length = 120
+
+[tool.uv]
+# torch-npu 的 x86 wheel 装得上但 import 需要 CANN，只作为类型参考，不进主依赖
+package = false
