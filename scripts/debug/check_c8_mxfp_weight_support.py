@@ -38,7 +38,7 @@ import json
 import re
 import struct
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 DEFAULT_MODEL_PATH = "/mnt/share/weight/Qwen3.5-35B-A3B-mxfp4-c8"
@@ -163,7 +163,14 @@ def expected_channel_width(model_path):
 
 
 def scan_tensors(tensors):
-    """Split the tensor names into the buckets the checks below need."""
+    """Split the tensor names into the buckets the checks below need.
+
+    Two of the buckets exist only to keep a miss honest: V_SCALE_SUFFIXES is a
+    hard-coded pair, so a checkpoint that spells the scale differently would
+    otherwise be reported as "no V scale" when it really means "named something
+    this script does not know". attn_module_suffixes and scale_like_suffixes
+    get printed on a miss so the real name is visible instead of guessed at.
+    """
     found = {
         "attn_layers": set(),
         "mtp_attn_layers": set(),
@@ -171,12 +178,18 @@ def scan_tensors(tensors):
         "mtp_v_scales": {},
         "k_scale_names": [],
         "v_proj_out_features": {},
+        "attn_module_suffixes": Counter(),
+        "scale_like_suffixes": Counter(),
     }
     for name, (shard, entry, data_start) in tensors.items():
         is_mtp = bool(MTP_RE.search(name))
         idx = layer_index(name)
         if idx is None:
             continue
+        if ".self_attn." in name:
+            found["attn_module_suffixes"][name.split(".self_attn.", 1)[1]] += 1
+        if "scale" in name.lower() and not name.endswith(".weight_scale"):
+            found["scale_like_suffixes"][".".join(name.rsplit(".", 2)[-2:])] += 1
         if name.endswith(".self_attn.v_proj.weight"):
             found["mtp_attn_layers" if is_mtp else "attn_layers"].add(idx)
             shape = entry.get("shape") or []
@@ -204,12 +217,43 @@ def check_coverage(found, failures):
         failures.append(
             f"{len(missing)} full-attention layer(s) have no V scale -> those layers cache V unscaled (all-127)"
         )
+        report_naming_candidates(found)
     elif attn_layers:
         print("  every full-attention layer has a V scale")
 
     extra = sorted(set(v_scales) - attn_layers)
     if extra:
         print(f"  V scales on layers with no v_proj.weight (ignored by the loader): {extra}")
+
+
+def report_naming_candidates(found):
+    """On a miss, show what IS there so "absent" can be told from "renamed".
+
+    The suffix list this script matches on is hard-coded, so a checkpoint that
+    ships the V-cache scale under a name nobody has seen yet would look exactly
+    like one that has no scale at all. Printing the real inventory settles it.
+    """
+    print()
+    print("  This script matches only: " + ", ".join("*" + s for s in V_SCALE_SUFFIXES))
+    print("  What the checkpoint actually has, so a rename is not mistaken for an absence:")
+
+    scale_like = found["scale_like_suffixes"]
+    if scale_like:
+        print("    scale-ish tensors (excluding *.weight_scale), by name suffix:")
+        for suffix, count in sorted(scale_like.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+            print(f"      {suffix}  x{count}")
+    else:
+        print("    no scale-like tensors anywhere outside *.weight_scale")
+
+    attn_suffixes = found["attn_module_suffixes"]
+    if attn_suffixes:
+        print("    everything under *.self_attn.:")
+        for suffix, count in sorted(attn_suffixes.items()):
+            print(f"      {suffix}  x{count}")
+
+    print("    -> if a V-cache scale appears above under a different name, add it to")
+    print("       V_SCALE_SUFFIXES here AND to suffix_map in modelslim_config.py; the")
+    print("       framework matches the same hard-coded list and would drop it too.")
 
 
 def check_scale_contents(found, expected_width, failures, warnings):
