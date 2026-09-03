@@ -57,6 +57,19 @@ class ScriptDefaultsTest(unittest.TestCase):
         self.assertIn("quant_model_description.json", text)
         self.assertIn("--dtype bfloat16", text)
 
+    def test_27b_graph_plan_follows_mtp_and_batch_bound(self):
+        text = (SCRIPTS_DIR / "27B.sh").read_text(encoding="utf-8")
+
+        # MTP is a token count, not a flag: a bare MTP=1 has to mean one draft
+        # token, and the capture sizes have to be derived rather than pasted,
+        # or a raised MAX_NUM_SEQS silently runs its widest batches eager.
+        self.assertIn('MTP="${MTP:-3}"', text)
+        self.assertIn('"num_speculative_tokens\\":$MTP', text)
+        self.assertIn("decode_query_len=$((MTP + 1))", text)
+        self.assertIn("$((n * decode_query_len))", text)
+        self.assertNotIn("num_speculative_tokens\":3}", text)
+        self.assertNotIn("CAPTURE_SIZES:-1,4,8", text)
+
     def test_container_install_defaults_to_qfa_worktree(self):
         create_container = (SCRIPTS_DIR / "create-container.sh").read_text(
             encoding="utf-8"

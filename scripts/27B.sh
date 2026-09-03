@@ -65,8 +65,7 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 # tokens, which shared blocks cannot track; a QFA-vs-FIA comparison therefore
 # has to pass --no-enable-prefix-caching to the baseline run as well, or the
 # two differ by more than the attention op.
-# GRAPH=0 turns off aclgraph capture (eager). MTP=0 turns off speculative
-# decoding. Both default to on.
+# GRAPH=0 turns off aclgraph capture (eager); it defaults to on.
 qfa_args=()
 if [[ "${QFA:-0}" == "1" ]]; then
     export VLLM_ASCEND_ENABLE_QFA=1
@@ -83,34 +82,58 @@ fi
 # Lowering it is the only way to move that constant without touching code, and
 # the graph-capture crash reproduces nowhere else, so single-variable
 # experiments have to run here rather than in a standalone script.
-# MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split. It
-# also decides which decode batches get a graph at all: a uniform decode step
-# is num_reqs * uniform_decode_query_len tokens (4 here, MTP's 3 draft tokens
-# plus one), and CudagraphDispatcher.dispatch falls back to eager the moment
-# that exceeds the largest CAPTURE_SIZES entry. The 128 ceiling below is
-# exactly 32 * 4, so past 32 concurrent requests the decode runs eager --
-# graphing the full 100 means raising CAPTURE_SIZES to 400, which costs
-# capture time and pool memory. Left at 128 until somebody measures both.
+# MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split and the
+# graph plan below.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-100}"
+if ! [[ "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_NUM_SEQS must be a positive integer, got '$MAX_NUM_SEQS'." >&2
+    exit 1
+fi
 
-# CAPTURE_SIZES and CUDAGRAPH_MODE exist for single-variable graph experiments:
-# capturing one size answers whether a failure needs several graphs sharing a
-# pool, and PIECEWISE keeps attention out of the graph entirely.
-capture_sizes="${CAPTURE_SIZES:-1,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128}"
+# MTP is num_speculative_tokens, not a flag: MTP=3 proposes three draft tokens
+# per step, MTP=0 turns speculative decoding off. It sets the width of a decode
+# step -- one accepted token plus MTP drafts -- which is what the graph plan
+# below is built on.
+MTP="${MTP:-3}"
+if ! [[ "$MTP" =~ ^[0-9]+$ ]]; then
+    echo "MTP must be a non-negative integer (num_speculative_tokens), got '$MTP'." >&2
+    exit 1
+fi
+if [[ "$MTP" == "0" ]]; then
+    spec_args=()
+    decode_query_len=1
+    echo "MTP speculative decoding disabled (MTP=0)." >&2
+else
+    spec_args=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTP}")
+    decode_query_len=$((MTP + 1))
+fi
+
+# A uniform decode step is num_reqs * decode_query_len tokens, and
+# CudagraphDispatcher.dispatch drops to eager the moment that exceeds the
+# largest captured size -- so the plan has to track both MAX_NUM_SEQS and MTP
+# or the top of the batch range silently runs ungraphed. Hence one size per
+# request count, stepping by decode_query_len up to the full batch. Sizes that
+# are not multiples of decode_query_len are pointless: vLLM's
+# adjust_cudagraph_sizes_for_spec_decode round_up's every entry to that
+# multiple, which is why the old hand-written list's leading 1 only ever
+# merged into 4. The count is MAX_NUM_SEQS graphs whatever MTP is, so capture
+# time and pool memory scale with the batch bound; CAPTURE_SIZES still
+# overrides the whole list for single-variable experiments, as does
+# CUDAGRAPH_MODE for keeping attention out of the graph entirely.
+default_capture_sizes=""
+for ((n = 1; n <= MAX_NUM_SEQS; n++)); do
+    default_capture_sizes+="${default_capture_sizes:+,}$((n * decode_query_len))"
+done
+capture_sizes="${CAPTURE_SIZES:-$default_capture_sizes}"
 cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
 compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\"}"
 if [[ "${GRAPH:-1}" == "0" ]]; then
     compilation_config='{"cudagraph_mode":"NONE"}'
     echo "aclgraph capture disabled (GRAPH=0)." >&2
 else
-    echo "aclgraph: mode=$cudagraph_mode sizes=[$capture_sizes]" >&2
-fi
-
-spec_args=(--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}')
-if [[ "${MTP:-1}" == "0" ]]; then
-    spec_args=()
-    echo "MTP speculative decoding disabled (MTP=0)." >&2
+    echo "aclgraph: mode=$cudagraph_mode query_len=$decode_query_len" \
+         "sizes=[$capture_sizes]" >&2
 fi
 
 # The Qwen3 chat template only injects the empty <think></think> block when

@@ -9,7 +9,13 @@ repository serves the model by itself -- the plugin-side adaptation lives in
 - `27B.sh` -- single-node 8-NPU Qwen3.8-27B-MXFP8 baseline, the current
   workhorse. Cleans the devices through `npu-cleaner.sh`, applies the host
   tuning, and exposes `QFA` / `GRAPH` / `MTP` / `THINKING` / `GPU_MEM_UTIL` /
-  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`. `THINKING` writes
+  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`. `MTP` is `num_speculative_tokens` (3 by
+  default, 0 disables speculative decoding), not an on/off flag. The aclgraph
+  capture sizes follow it and `MAX_NUM_SEQS` together -- one size per request
+  count, stepping by `MTP + 1` -- because a decode batch wider than the largest
+  captured size runs eager; that is `MAX_NUM_SEQS` graphs, so the batch bound
+  is also the capture-time and pool-memory bound. `CAPTURE_SIZES` still
+  overrides the list outright. `THINKING` writes
   `--default-chat-template-kwargs '{"enable_thinking": ...}'`, on by default;
   a request that carries its own `chat_template_kwargs` still overrides it.
 - `serve_qwen3.8_2.4t_4node.sh` -- the four-node 32-NPU launcher for the
