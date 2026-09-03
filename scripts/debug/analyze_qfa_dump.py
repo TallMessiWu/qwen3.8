@@ -117,6 +117,7 @@ def reference_attention(
     value: torch.Tensor,
     softmax_scale: float,
     causal: bool = True,
+    gqa: str = "interleave",
 ) -> torch.Tensor:
     """Exact attention in float64. query [Tq, H, D], key/value [Tkv, N, D]."""
     tq, h, _ = query.shape
@@ -125,10 +126,17 @@ def reference_attention(
     k = key.to(torch.float64).permute(1, 0, 2)  # [N, Tkv, D]
     v = value.to(torch.float64).permute(1, 0, 2)
 
-    # GQA: every group of H/N query heads shares one KV head.
+    # GQA head mapping. "interleave" gives consecutive query heads to one KV
+    # head (head i -> i // (H/N)); "tile" strides instead (head i -> i % N).
+    # Which one an operator uses is a layout convention, not something the
+    # shapes reveal, so --diagnose measures both rather than assuming.
     repeat = h // n
-    k = k.repeat_interleave(repeat, dim=0)
-    v = v.repeat_interleave(repeat, dim=0)
+    if gqa == "tile":
+        k = k.repeat(repeat, 1, 1)
+        v = v.repeat(repeat, 1, 1)
+    else:
+        k = k.repeat_interleave(repeat, dim=0)
+        v = v.repeat_interleave(repeat, dim=0)
 
     scores = torch.matmul(q, k.transpose(-1, -2)) * softmax_scale  # [H, Tq, Tkv]
     if causal and tq > 1:
@@ -174,6 +182,60 @@ def optimal_v_scale_error(value_bf16: torch.Tensor) -> float:
     scale = torch.pow(torch.tensor(2.0, dtype=torch.float64), exponent)
     quantized = (v * scale).to(torch.float8_e4m3fn).to(torch.float64) / scale
     return rel_l2(quantized, v)
+
+
+def diagnose_pair(cache_write: dict, qfa_call: dict, label: str) -> None:
+    """Sweep the reference's layout conventions to see which one QFA actually used.
+
+    When [compute] comes out far above the couple of percent an FP8 matmul
+    costs, the likely culprit is a convention this script assumed rather than
+    the operator being wrong: which KV head a query head reads, whether the mask
+    is applied, where the causal diagonal sits. Each is a discrete choice, so
+    measuring all of them is quicker and safer than reasoning about which is
+    right -- the combination that drops the error to a few percent is the one
+    the operator uses.
+    """
+    print(f"\n=== {label} (diagnose) ===")
+    op_kwargs = qfa_call["op_kwargs"]
+    seqused_kv = op_kwargs["seqused_kv"].to(torch.int64)
+    if seqused_kv.numel() != 1:
+        print("  batch > 1, skipping")
+        return
+    kv_len = int(seqused_kv[0])
+    block_table = qfa_call["block_table_local"]
+    num_heads = int(qfa_call["num_heads"])
+    head_size = int(qfa_call["head_size"])
+    softmax_scale = float(qfa_call["softmax_scale"])
+
+    key_deq = dequant_k_cache(qfa_call["key_cache"], qfa_call["key_scale_cache"])
+    value_deq = dequant_v_cache(qfa_call["value_cache"], qfa_call["value_scale_cache"])
+    k_seq = gather_kv(key_deq, block_table[0], kv_len)
+    v_seq = gather_kv(value_deq, block_table[0], kv_len)
+    q_deq = dequant_along_last(qfa_call["q_fp8"], qfa_call["q_descale"])
+    out = qfa_call["attn_output"].reshape(-1, num_heads, head_size)
+
+    # Also try K/V straight from the pre-cache tensors: if these beat the paged
+    # ones, the paging/scale-layout assumption is what is wrong, not the math.
+    variants = [("cache", k_seq, v_seq)]
+    if "key_mxfp8" in cache_write and "key_scale" in cache_write:
+        k_direct = dequant_along_last(cache_write["key_mxfp8"], cache_write["key_scale"])
+        v_scale = e8m0_to_float(cache_write["v_cache_scale"]).reshape(1, k_direct.shape[1], head_size)
+        v_direct = cache_write["value_mxfp8"].to(torch.float64) * v_scale
+        variants.append(("pre-cache", k_direct, v_direct))
+
+    print(f"  {'K/V source':<12} {'GQA':<11} {'causal':<8} rel_l2      cos")
+    best = None
+    for src, kk, vv in variants:
+        for gqa in ("interleave", "tile"):
+            for causal in (True, False):
+                ref = reference_attention(q_deq, kk, vv, softmax_scale, causal=causal, gqa=gqa)
+                err = rel_l2(out, ref)
+                cos = cosine(out, ref)
+                print(f"  {src:<12} {gqa:<11} {causal!s:<8} {err * 100:8.3f}%   {cos:.6f}")
+                if best is None or err < best[0]:
+                    best = (err, src, gqa, causal)
+    if best:
+        print(f"  -> lowest: {best[1]} / GQA {best[2]} / causal={best[3]} at {best[0] * 100:.3f}%")
 
 
 def analyze_pair(cache_write: dict, qfa_call: dict, label: str) -> dict:
@@ -335,6 +397,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dump_dir", nargs="?", help="directory written by VLLM_ASCEND_QFA_DUMP_DIR")
     parser.add_argument("--selftest", action="store_true", help="verify the dequantizers, no dump needed")
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="sweep GQA mapping / causal / cache-vs-pre-cache to find which convention QFA uses",
+    )
     args = parser.parse_args()
 
     if args.selftest:
@@ -379,6 +446,19 @@ def main() -> int:
         return 1
 
     print(f"found {len(pairs)} dump pair(s) under {dump_dir}")
+
+    if args.diagnose:
+        # One pair is enough: the conventions are global, not per-layer.
+        write_file, call_file = pairs[0]
+        diagnose_pair(
+            load_dump(str(write_file)),
+            load_dump(str(call_file)),
+            call_file.name.replace("__qfa_call.pt", ""),
+        )
+        print()
+        print("[GREEN]")
+        return 0
+
     all_results = []
     for write_file, call_file in pairs:
         label = call_file.name.replace("__qfa_call.pt", "")
