@@ -48,6 +48,7 @@ Usage (inside the serving container, no server running):
   python scripts/debug/test_qfa_as_fia_npu.py --bench
   python scripts/debug/test_qfa_as_fia_npu.py --model 35b
   python scripts/debug/test_qfa_as_fia_npu.py --model 35b --bench
+  python scripts/debug/test_qfa_as_fia_npu.py --model 35b --all   # both halves
   python scripts/debug/test_qfa_as_fia_npu.py --bench --shape decode-b32-16k
 """
 
@@ -553,26 +554,8 @@ def _print_bench_table(rows: list) -> None:
     )
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--case", choices=CASES)
-    ap.add_argument("--bench", action="store_true", help="time the two operators instead of comparing")
-    ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
-    ap.add_argument("--iters", type=int, default=20)
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--model", choices=sorted(MODELS), default="27b", help="shape preset")
-    for _name in SHAPE_FLAGS:
-        ap.add_argument("--" + _name.replace("_", "-"), type=int, help="override the preset")
-    args = ap.parse_args()
-    apply_shape(args)
-    if args.case:
-        return run_case(args.case)
-    if args.shape:
-        row = next(r for r in BENCH_SHAPES if r[0] == args.shape)
-        return run_bench(*row, iters=args.iters, warmup=args.warmup)
-    if args.bench:
-        return run_bench_sweep(args)
-
+def run_all_cases(args) -> int:
+    """Every accuracy case, one subprocess each."""
     results = {}
     for case in CASES:
         print(f"== {case}")
@@ -595,6 +578,44 @@ def main() -> int:
     else:
         print("The two operators disagree beyond rounding -- a layout is wrong.")
     return 0 if all(results.values()) else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--case", choices=CASES)
+    ap.add_argument("--bench", action="store_true", help="time the two operators instead of comparing")
+    ap.add_argument("--all", action="store_true",
+                    help="accuracy cases first, then the bench sweep")
+    ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
+    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--model", choices=sorted(MODELS), default="27b", help="shape preset")
+    for _name in SHAPE_FLAGS:
+        ap.add_argument("--" + _name.replace("_", "-"), type=int, help="override the preset")
+    args = ap.parse_args()
+    apply_shape(args)
+    if args.case:
+        return run_case(args.case)
+    if args.shape:
+        row = next(r for r in BENCH_SHAPES if r[0] == args.shape)
+        return run_bench(*row, iters=args.iters, warmup=args.warmup)
+    if args.bench:
+        return run_bench_sweep(args)
+    if args.all:
+        # Accuracy first: it is the cheap half, and a layout error makes the
+        # timings meaningless anyway. Both halves run whatever the first
+        # returns, so one RED does not hide the other's numbers.
+        print("=== accuracy ===", flush=True)
+        accuracy = run_all_cases(args)
+        print()
+        print("=== performance ===", flush=True)
+        performance = run_bench_sweep(args)
+        print()
+        print(f"accuracy: {'GREEN' if accuracy == 0 else 'RED'}   "
+              f"performance: {'GREEN' if performance == 0 else 'RED'}")
+        return accuracy or performance
+
+    return run_all_cases(args)
 
 
 if __name__ == "__main__":
