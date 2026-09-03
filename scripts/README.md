@@ -8,8 +8,10 @@ repository serves the model by itself -- the plugin-side adaptation lives in
 
 - `27B.sh` -- single-node 8-NPU Qwen3.8-27B-MXFP8 baseline, the current
   workhorse. Cleans the devices through `npu-cleaner.sh`, applies the host
-  tuning, and exposes `QFA` / `GRAPH` / `MTP` / `GPU_MEM_UTIL` /
-  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
+  tuning, and exposes `QFA` / `GRAPH` / `MTP` / `THINKING` / `GPU_MEM_UTIL` /
+  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`. `THINKING` writes
+  `--default-chat-template-kwargs '{"enable_thinking": ...}'`, on by default;
+  a request that carries its own `chat_template_kwargs` still overrides it.
 - `serve_qwen3.8_2.4t_4node.sh` -- the four-node 32-NPU launcher for the
   ModelSlim mxfp8 Qwen3.8-2.4T-A95B checkpoint. `2.4T-0.sh` through `2.4T-3.sh`
   are per-machine wrappers that only pin `NODE_RANK`, the IPs and the NIC.
@@ -47,6 +49,11 @@ directory, whatever its name says.
   the load branch is chosen from the tensor name, not the shape.
 - `debug/verify_expert_split_axis.py` -- proves on the real bytes which axis a
   fused `gate_up` export was split along, by sign-bit correlation.
+- `debug/check_chat_template_thinking.py` -- answers "was thinking already on
+  before anyone passed `enable_thinking`": renders the checkpoint's chat
+  template with the kwarg absent, true and false, and says which pair matches.
+  Uses jinja2 when it is importable and falls back to reading the template's
+  `enable_thinking` lines when it is not.
 - `debug/estimate_hbm_budget.py` -- answers "do N machines have enough HBM":
   splits the checkpoint into EP-sharded, TP-sharded and replicated bytes (only
   the first shrinks when you add nodes), sizes per-token KV and per-request GDN

@@ -85,7 +85,7 @@ fi
 # experiments have to run here rather than in a standalone script.
 # MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-100}"
 
 # CAPTURE_SIZES and CUDAGRAPH_MODE exist for single-variable graph experiments:
 # capturing one size answers whether a failure needs several graphs sharing a
@@ -106,6 +106,19 @@ if [[ "${MTP:-1}" == "0" ]]; then
     echo "MTP speculative decoding disabled (MTP=0)." >&2
 fi
 
+# The Qwen3 chat template only injects the empty <think></think> block when
+# enable_thinking is explicitly false, so an absent kwarg already means
+# thinking on. Passing it makes that the server's own default instead of the
+# template's, which is what --reasoning-parser qwen3 assumes anyway, and gives
+# THINKING=0 a lever that does not need every client to send
+# chat_template_kwargs. A request that sends its own enable_thinking still
+# wins -- the CLI value is only a default to merge under it.
+enable_thinking=true
+if [[ "${THINKING:-1}" == "0" ]]; then
+    enable_thinking=false
+    echo "thinking disabled (THINKING=0)." >&2
+fi
+
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
@@ -117,6 +130,7 @@ exec vllm serve "$MODEL_PATH" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --reasoning-parser qwen3 \
+    --default-chat-template-kwargs "{\"enable_thinking\": $enable_thinking}" \
     --compilation-config "$compilation_config" \
     "${spec_args[@]}" \
     --trust-remote-code \
