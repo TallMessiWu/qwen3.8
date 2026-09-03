@@ -51,7 +51,14 @@ def e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
     mxfp_c8.py's process_weights_after_loading() does the same rewrite: a minmax
     calibrator emits 0 for an all-zero channel, and 2^-127 there would send any
     non-zero activation to inf on the reciprocal.
+
+    Accepts either spelling of the same bytes: the cache stores its scales as
+    uint8, while q_descale comes back as float8_e8m0fnu. Casting the latter to
+    an integer would convert its *value* (2^-7 -> 0), not read its exponent
+    byte, so it has to go through a byte view first.
     """
+    if "float8" in str(raw.dtype):
+        raw = raw.view(torch.uint8)
     raw = raw.to(torch.int64)
     exponent = torch.where(raw == 0, torch.full_like(raw, E8M0_BIAS), raw) - E8M0_BIAS
     return torch.pow(torch.tensor(2.0, dtype=torch.float64), exponent.to(torch.float64))
@@ -288,6 +295,18 @@ def selftest() -> int:
     v_err = rel_l2(v_deq, vq.to(torch.float64) * v_mult)
     print(f"  V dequant round-trip rel_l2 = {v_err:.3e}  (expect 0)")
     ok &= v_err < 1e-12
+
+    # The same exponent bytes arrive as uint8 from the cache and as
+    # float8_e8m0fnu from q_descale; both must decode identically.
+    byte = torch.tensor([100, 118, 127, 130, 0], dtype=torch.uint8)
+    as_e8m0 = byte.view(torch.float8_e8m0fnu)
+    dtype_err = rel_l2(e8m0_to_float(as_e8m0), e8m0_to_float(byte))
+    print(f"  E8M0 uint8 vs float8 view      rel_l2 = {dtype_err:.3e}  (expect 0)")
+    ok &= dtype_err < 1e-12
+    expected_120 = 2.0 ** (118 - E8M0_BIAS)
+    got_120 = float(e8m0_to_float(as_e8m0)[1])
+    print(f"  byte 118 -> {got_120:g}  (expect {expected_120:g})")
+    ok &= abs(got_120 - expected_120) < 1e-30
 
     # Reference attention against a hand-rolled single-head case.
     q1 = torch.randn(4, 2, 8, dtype=torch.float64)
