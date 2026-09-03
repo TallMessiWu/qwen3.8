@@ -141,19 +141,6 @@ def replay_one(write_file: Path, call_file: Path, dump_dir: Path, dry_run: bool)
         print("  dry run: everything needed for a replay is present and consistent")
         return True
 
-    import torch_npu  # noqa: F401  (registers the NPU device)
-
-    # torch.ops._C_ascend.* are vllm-ascend's own kernels, not torch_npu's:
-    # enable_custom_op() points ASCEND_CUSTOM_OPP_PATH at the vendored operators
-    # and imports the extension that registers them into the torch library.
-    # Without it the namespace exists but is empty.
-    from vllm_ascend.utils import enable_custom_op
-
-    if not enable_custom_op():
-        print("  [FAIL] vllm-ascend custom ops did not load; run this from an env where")
-        print("         the package is installed (the same one that serves the model)")
-        return False
-
     device = "npu"
     q_fp8 = to_device(call["q_fp8"], device)
     q_descale = to_device(call["q_descale"], device)
@@ -237,6 +224,44 @@ def replay_one(write_file: Path, call_file: Path, dump_dir: Path, dry_run: bool)
     return ok
 
 
+def register_custom_ops() -> bool:
+    """Register torch.ops._C_ascend.* -- vllm-ascend's kernels, not torch_npu's.
+
+    Deliberately not via enable_custom_op(): that gates on
+    get_current_hardware_profile(), which a standalone script has not set up, and
+    it swallows the ImportError so a failure arrives as a bare False. Doing the
+    two real steps here keeps the actual reason visible.
+    """
+    import torch_npu  # noqa: F401  (registers the NPU device)
+    from vllm_ascend.utils import bootstrap_custom_op_env
+
+    def _import_extension():
+        import vllm_ascend.vllm_ascend_C  # type: ignore # noqa: F401
+
+    bootstrap_custom_op_env()
+    try:
+        _import_extension()
+    except ImportError as exc:
+        # The extension prefers its own rpath for the vendor op_api; fall back to
+        # LD_LIBRARY_PATH only when the import says that is what is missing.
+        if "libcust_opapi.so" not in str(exc):
+            print(f"  cannot import vllm_ascend.vllm_ascend_C: {exc}")
+            return False
+        print(f"  first import failed ({exc}); retrying with the vendor lib path")
+        bootstrap_custom_op_env(include_vendor_lib=True)
+        try:
+            _import_extension()
+        except ImportError as exc2:
+            print(f"  still failing: {exc2}")
+            return False
+
+    if not hasattr(torch.ops._C_ascend, "npu_quant_flash_attn"):
+        print("  extension loaded but npu_quant_flash_attn is not registered.")
+        print("  The QFA kernels are built separately -- see scripts/debug/build_qfa_ops.sh.")
+        return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dump_dir", help="directory written by VLLM_ASCEND_QFA_DUMP_DIR")
@@ -258,6 +283,13 @@ def main() -> int:
 
     mode = "dry run (no NPU)" if args.dry_run else "replaying on NPU"
     print(f"found {len(pairs)} recorded call(s) under {dump_dir} -- {mode}")
+
+    if not args.dry_run:
+        print("\nregistering vllm-ascend custom ops...")
+        if not register_custom_ops():
+            print("\n[RED] cannot replay without torch.ops._C_ascend.npu_quant_flash_attn")
+            return 1
+        print("  ok, npu_quant_flash_attn is available")
 
     results = [replay_one(w, c, dump_dir, args.dry_run) for w, c in pairs]
 
