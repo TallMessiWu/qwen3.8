@@ -476,8 +476,9 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
             num_key_value_heads=NKV, num_heads=NQ, scale=D ** -0.5, sparse_mode=3)
 
     def call_quant():
+        # q only. K/V come out of the C8 cache already MXFP8 -- quantizing them
+        # per step was the pre-C8 path and is not what the engine does now.
         _qfa_quant(q, D)
-        quant_kv()
 
     result = {
         "shape": label,
@@ -528,7 +529,7 @@ def run_bench_sweep(args) -> int:
 def _print_bench_table(rows: list) -> None:
     head = (
         f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'speedup':>9}"
-        f"{'quant ms':>10}{'today ms':>10}{'meta ms':>9}"
+        f"{'q-quant':>10}{'step ms':>10}{'meta ms':>9}"
     )
     print("\n" + head)
     print("-" * len(head))
@@ -536,18 +537,20 @@ def _print_bench_table(rows: list) -> None:
         if row.get("error"):
             print(f"{row['shape']:<16}{row['error']:>46}")
             continue
-        today = row["qfa_ms"] + row["quant_ms"]
+        step = row["qfa_ms"] + row["quant_ms"]
         speedup = row["fia_ms"] / row["qfa_ms"] if row["qfa_ms"] else float("nan")
         print(
             f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}"
-            f"{speedup:>8.2f}x{row['quant_ms']:>10.3f}{today:>10.3f}{row['metadata_ms']:>9.3f}"
+            f"{speedup:>8.2f}x{row['quant_ms']:>10.3f}{step:>10.3f}{row['metadata_ms']:>9.3f}"
         )
     print(
-        "\nspeedup = FIA / QFA, per attention layer -- this is the post-6.3 number,\n"
-        "  QFA reads MXFP8 whoever wrote it.\n"
-        "quant ms = quantizing the whole KV cache on the fly, per layer per step.\n"
-        "  It is what makes 'today ms' worse than FIA, and it disappears once the\n"
-        "  cache is stored as MXFP8. Not part of the operator; never subtract it.\n"
+        "\nspeedup = FIA / QFA, per attention layer, both reading what the C8 cache holds:\n"
+        "  FIA bf16, QFA MXFP8. Decode is KV-bandwidth bound and QFA reads half the\n"
+        "  bytes, so watch how the ratio moves with context length.\n"
+        "q-quant = quantizing this step's query, per layer per step. K/V are\n"
+        "  not quantized: the C8 cache already holds them as MXFP8. Not part of\n"
+        "  the operator; never subtract it.\n"
+        "step ms = QFA + q-quant, one attention layer per decode step.\n"
         "meta ms = the AICPU plan, paid once per step for all layers, not per layer.\n"
         "  It is not optional: the doc calls it a scheduling hint, but passing None\n"
         "  is rejected outright (EZ0004) -- hence no no-metadata column."
