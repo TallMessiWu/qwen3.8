@@ -141,7 +141,18 @@ def replay_one(write_file: Path, call_file: Path, dump_dir: Path, dry_run: bool)
         print("  dry run: everything needed for a replay is present and consistent")
         return True
 
-    import torch_npu  # noqa: F401  (registers the NPU device and custom ops)
+    import torch_npu  # noqa: F401  (registers the NPU device)
+
+    # torch.ops._C_ascend.* are vllm-ascend's own kernels, not torch_npu's:
+    # enable_custom_op() points ASCEND_CUSTOM_OPP_PATH at the vendored operators
+    # and imports the extension that registers them into the torch library.
+    # Without it the namespace exists but is empty.
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        print("  [FAIL] vllm-ascend custom ops did not load; run this from an env where")
+        print("         the package is installed (the same one that serves the model)")
+        return False
 
     device = "npu"
     q_fp8 = to_device(call["q_fp8"], device)
@@ -200,7 +211,10 @@ def replay_one(write_file: Path, call_file: Path, dump_dir: Path, dry_run: bool)
             int(call["num_kv_heads"]),
             int(call["head_size"]),
             1,
-            v_descale=torch.zeros(1, 1, 1, 1, 1, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu),
+            # Same 5D minimum-size E8M0 placeholder the builder uses: the aclnn
+            # entry requires vDescale to be non-null and 5D under PA_BBND, but
+            # nothing reads it there.
+            v_descale=torch.zeros(1, 1, 1, 1, 2, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu),
             **op_kwargs_dev,
         )
     except Exception as exc:  # noqa: BLE001
