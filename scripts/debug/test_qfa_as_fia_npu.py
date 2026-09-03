@@ -24,8 +24,12 @@ result_compare_method) rather than bit-exact -- and the first token of a sequenc
 attends a single KV with no softmax averaging, so its pointwise error is large by
 construction and says nothing about correctness.
 
-Cases use the live 27B prefill/decode shapes (Nq=24 Nkv=4 D=256, block 128).
-Each runs in its own subprocess: an AICPU abort poisons the device.
+Shapes come from --model (default 27b: Nq=24 Nkv=4 D=256 block 128; 35b:
+Nq=16 Nkv=2 D=256 block 512), with per-field flags to override. Both models are
+D=256, but the decode bandwidth ratio this measures depends on NKV*D bytes per
+token and BLOCK per page -- measuring one model's numbers against the other's
+server answers nothing. Each case runs in its own subprocess: an AICPU abort
+poisons the device.
 
 --bench times the two operators instead of comparing them, over the shapes the
 27B config actually produces. What it answers is "what will QFA be worth once
@@ -42,6 +46,8 @@ Usage (inside the serving container, no server running):
   python scripts/debug/test_qfa_as_fia_npu.py
   python scripts/debug/test_qfa_as_fia_npu.py --case dense
   python scripts/debug/test_qfa_as_fia_npu.py --bench
+  python scripts/debug/test_qfa_as_fia_npu.py --model 35b
+  python scripts/debug/test_qfa_as_fia_npu.py --model 35b --bench
   python scripts/debug/test_qfa_as_fia_npu.py --bench --shape decode-b32-16k
 """
 
@@ -50,9 +56,53 @@ import os
 import subprocess
 import sys
 
+# Shape presets. Both served models are D=256, but the head counts and the
+# kernel block size differ -- and the decode bandwidth ratio this script exists
+# to measure depends on exactly those (NKV * D bytes per token, BLOCK per page),
+# so measuring 27B's numbers against a 35B server would answer nothing.
+MODELS = {
+    "27b": {"num_heads": 24, "num_kv_heads": 4, "head_dim": 256,
+            "block_size": 128, "prefill_len": 1594},
+    "35b": {"num_heads": 16, "num_kv_heads": 2, "head_dim": 256,
+            "block_size": 512, "prefill_len": 1552},
+}
+
+# Defaults are 27B's, as they always were. apply_shape() overwrites them from
+# --model / the per-field flags before anything reads them; the module-level
+# names stay so the call sites below need no threading.
 NQ, NKV, D, BLOCK, WINDOW = 24, 4, 256, 128, 64
 PREFILL_LEN = 1594
 DECODE_REQS, DECODE_KV = 4, 300
+
+# WINDOW is MXFP8's scale grouping, not a model shape -- it stays 64.
+SHAPE_FLAGS = ("num_heads", "num_kv_heads", "head_dim", "block_size", "prefill_len")
+
+
+def apply_shape(args) -> None:
+    """Resolve the preset plus any per-field override into the globals."""
+    global NQ, NKV, D, BLOCK, PREFILL_LEN
+    preset = MODELS[args.model]
+    resolved = {name: getattr(args, name) or preset[name] for name in SHAPE_FLAGS}
+    NQ = resolved["num_heads"]
+    NKV = resolved["num_kv_heads"]
+    D = resolved["head_dim"]
+    BLOCK = resolved["block_size"]
+    PREFILL_LEN = resolved["prefill_len"]
+    print(
+        f"shapes: model={args.model} num_heads={NQ} num_kv_heads={NKV} "
+        f"head_dim={D} block_size={BLOCK} prefill_len={PREFILL_LEN}",
+        flush=True,
+    )
+
+
+def shape_argv(args) -> list:
+    """The shape flags, for passing down to a per-case subprocess."""
+    argv = ["--model", args.model]
+    for name in SHAPE_FLAGS:
+        value = getattr(args, name)
+        if value is not None:
+            argv += ["--" + name.replace("_", "-"), str(value)]
+    return argv
 CASES = ["dense", "paged"]
 
 # The shapes the live 27B config produces. Prefill is one request at a time with
@@ -462,7 +512,7 @@ def run_bench_sweep(args) -> int:
         print(f"== {label}", flush=True)
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "--shape", label,
-             "--iters", str(args.iters), "--warmup", str(args.warmup)],
+             "--iters", str(args.iters), "--warmup", str(args.warmup), *shape_argv(args)],
             capture_output=True, text=True,
         )
         line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("BENCH-RESULT ")), None)
@@ -519,7 +569,11 @@ def main() -> int:
     ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--model", choices=sorted(MODELS), default="27b", help="shape preset")
+    for _name in SHAPE_FLAGS:
+        ap.add_argument("--" + _name.replace("_", "-"), type=int, help="override the preset")
     args = ap.parse_args()
+    apply_shape(args)
     if args.case:
         return run_case(args.case)
     if args.shape:
@@ -531,7 +585,8 @@ def main() -> int:
     results = {}
     for case in CASES:
         print(f"== {case}")
-        proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--case", case],
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--case", case,
+                               *shape_argv(args)],
                               capture_output=True, text=True)
         results[case] = proc.returncode == 0
         for line in (proc.stdout + proc.stderr).splitlines():
