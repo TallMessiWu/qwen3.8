@@ -467,12 +467,6 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
             block_table=table, attn_mask=mask, metadata=metadata,
             softmax_scale=D ** -0.5, **args)
 
-    def call_qfa_nometa():
-        torch.ops._C_ascend.npu_quant_flash_attn(
-            q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale, 1,
-            block_table=table, attn_mask=mask, metadata=None,
-            softmax_scale=D ** -0.5, **args)
-
     def call_fia():
         torch_npu.npu_fused_infer_attention_score(
             query=q, key=fia_key, value=fia_value, atten_mask=mask,
@@ -492,9 +486,6 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
         "kv_len": kv_len,
         "fia_ms": _time(call_fia, iters, warmup) * 1e3,
         "qfa_ms": _time(call_qfa, iters, warmup) * 1e3,
-        # What the plan buys. If this is close to qfa_ms, the graph path can
-        # drop metadata and stop straddling the doc's consistency requirement.
-        "qfa_nometa_ms": _time(call_qfa_nometa, iters, warmup) * 1e3,
         "quant_ms": _time(call_quant, iters, warmup) * 1e3,
         "metadata_ms": _time(call_metadata, iters, warmup) * 1e3,
     }
@@ -525,13 +516,17 @@ def run_bench_sweep(args) -> int:
             reason = tail[-1][:44] if tail else f"exit {proc.returncode}"
             rows.append({"shape": label, "error": reason})
             print(f"   FAILED: {reason}", flush=True)
+            # The table column is 44 chars wide, which truncates every aclnn
+            # error to the point of uselessness. Print the real tail here.
+            for line in tail[-4:]:
+                print(f"     | {line}", flush=True)
     _print_bench_table(rows)
     return 0 if any("error" not in r for r in rows) else 1
 
 
 def _print_bench_table(rows: list) -> None:
     head = (
-        f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'no-meta':>9}{'speedup':>9}"
+        f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'speedup':>9}"
         f"{'quant ms':>10}{'today ms':>10}{'meta ms':>9}"
     )
     print("\n" + head)
@@ -542,9 +537,8 @@ def _print_bench_table(rows: list) -> None:
             continue
         today = row["qfa_ms"] + row["quant_ms"]
         speedup = row["fia_ms"] / row["qfa_ms"] if row["qfa_ms"] else float("nan")
-        nometa = row.get("qfa_nometa_ms", float("nan"))
         print(
-            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}{nometa:>9.3f}"
+            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}"
             f"{speedup:>8.2f}x{row['quant_ms']:>10.3f}{today:>10.3f}{row['metadata_ms']:>9.3f}"
         )
     print(
@@ -554,11 +548,8 @@ def _print_bench_table(rows: list) -> None:
         "  It is what makes 'today ms' worse than FIA, and it disappears once the\n"
         "  cache is stored as MXFP8. Not part of the operator; never subtract it.\n"
         "meta ms = the AICPU plan, paid once per step for all layers, not per layer.\n"
-        "no-meta = the same op with metadata=None. The doc calls the plan an optional\n"
-        "  scheduling optimization; if this column is close to QFA ms, the graph path can\n"
-        "  drop it -- and with it the requirement that two calls' arguments stay in step,\n"
-        "  which capture/replay cannot honour and which the doc says ends in illegal\n"
-        "  memory access."
+        "  It is not optional: the doc calls it a scheduling hint, but passing None\n"
+        "  is rejected outright (EZ0004) -- hence no no-metadata column."
     )
 
 
