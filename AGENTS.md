@@ -31,7 +31,7 @@ qwen3.8/                   # 主仓（git，分支 main）
 │   ├── setup/             # 构建与安装入口
 │   ├── debug/             # 一次性诊断的暂存区，查完即删
 │   └── local/             # 例外：只在本机跑的环境搭建与静态检查脚本
-├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.2rc0+）
+├── vllm/                  # submodule「vllm」→ 上游 vLLM（只读参考，当前 v0.27.1 = 真机版本）
 └── vllm-ascend/           # git worktree 根，一个分支一个目录
     ├── main/              # submodule「vllm-ascend」→ 个人 fork，跟踪 origin/main
     └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
@@ -85,9 +85,11 @@ python scripts/local/check_patch_targets.py     # patch 目标还在不在、参
 bash scripts/local/run_cpu_ut.sh                # CPU 单测 + 跟已知基线比对
 ```
 
-vllm 源码取自 `.dev/vllm-0.27.1`（从 `vllm/` submodule 派生的只读 worktree），
-**不要拿 `vllm/` 的工作区当真机参考**——它现在停在 v0.28.1rc0，比真机装的 0.27.1
-领先 1300+ commit，照着它查函数签名会得出跟真机对不上的结论。
+vllm 源码取自 `.dev/vllm-0.27.1`——从 `vllm/` submodule 派生、**钉死在 0.27.1** 的只读
+worktree。`vllm/` 本身当前也正好是 v0.27.1（与真机同一个 commit），所以现在两者等价；
+但 submodule 指针会随任务移动，而 `.dev/` 不会。**查真机的函数签名前先确认
+`git -C vllm describe --tags` 是不是 0.27.1**，拿不准就直接看 `.dev/vllm-0.27.1`。
+（曾经 `vllm/` 停在 v0.28.1rc0、领先真机 1300+ commit，照着它查会得出对不上的结论。）
 能拦什么、拦不住什么、已知的 4 条基线失败，见 `scripts/local/README.md`。
 
 ## 常用命令（全部在某个 vllm-ascend worktree 目录内执行）
@@ -148,6 +150,12 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`；在途功能分支 `junlin-qfa`（QFA 算子接入，官方 master QFA 已 vendor 进 csrc）基于 upstream/main，有独立 worktree。旧的 `archive-qfa-mxfp8-attn`（原 `feat/qfa-mxfp8-attn`）已废弃归档，勿参考。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。在途分支（都基于 upstream/main，各有独立 worktree）：
+
+- `junlin-qfa` —— QFA 算子接入主线，官方 master QFA 已 vendor 进 csrc。容器默认 editable 安装的就是它。
+- `junlin-qfa-c8switch` —— 在它之上加 `VLLM_ASCEND_DISABLE_C8_MXFP`，用来强制关掉 C8 拿 bf16 基线。
+- `feat-qfa-dump` —— 在它之上加 QFA 输入输出的 dump 插桩（`vllm_ascend/attention/qfa_dump.py`），配合 `scripts/bench/replay_qfa_dump.py` 回放。
+
+旧的 `archive-qfa-mxfp8-attn`（原 `feat/qfa-mxfp8-attn`）已废弃归档，勿参考。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。

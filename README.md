@@ -238,10 +238,10 @@ bash scripts/setup/create-container.sh \
     ├── skills-lock.json
     ├── pics/                        # 架构页面使用的图片
     ├── qwen3.8-architecture.html
+    ├── c8-recipes.html              # 两份 C8 权重的配方对照，临时转发用，可删
     ├── docs/                        # 长文档，见开头的「文档入口」
     ├── scripts/
     │   ├── README.md                # 每个脚本的用途与运行方式
-    │   ├── create-container.sh      # 宿主机容器创建入口
     │   ├── 27B.sh                   # 单机 8 卡服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
     │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
