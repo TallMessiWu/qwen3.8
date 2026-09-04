@@ -72,9 +72,12 @@ fi
 # an immediate EOS -- so moving it is how the causal link gets tested. Here it
 # goes from 400 to 4096, clamped by the 512-tokens-per-rank MC2 limit.
 # That size also decides how much HCCL window MoeDistributeDispatch demands, and
-# 2048MB is not enough for it: the tiling check asks for 4433MB and fails with
-# EZ1008 during profile_run, naming HCCL_BUFFSIZE_EP. So raise that alongside,
-# e.g. HCCL_BUFFSIZE_EP=5120, and expect the window to come out of KV cache.
+# the defaults above are not enough: its tiling check asks for 4433MB here and
+# fails with EZ1008 during profile_run. Raise HCCL_BUFFSIZE, not the EP one --
+# the message blames HCCL_BUFFSIZE_EP, but taking that from 2048 to 5120 left
+# the reported "actual CCL_BUFFSIZE" at 2048MB, which is 2 x HCCL_BUFFSIZE both
+# times. So HCCL_BUFFSIZE=2560 buys a 5120MB window, and it comes out of KV
+# cache -- drop GPU_MEM_UTIL if the KV budget then goes negative.
 additional_config='{"enable_cpu_binding":true'
 if [[ "${PREFILL_MC2:-0}" == "1" ]]; then
     additional_config+=',"enable_prefill_mc2":true'
