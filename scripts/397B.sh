@@ -71,6 +71,10 @@ fi
 # all-to-all, and that switch-over is where long prompts start answering with
 # an immediate EOS -- so moving it is how the causal link gets tested. Here it
 # goes from 400 to 4096, clamped by the 512-tokens-per-rank MC2 limit.
+# That size also decides how much HCCL window MoeDistributeDispatch demands, and
+# 2048MB is not enough for it: the tiling check asks for 4433MB and fails with
+# EZ1008 during profile_run, naming HCCL_BUFFSIZE_EP. So raise that alongside,
+# e.g. HCCL_BUFFSIZE_EP=5120, and expect the window to come out of KV cache.
 additional_config='{"enable_cpu_binding":true'
 if [[ "${PREFILL_MC2:-0}" == "1" ]]; then
     additional_config+=',"enable_prefill_mc2":true'
