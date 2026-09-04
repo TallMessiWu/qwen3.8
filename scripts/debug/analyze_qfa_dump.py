@@ -184,6 +184,45 @@ def optimal_v_scale_error(value_bf16: torch.Tensor) -> float:
     return rel_l2(quantized, v)
 
 
+def diagnose_quant_direction(cache_write: dict, qfa_call: dict) -> None:
+    """Check this script's E8M0 reading and dequant direction against the framework's own.
+
+    The dump carries the multiplier the framework actually handed to
+    npu_quantize (v_cache_scale_float_reciprocal) next to the raw E8M0 bytes it
+    came from, and the quantized V next to the bf16 it came from. That makes
+    both assumptions checkable rather than argued about:
+      - decoding: this script's multiplier times the framework's reciprocal
+        must be exactly 1, or the exponent is being read wrong;
+      - direction: exactly one of (value * recip) and (value / recip) will
+        reproduce the stored FP8 to within rounding.
+    """
+    print("  quantization conventions, checked against the framework's own numbers:")
+    recip = cache_write.get("v_cache_scale_float_reciprocal")
+    raw = cache_write.get("v_cache_scale")
+    if recip is None or raw is None:
+        print("    (dump predates these fields; re-dump to check)")
+        return
+
+    mine = e8m0_to_float(raw).flatten()
+    product = mine * recip.to(torch.float64).flatten()
+    off = float((product - 1.0).abs().max())
+    print(f"    E8M0 decode:  max|mine * framework_reciprocal - 1| = {off:.3e}  (expect 0)")
+    if off > 1e-9:
+        sample_raw = int(raw.flatten()[0])
+        print(f"      -> mismatch. byte {sample_raw} -> mine {float(mine[0]):g}, "
+              f"framework reciprocal {float(recip.flatten()[0]):g}")
+
+    v_bf16 = cache_write["value_bf16"].to(torch.float64)
+    v_q = cache_write["value_mxfp8"].to(torch.float64)
+    n, d = v_bf16.shape[1], v_bf16.shape[2]
+    r = recip.to(torch.float64).reshape(1, n, d)
+    err_mul = rel_l2(v_q, v_bf16 * r)
+    err_div = rel_l2(v_q, v_bf16 / r)
+    print(f"    V quantize:   value * recip -> {err_mul * 100:8.3f}%    value / recip -> {err_div * 100:8.3f}%")
+    print(f"      -> stored FP8 matches '{'value * recip' if err_mul < err_div else 'value / recip'}'"
+          f"; dequant must therefore {'divide by' if err_mul < err_div else 'multiply by'} recip")
+
+
 def diagnose_pair(cache_write: dict, qfa_call: dict, label: str) -> None:
     """Sweep the reference's layout conventions to see which one QFA actually used.
 
@@ -196,6 +235,7 @@ def diagnose_pair(cache_write: dict, qfa_call: dict, label: str) -> None:
     the operator uses.
     """
     print(f"\n=== {label} (diagnose) ===")
+    diagnose_quant_direction(cache_write, qfa_call)
     op_kwargs = qfa_call["op_kwargs"]
     seqused_kv = op_kwargs["seqused_kv"].to(torch.int64)
     if seqused_kv.numel() != 1:
