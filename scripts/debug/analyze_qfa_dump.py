@@ -222,6 +222,28 @@ def diagnose_quant_direction(cache_write: dict, qfa_call: dict) -> None:
     print(f"      -> stored FP8 matches '{'value * recip' if err_mul < err_div else 'value / recip'}'"
           f"; dequant must therefore {'divide by' if err_mul < err_div else 'multiply by'} recip")
 
+    # Where the scaled values land decides whether the loss is saturation at the
+    # top of e4m3's range or crushing at the bottom of it. e4m3 tops out at 448
+    # and its smallest subnormal is 2^-9, and with only 3 mantissa bits anything
+    # down in the subnormals keeps almost no relative precision.
+    scaled = v_bf16 * r
+    mag = scaled.abs()
+    nonzero = mag[mag > 0]
+    fp8_max, fp8_min_subnormal = 448.0, 2.0**-9
+    saturated = float((mag > fp8_max).to(torch.float64).mean())
+    subnormal = float(((mag > 0) & (mag < 2.0**-6)).to(torch.float64).mean())
+    print(
+        f"    scaled |value|: median {float(nonzero.median()):.4g}  max {float(mag.max()):.4g}"
+        if nonzero.numel()
+        else "    scaled |value|: all zero"
+    )
+    print(f"      saturating (>{fp8_max:g}): {saturated * 100:.2f}%    subnormal (<2^-6): {subnormal * 100:.2f}%")
+    # Applying e4m3's own limits should reproduce the stored tensor almost exactly;
+    # whatever error survives is not explained by range at all.
+    modelled = scaled.clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn).to(torch.float64)
+    print(f"      clamp+cast to e4m3 reproduces the stored FP8 to {rel_l2(v_q, modelled) * 100:.3f}%")
+    print(f"      (e4m3 min subnormal is {fp8_min_subnormal:g}; values under it quantize to zero)")
+
 
 def diagnose_pair(cache_write: dict, qfa_call: dict, label: str) -> None:
     """Sweep the reference's layout conventions to see which one QFA actually used.
