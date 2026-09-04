@@ -237,6 +237,48 @@ def diagnose_pair(cache_write: dict, qfa_call: dict, label: str) -> None:
     if best:
         print(f"  -> lowest: {best[1]} / GQA {best[2]} / causal={best[3]} at {best[0] * 100:.3f}%")
 
+    # Per-head: pair each query head with each KV head on its own. This reads the
+    # mapping off the data instead of assuming a convention, and the best-match
+    # error says whether the mapping is even the problem -- if a single head
+    # still misses by a lot when paired with its best KV head, nothing about
+    # head assignment can explain the gap.
+    print()
+    print("  per-head, matched against each KV head separately:")
+    print(f"  {'q_head':<8} {'best_kv':<9} {'err(best)':>11}   err(others)")
+    mapping = []
+    per_head_best = []
+    for h in range(num_heads):
+        errs = []
+        for n in range(k_seq.shape[1]):
+            ref_h = reference_attention(
+                q_deq[:, h : h + 1], k_seq[:, n : n + 1], v_seq[:, n : n + 1], softmax_scale
+            )
+            errs.append(rel_l2(out[:, h : h + 1], ref_h))
+        pick = min(range(len(errs)), key=lambda i: errs[i])
+        mapping.append(pick)
+        per_head_best.append(errs[pick])
+        others = "  ".join(f"{e * 100:.1f}%" for i, e in enumerate(errs) if i != pick)
+        print(f"  {h:<8} {pick:<9} {errs[pick] * 100:10.3f}%   {others}")
+    n_kv = k_seq.shape[1]
+    print(f"  -> observed mapping:    {mapping}")
+    print(f"  -> interleave would be: {[h // (num_heads // n_kv) for h in range(num_heads)]}")
+    print(f"  -> tile would be:       {[h % n_kv for h in range(num_heads)]}")
+    worst = max(per_head_best)
+    print(f"  -> best-match error per head: min {min(per_head_best) * 100:.3f}%  max {worst * 100:.3f}%")
+    if worst > 0.1:
+        print("     A head that still misses this much with its best KV head means the")
+        print("     mapping is not the issue -- look at the maths or the inputs instead.")
+
+    # Per-token: a causal reference gets progressively more context, so an error
+    # that grows or collapses along the sequence points at the mask or at the
+    # positions, while a flat profile points at something uniform.
+    ref = reference_attention(q_deq, k_seq, v_seq, softmax_scale)
+    tq = out.shape[0]
+    print()
+    print("  per-token error along the sequence:")
+    line = "  ".join(f"t{t}={rel_l2(out[t], ref[t]) * 100:.1f}%" for t in range(min(tq, 16)))
+    print(f"    {line}")
+
 
 def analyze_pair(cache_write: dict, qfa_call: dict, label: str) -> dict:
     """Report one layer/call: quantization, compute and end-to-end losses."""
