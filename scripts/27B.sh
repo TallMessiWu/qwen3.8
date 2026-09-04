@@ -112,6 +112,12 @@ fi
 # MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split and the
 # graph plan below.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
+# Bounds one scheduler step. On an EP MoE it also bounds the MoE comm choice:
+# a step wider than mc2_tokens_capacity falls to all-to-all, which miscomputes
+# under aclgraph. With enable_prefill_mc2 the capacity is
+# min(ceil(this/tp), 512) * tp, so setting this to the capacity makes
+# "step <= capacity" hold by construction and the bad branch unreachable.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-100}"
 if ! [[ "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_NUM_SEQS must be a positive integer, got '$MAX_NUM_SEQS'." >&2
@@ -189,7 +195,7 @@ exec vllm serve "$MODEL_PATH" \
     --data-parallel-size 1 \
     --tensor-parallel-size 1 \
     --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-batched-tokens 16384 \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --reasoning-parser qwen3 \
