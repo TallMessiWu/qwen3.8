@@ -58,8 +58,19 @@ V_SCALE_SUFFIXES = (".v_proj.kv_cache_scale", ".v_proj.v_scale")
 # checkpoint was produced with a different one.
 K_SCALE_SUFFIXES = (".k_proj.kv_cache_scale", ".k_proj.k_scale")
 
-# TP sizes worth checking the per-channel split against.
-TP_SIZES = (1, 2, 4, 8, 16)
+# Mirrors MXFP_KV_SCALE_GROUP_SIZE in vllm_ascend/device/mxfp_kv_cache.py:
+# the K scale cache groups head_dim into 64-wide slots, and building it
+# raises outright when head_dim does not divide by this.
+SCALE_GROUP_SIZE = 64
+
+# TP sizes worth checking the per-channel split against. Goes past 16 because
+# 397B-class models are served far wider than the 35B this started on.
+TP_SIZES = (1, 2, 4, 8, 16, 32, 64)
+
+# head_dim values QFA has actually been run at here. Others are not known to
+# fail -- they are just untested, and the report says so rather than implying
+# either answer.
+MEASURED_HEAD_DIMS = (256,)
 
 LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 MTP_RE = re.compile(r"(?:^|\.)mtp\.")
@@ -158,10 +169,17 @@ def check_kv_cache_type(model_path, failures):
         print("  note: this selects the int8 dense-attention C8 path (kv_c8.py), not MXFP8.")
 
 
-def expected_channel_width(model_path):
-    """Section 2: num_kv_heads * head_dim, or None when config.json is unclear."""
+def expected_channel_width(model_path, failures, warnings):
+    """Section 2: geometry the C8 cache needs, and what would keep QFA off anyway.
+
+    Two separate gates live here. The cache itself refuses to be built unless
+    head_dim divides by 64 (validate_mxfp_k_scale_head_dim). And even with the
+    cache up, _qfa_serves declines any layer that has attention sinks or a
+    sliding window, so a checkpoint carrying either would quietly fall back to
+    FIA on those layers -- worth knowing before blaming the operator.
+    """
     print()
-    print("--- 2. expected per-channel width ---")
+    print("--- 2. model geometry and QFA's serve conditions ---")
     config = load_json(model_path / "config.json")
     text_config = {}
     if config:
@@ -175,12 +193,56 @@ def expected_channel_width(model_path):
     head_dim = merged.get("head_dim")
     if head_dim is None and merged.get("hidden_size") and merged.get("num_attention_heads"):
         head_dim = merged["hidden_size"] // merged["num_attention_heads"]
+
+    width = None
     if num_kv_heads and head_dim:
         width = num_kv_heads * head_dim
         print(f"  num_key_value_heads={num_kv_heads} head_dim={head_dim} -> expect {width} channels")
-        return width
-    print("  config.json did not give num_key_value_heads/head_dim; falling back to v_proj.weight shapes")
-    return None
+
+        # Hard gate: the K scale cache groups along head_dim in 64-wide slots.
+        if head_dim % SCALE_GROUP_SIZE:
+            failures.append(
+                f"head_dim {head_dim} is not divisible by {SCALE_GROUP_SIZE}; "
+                "validate_mxfp_k_scale_head_dim() raises and the C8 cache cannot be built"
+            )
+        else:
+            print(f"  head_dim % {SCALE_GROUP_SIZE} == 0, so the K scale cache is constructible")
+
+        # TP splits the per-channel scale; _quant_weight_loader asserts on a
+        # ragged split. 397B-class models run wide, so check past 16.
+        bad_tp = [tp for tp in TP_SIZES if width % tp]
+        if bad_tp:
+            warnings.append(
+                f"{width} channels is not divisible by TP size(s) {bad_tp}; "
+                "_quant_weight_loader would assert if served at those"
+            )
+        else:
+            print(f"  {width} channels divides evenly across TP {list(TP_SIZES)}")
+
+        if head_dim not in MEASURED_HEAD_DIMS:
+            warnings.append(
+                f"head_dim {head_dim} has not been exercised on QFA here (measured: "
+                f"{sorted(MEASURED_HEAD_DIMS)}); the operator may well take it, but that is untested"
+            )
+    else:
+        print("  config.json did not give num_key_value_heads/head_dim; falling back to v_proj.weight shapes")
+
+    # Soft gates: these do not stop C8, they stop QFA from serving those layers.
+    sliding = merged.get("sliding_window")
+    uses_sliding = merged.get("use_sliding_window", sliding is not None)
+    if sliding and uses_sliding:
+        warnings.append(
+            f"config sets sliding_window={sliding} with use_sliding_window={uses_sliding}; "
+            "_qfa_serves declines any layer with a sliding window, which falls back to FIA"
+        )
+    layer_types = merged.get("layer_types")
+    if isinstance(layer_types, list) and any("sliding" in str(t) for t in layer_types):
+        sliding_layers = sum(1 for t in layer_types if "sliding" in str(t))
+        warnings.append(f"layer_types marks {sliding_layers} sliding-attention layer(s); QFA will not serve those")
+    if merged.get("attention_sinks") or merged.get("sinks"):
+        warnings.append("config declares attention sinks; _qfa_serves declines those layers")
+
+    return width
 
 
 def scan_tensors(tensors):
@@ -337,12 +399,15 @@ def check_scale_contents(found, expected_width, failures, warnings):
     if len(widths) > 1:
         warnings.append(f"V scales disagree on channel count across layers: {sorted(widths)}")
     width = min(widths)
-    bad_tp = [tp for tp in TP_SIZES if width % tp]
-    if bad_tp:
-        warnings.append(
-            f"channel count {width} is not divisible by TP size(s) {bad_tp}; "
-            "_quant_weight_loader would assert there"
-        )
+    # Section 2 already reports TP divisibility from config.json; only fall back
+    # to the measured width when config could not supply the geometry.
+    if expected_width is None:
+        bad_tp = [tp for tp in TP_SIZES if width % tp]
+        if bad_tp:
+            warnings.append(
+                f"channel count {width} is not divisible by TP size(s) {bad_tp}; "
+                "_quant_weight_loader would assert there"
+            )
 
     print()
     pct = (100.0 * total_zeros / total_channels) if total_channels else 0.0
@@ -416,7 +481,7 @@ def main():
     warnings = []
 
     check_kv_cache_type(model_path, failures)
-    expected_width = expected_channel_width(model_path)
+    expected_width = expected_channel_width(model_path, failures, warnings)
 
     print()
     print("--- 3. per-layer V scale ---")
