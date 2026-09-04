@@ -65,6 +65,19 @@ if [[ "${EP:-1}" == "0" ]]; then
     echo "expert parallelism disabled (EP=0)." >&2
 fi
 
+# PREFILL_MC2=1 sizes the MC2 buffers from max-num-batched-tokens instead of
+# the largest captured graph size (set_mc2_tokens_capacity is its only reader).
+# That size is where select_moe_comm_method stops using MC2 and falls to
+# all-to-all, and that switch-over is where long prompts start answering with
+# an immediate EOS -- so moving it is how the causal link gets tested. Here it
+# goes from 400 to 4096, clamped by the 512-tokens-per-rank MC2 limit.
+additional_config='{"enable_cpu_binding":true'
+if [[ "${PREFILL_MC2:-0}" == "1" ]]; then
+    additional_config+=',"enable_prefill_mc2":true'
+    echo "prefill MC2 on: MC2 capacity sized from max-num-batched-tokens." >&2
+fi
+additional_config+='}'
+
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
@@ -224,5 +237,5 @@ exec vllm serve "$MODEL_PATH" \
     --mm-processor-cache-gb 0 \
     --mm-encoder-tp-mode data \
     --mm-processor-cache-type shm \
-    --additional-config '{"enable_cpu_binding":true}' \
+    --additional-config "$additional_config" \
     "${qfa_args[@]}"

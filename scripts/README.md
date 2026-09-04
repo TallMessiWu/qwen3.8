@@ -19,7 +19,8 @@ chased this week, cleared once that question is answered.
   name it serves whatever `MODEL_PATH` points at, 35B included.
 - `397B.sh` -- single-node Qwen3.5-397B. A copy of `27B.sh` differing only in
   the checkpoint, `--tensor-parallel-size 8`, expert parallelism (`EP=0` turns
-  it off for a diagnostic) and the HCCL buffer sizing EP's all-to-all needs;
+  it off for a diagnostic, `PREFILL_MC2=1` moves the MC2/all-to-all switch-over
+  off the captured graph size) and the HCCL buffer sizing EP's all-to-all needs;
   every switch behaves identically, which a test pins by diffing the two.
 - `2.4T-{0..3}.sh` -- the four-node 2.4T launchers, one per node.
 - `serve_qwen3.8_2.4t_4node.sh`, `serve_qwen3.8_2.4t_single_node_4layer.sh` --
