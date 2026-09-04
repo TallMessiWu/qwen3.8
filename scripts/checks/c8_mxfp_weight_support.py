@@ -35,7 +35,7 @@ Pure stdlib, read-only, never imports torch/vllm and never touches the NPU.
 Only safetensors headers plus the V-scale tensors themselves are read, so this
 is cheap even on a multi-hundred-GB checkpoint.
 
-Usage: python3 check_c8_mxfp_weight_support.py [MODEL_PATH]
+Usage: python3 c8_mxfp_weight_support.py [MODEL_PATH]
 Final line is [GREEN] (exit 0) or [RED] (exit 1).
 """
 

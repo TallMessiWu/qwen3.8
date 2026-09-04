@@ -71,10 +71,10 @@ class ScriptDefaultsTest(unittest.TestCase):
         self.assertNotIn("CAPTURE_SIZES:-1,4,8", text)
 
     def test_container_install_defaults_to_qfa_worktree(self):
-        create_container = (SCRIPTS_DIR / "create-container.sh").read_text(
+        create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
             encoding="utf-8"
         )
-        installer = (SCRIPTS_DIR / "install-vllm-ascend.sh").read_text(
+        installer = (SCRIPTS_DIR / "setup" / "install-vllm-ascend.sh").read_text(
             encoding="utf-8"
         )
 

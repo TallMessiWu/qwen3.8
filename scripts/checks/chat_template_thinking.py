@@ -16,7 +16,7 @@ Renders it three ways when jinja2 is importable (it is, wherever transformers
 is), because the rendered prompts are the actual evidence; falls back to
 printing the ``enable_thinking`` lines when it is not.
 
-    python3 scripts/debug/check_chat_template_thinking.py \
+    python3 scripts/checks/chat_template_thinking.py \
         /mnt/share/weight/Qwen3.8-27B-mxfp8
 """
 

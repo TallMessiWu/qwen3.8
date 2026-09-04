@@ -43,13 +43,13 @@ interesting output is how the ratio moves with context length, not any single
 number.
 
 Usage (inside the serving container, no server running):
-  python scripts/debug/test_qfa_as_fia_npu.py
-  python scripts/debug/test_qfa_as_fia_npu.py --case dense
-  python scripts/debug/test_qfa_as_fia_npu.py --bench
-  python scripts/debug/test_qfa_as_fia_npu.py --model 35b
-  python scripts/debug/test_qfa_as_fia_npu.py --model 35b --bench
-  python scripts/debug/test_qfa_as_fia_npu.py --model 35b --all   # both halves
-  python scripts/debug/test_qfa_as_fia_npu.py --bench --shape decode-b32-16k
+  python scripts/bench/test_qfa_vs_fia.py
+  python scripts/bench/test_qfa_vs_fia.py --case dense
+  python scripts/bench/test_qfa_vs_fia.py --bench
+  python scripts/bench/test_qfa_vs_fia.py --model 35b
+  python scripts/bench/test_qfa_vs_fia.py --model 35b --bench
+  python scripts/bench/test_qfa_vs_fia.py --model 35b --all   # both halves
+  python scripts/bench/test_qfa_vs_fia.py --bench --shape decode-b32-16k
 """
 
 import argparse
@@ -225,7 +225,7 @@ def run_case(name: str) -> int:
     import torch_npu  # noqa: F401
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_junlin_qfa_npu import bootstrap_ops
+    from test_qfa_op import bootstrap_ops
 
     torch.npu.set_device(int(os.environ.get("QFA_DEVICE", "0")))
     bootstrap_ops()
@@ -396,7 +396,7 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
     import torch_npu  # noqa: F401
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_junlin_qfa_npu import bootstrap_ops
+    from test_qfa_op import bootstrap_ops
 
     torch.npu.set_device(int(os.environ.get("QFA_DEVICE", "0")))
     bootstrap_ops()

@@ -8,7 +8,7 @@
 # pip_install log. Does NOT touch build dirs -- run this BEFORE any rebuild.
 #
 # Usage (inside the serving container):
-#   bash scripts/debug/diag_qfa_tiling_registry.sh [worktree_dir]
+#   bash scripts/setup/diag_qfa_tiling_registry.sh [worktree_dir]
 
 set -uo pipefail
 

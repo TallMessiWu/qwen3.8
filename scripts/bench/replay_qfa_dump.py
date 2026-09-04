@@ -23,7 +23,7 @@ Needs an NPU. Use --dry-run to check loading, dtype restoration and shape
 reconstruction anywhere, without torch_npu and without touching the device.
 
 Usage:
-  python3 replay_qfa_dump_npu.py DUMP_DIR [--dry-run]
+  python3 replay_qfa_dump.py DUMP_DIR [--dry-run]
 Final line is [GREEN] (exit 0) or [RED] (exit 1).
 """
 
@@ -257,7 +257,7 @@ def register_custom_ops() -> bool:
 
     if not hasattr(torch.ops._C_ascend, "npu_quant_flash_attn"):
         print("  extension loaded but npu_quant_flash_attn is not registered.")
-        print("  The QFA kernels are built separately -- see scripts/debug/build_qfa_ops.sh.")
+        print("  The QFA kernels are built separately -- see scripts/setup/build_qfa_ops.sh.")
         return False
     return True
 

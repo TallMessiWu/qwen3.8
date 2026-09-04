@@ -37,8 +37,8 @@ with an identical argument set (the op does no cross-call validation).
 Prints [GREEN]/[RED] per case and exits non-zero on any RED.
 
 Usage (inside the serving container, after pip_install_qfa.sh):
-  python scripts/debug/test_junlin_qfa_npu.py
-  QFA_CASES=PA-N2TGD python scripts/debug/test_junlin_qfa_npu.py   # one case
+  python scripts/bench/test_qfa_op.py
+  QFA_CASES=PA-N2TGD python scripts/bench/test_qfa_op.py   # one case
 """
 
 import math

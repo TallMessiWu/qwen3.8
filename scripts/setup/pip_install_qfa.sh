@@ -7,7 +7,7 @@
 # at the end -- this script prints exactly those sections for handoff.
 #
 # Usage (inside the serving container):
-#   bash scripts/debug/pip_install_qfa.sh [worktree_dir]
+#   bash scripts/setup/pip_install_qfa.sh [worktree_dir]
 # Env: SOC_VERSION (default ascend950pr_9589)
 
 set -uo pipefail
@@ -74,4 +74,4 @@ assert hasattr(torch.ops._C_ascend, "npu_quant_flash_attn"), "npu_quant_flash_at
 assert hasattr(torch.ops._C_ascend, "npu_quant_flash_attn_metadata"), "metadata op missing"
 print("[GREEN] torch.ops._C_ascend.npu_quant_flash_attn{,_metadata} registered")
 EOF
-echo "[GREEN] full install done (log: $LOG); next: python scripts/debug/test_junlin_qfa_npu.py"
+echo "[GREEN] full install done (log: $LOG); next: python scripts/bench/test_qfa_op.py"

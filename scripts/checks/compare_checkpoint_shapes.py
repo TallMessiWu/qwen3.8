@@ -279,8 +279,6 @@ def main():
             print("      Every 'gate_proj' here is really the first half of hidden for gate AND up,")
             print("      so no loader-side reshape can recover it correctly without re-pairing the")
             print("      two tensors. The quantized export is the broken artifact.")
-            print("      Confirm on real bytes with:")
-            print("        python3 verify_expert_split_axis.py <quant_path> <bf16_path>")
         else:
             print("      config.json and this quantized export disagree about the expert layout.")
         return 1

@@ -133,7 +133,7 @@ git -C "${VLLM_ASCEND_QFA}" submodule status --recursive
 - `/home`、`/mnt`、`/data` 会按相同绝对路径挂载进容器。自定义项目路径、
   checkout、代理或安装脚本时，路径必须位于容器可见的挂载目录中。
 - 安装脚本默认位于
-  `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh`，可通过
+  `/home/hajimi/qwen3.8/scripts/setup/install-vllm-ascend.sh`，可通过
   `--install-script` 覆盖。
 - editable 安装使用的 checkout 默认为 QFA 分支 worktree
   `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa`，
@@ -159,7 +159,7 @@ ls /dev/davinci{0..7}
 
 ```bash
 cd /home/hajimi/qwen3.8
-bash scripts/create-container.sh
+bash scripts/setup/create-container.sh
 ```
 
 脚本会创建 privileged、host network、host PID 的 8 卡容器，挂载宿主机
@@ -178,8 +178,8 @@ docker exec -it hajimi-vllm bash
 两个脚本同时支持 `--参数 值` 和 `--参数=值`。完整列表：
 
 ```bash
-bash scripts/create-container.sh --help
-bash scripts/install-vllm-ascend.sh --help
+bash scripts/setup/create-container.sh --help
+bash scripts/setup/install-vllm-ascend.sh --help
 ```
 
 常用参数：
@@ -188,7 +188,7 @@ bash scripts/install-vllm-ascend.sh --help
 | --- | --- |
 | `--image` | 默认 vendor A5 镜像 |
 | `--container-name` | `hajimi-vllm` |
-| `--install-script` | `/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh` |
+| `--install-script` | `/home/hajimi/qwen3.8/scripts/setup/install-vllm-ascend.sh` |
 | `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa` |
 | `--proxy-file` | `/home/hajimi/proxy.sh`，不存在时跳过 |
 | `--shell-workdir` | `/home/hajimi/qwen3.8/scripts` |
@@ -201,10 +201,10 @@ bash scripts/install-vllm-ascend.sh --help
 示例：
 
 ```bash
-bash scripts/create-container.sh \
+bash scripts/setup/create-container.sh \
   --image vllm-ascend:custom-a5 \
   --container-name qwen38-test \
-  --install-script /mnt/qwen3.8/scripts/install-vllm-ascend.sh \
+  --install-script /mnt/qwen3.8/scripts/setup/install-vllm-ascend.sh \
   --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/junlin-qfa \
   --proxy-file /mnt/proxy.sh \
   --shell-workdir /mnt/qwen3.8/scripts \
@@ -242,15 +242,16 @@ bash scripts/create-container.sh \
     ├── scripts/
     │   ├── README.md                # 每个脚本的用途与运行方式
     │   ├── create-container.sh      # 宿主机容器创建入口
-    │   ├── install-vllm-ascend.sh   # 容器内 Python 包安装入口
     │   ├── 27B.sh                   # 单机 8 卡服务入口
     │   ├── 2.4T-0.sh ... 2.4T-3.sh # 四机服务入口
     │   ├── serve_qwen3.8_2.4t_4node.sh # 四机共用服务启动脚本
     │   ├── serve_qwen3.8_2.4t_single_node_4layer.sh # 单机裁层冒烟
     │   ├── npu-cleaner.sh           # 清理残留在指定卡上的进程
     │   ├── curl.sh                  # 多模态请求冒烟
-    │   ├── bench_qfa_vs_fia.py      # QFA / FIA 对比压测
-    │   ├── debug/                   # 服务器上跑的诊断与复现脚本
+    │   ├── bench/                   # 算子精度与性能基准，长期复用
+    │   ├── checks/                  # 权重与设备体检，长期复用
+    │   ├── setup/                   # 构建与安装入口
+    │   ├── debug/                   # 一次性诊断的暂存区，查完即删
     │   ├── runtime/                 # 裁层 checkpoint 运行时过滤器
     │   └── tests/                   # 脚本静态回归测试
     ├── ops-transformer/             # CANN 算子源码克隆，被 gitignore，不属于本仓

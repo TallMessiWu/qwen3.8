@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在【本机】（x86_64 + NVIDIA GPU，无 NPU、无 CANN）重建 Qwen3.8 的静态检查 /
-# 数值模拟环境。这不是服务器脚本——服务器侧请用 scripts/install-vllm-ascend.sh。
+# 数值模拟环境。这不是服务器脚本——服务器侧请用 scripts/setup/install-vllm-ascend.sh。
 #
 # 环境构成，刻意对齐真机容器（py311 + vllm 0.27.1 + torch 2.10.0）：
 #   - Python 3.11

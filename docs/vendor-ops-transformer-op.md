@@ -171,7 +171,7 @@ target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
 )
 ```
 
-排查工具已经写好：`scripts/debug/diag_qfa_tiling_registry.sh`，
+排查工具已经写好：`scripts/setup/diag_qfa_tiling_registry.sh`，
 对构建产物跑 `ldd -r` 一次列出所有未解析符号，别一个一个 dlopen 试。
 
 ### 坑二：AICPU 的 CMake 签名不同
@@ -375,7 +375,7 @@ qfa_events: dict[int, list[torch.npu.ExternalEvent]] = field(default_factory=dic
 **快速迭代（只编两个算子，10–40 分钟）**
 
 ```bash
-bash scripts/debug/build_qfa_ops.sh /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
+bash scripts/setup/build_qfa_ops.sh /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 ```
 
 失败时它会把 ninja 的 `FAILED:` 块和编译器错误抽出来打印——**不要在滚动输出里找错误**，
@@ -385,7 +385,7 @@ bash scripts/debug/build_qfa_ops.sh /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 **全量 editable 安装**
 
 ```bash
-bash scripts/debug/pip_install_qfa.sh /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
+bash scripts/setup/pip_install_qfa.sh /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 ```
 
 **坑五：快速构建的产物会污染全量构建。** 两算子构建留下的 `csrc/build/custom` 是一个
@@ -397,9 +397,9 @@ third-party tarball 在 `build/` 之外，清了不会重新下载。
 成功判据：`torch.ops._C_ascend.<op>` 存在。之后跑数值验证：
 
 ```bash
-python scripts/debug/run_doc_examples_qfa_npu.py   # 官方文档示例
-python scripts/debug/test_qfa_as_fia_npu.py        # 与 FIA 对齐
-python scripts/bench_qfa_vs_fia.py                 # 性能对比
+python scripts/bench/test_qfa_op.py        # 8 个 case 对 golden
+python scripts/bench/test_qfa_vs_fia.py        # 与 FIA 对齐
+python scripts/bench/test_qfa_vs_fia.py --bench  # 性能对比
 ```
 
 ---

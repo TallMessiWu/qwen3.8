@@ -7,7 +7,7 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-vllm-ascend:dev-26.1.0.day20260817-A5-py311-openEuler24.03-lts-aarch64}"
 CONTAINER_NAME="${CONTAINER_NAME:-hajimi-vllm}"
-INSTALL_SCRIPT=/home/hajimi/qwen3.8/scripts/install-vllm-ascend.sh
+INSTALL_SCRIPT=/home/hajimi/qwen3.8/scripts/setup/install-vllm-ascend.sh
 VLLM_ASCEND_REPO=/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 PROXY_FILE=/home/hajimi/proxy.sh
 SHELL_WORKDIR=/home/hajimi/qwen3.8/scripts

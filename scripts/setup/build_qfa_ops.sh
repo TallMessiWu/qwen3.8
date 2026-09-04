@@ -9,7 +9,7 @@
 # symbols. Ends with [GREEN]/[RED].
 #
 # Usage (inside the serving container):
-#   bash scripts/debug/build_qfa_ops.sh [worktree_dir]
+#   bash scripts/setup/build_qfa_ops.sh [worktree_dir]
 # Default worktree: /home/hajimi/qwen3.8/vllm-ascend/junlin-qfa
 
 set -uo pipefail

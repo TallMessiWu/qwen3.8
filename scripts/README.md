@@ -4,108 +4,87 @@ Everything here runs on the server unless it says otherwise. Nothing in this
 repository serves the model by itself -- the plugin-side adaptation lives in
 `vllm-ascend`, and these are the assets used to launch, diagnose and regress it.
 
+Directories are split by lifetime, because the two kinds of script age very
+differently. `bench/`, `checks/` and `setup/` are meant to be re-run for months:
+every new checkpoint, CANN version or vendored-operator rebase is a reason to
+run them again. `debug/` is the opposite -- scratch space for whatever is being
+chased this week, cleared once that question is answered.
+
 ## Service launchers
 
-- `27B.sh` -- single-node 8-NPU Qwen3.8-27B-MXFP8 baseline, the current
-  workhorse. Cleans the devices through `npu-cleaner.sh`, applies the host
-  tuning, and exposes `QFA` / `GRAPH` / `MTP` / `THINKING` / `GPU_MEM_UTIL` /
-  `MAX_MODEL_LEN` / `MAX_NUM_SEQS`. `MTP` is `num_speculative_tokens` (3 by
-  default, 0 disables speculative decoding), not an on/off flag. The aclgraph
-  capture sizes follow it and `MAX_NUM_SEQS` together -- one size per request
-  count, stepping by `MTP + 1` -- because a decode batch wider than the largest
-  captured size runs eager; that is `MAX_NUM_SEQS` graphs, so the batch bound
-  is also the capture-time and pool-memory bound. `CAPTURE_SIZES` still
-  overrides the list outright. `THINKING` writes
-  `--default-chat-template-kwargs '{"enable_thinking": ...}'`, on by default;
-  a request that carries its own `chat_template_kwargs` still overrides it.
-  Both launchers carry `--profiler-config` for the torch/NPU profiler, armed
-  but idle until `/start_profile` is posted; traces land in `./profiling`
-  relative to wherever the launcher was started.
-- `serve_qwen3.8_2.4t_4node.sh` -- the four-node 32-NPU launcher for the
-  ModelSlim mxfp8 Qwen3.8-2.4T-A95B checkpoint. `2.4T-0.sh` through `2.4T-3.sh`
-  are per-machine wrappers that only pin `NODE_RANK`, the IPs and the NIC.
-- `serve_qwen3.8_2.4t_single_node_4layer.sh` -- four-layer weight smoke test on
-  one node. Refuses a quant description whose entries are all FLOAT, i.e. a
-  checkpoint that was never actually quantized.
-- `curl.sh` -- serves the test images over a local `http.server` and sends two
-  multimodal chat requests, so the payload stays a URL instead of base64.
-- `npu-cleaner.sh` -- kills leftover processes on the given device ids.
+- `27B.sh` -- single-node 8-NPU launcher, the current workhorse. Cleans the
+  devices through `npu-cleaner.sh`, applies the host settings, and exposes the
+  switches the QFA work needs: `QFA`, `GRAPH`, `MTP` (a token count, not a
+  flag), `C8`, `CAPTURE_SIZES`, `MAX_NUM_SEQS`, `CUDAGRAPH_MODE`. Despite the
+  name it serves whatever `MODEL_PATH` points at, 35B included.
+- `2.4T-{0..3}.sh` -- the four-node 2.4T launchers, one per node.
+- `serve_qwen3.8_2.4t_4node.sh`, `serve_qwen3.8_2.4t_single_node_4layer.sh` --
+  the underlying serve commands those wrap.
+- `curl.sh` -- multimodal smoke request against a running server.
+- `npu-cleaner.sh` -- frees devices left busy by a killed run.
 
-## Container and install
+## bench/ -- operator accuracy and performance (NPU required)
 
-- `create-container.sh` -- creates the privileged A5 serving container on the
-  host and installs the host-mounted vLLM-Ascend checkout into it.
-- `install-vllm-ascend.sh` -- the in-container half: editable install from a
-  mounted checkout, or a requested package version.
-- `debug/pip_install_qfa.sh` -- full editable install with the log captured and
-  the real errors extracted from the TBE cascade noise.
-- `debug/build_qfa_ops.sh` -- fast-iteration build of the two QFA custom ops
-  only, with readable ninja error extraction.
-- `debug/diag_qfa_tiling_registry.sh` -- read-only triage for the mass
-  "do not registe tiling struct" build failures.
+Long-lived. Re-run these after a CANN upgrade, a vendored-operator rebase, or
+any change to the attention call site.
 
-## Checkpoint diagnostics
+- `test_qfa_op.py` -- does the vendored QuantFlashAttn compute the right
+  answer at all? Eight self-contained cases against golden data, covering TND,
+  PA_BNBD, PA_BBND and N2TGD layouts plus the MTP and aclgraph shapes. Builds
+  its own inputs, so it needs no checkpoint and no server.
+- `test_qfa_vs_fia.py` -- how does QFA compare with the FIA baseline?
+  Three-way accuracy (QFA / FIA on dequantized input / FIA on bf16), which
+  separates the quantization loss from the operator difference, plus `--bench`
+  for timings across prefill and decode shapes.
+- `replay_qfa_dump.py` -- feeds a dump captured from a live server back into
+  the operator and checks it reproduces the recorded output bit-for-bit. Proves
+  a dump is self-contained enough to reproduce a problem away from the engine,
+  which is what an operator bug report has to ship. Capture the dump by setting
+  `VLLM_ASCEND_QFA_DUMP_DIR` (see `vllm_ascend/attention/qfa_dump.py`); it only
+  works in eager mode, since a D2H copy inside a graph capture fails with
+  EE1016 and no Python runs on replay.
 
-Pure stdlib, read-only, never import torch/vllm, never touch the NPU. Written
-for the 2.4T weight failures; run them before trusting any new weight
-directory, whatever its name says.
+## checks/ -- checkpoint and device inspection
 
-- `debug/check_quant_desc_qwen35_moe_text.py` -- replays vLLM Ascend's
-  load-time packed-module lookup against `quant_model_description.json`.
-- `debug/compare_checkpoint_shapes.py` -- diffs tensor names and shapes between
-  a quantized checkpoint and its BF16 original, from safetensors headers alone.
-- `debug/check_moe_expert_shapes.py` -- explains a MoE `w13` load failure:
-  the load branch is chosen from the tensor name, not the shape.
-- `debug/verify_expert_split_axis.py` -- proves on the real bytes which axis a
-  fused `gate_up` export was split along, by sign-bit correlation.
-- `debug/check_chat_template_thinking.py` -- answers "was thinking already on
-  before anyone passed `enable_thinking`": renders the checkpoint's chat
-  template with the kwarg absent, true and false, and says which pair matches.
-  Uses jinja2 when it is importable and falls back to reading the template's
-  `enable_thinking` lines when it is not.
-- `debug/estimate_hbm_budget.py` -- answers "do N machines have enough HBM":
-  splits the checkpoint into EP-sharded, TP-sharded and replicated bytes (only
-  the first shrinks when you add nodes), sizes per-token KV and per-request GDN
-  state from `config.json`, then sweeps node count and `max_model_len`. A failed
-  launch already carries both runtime inputs it needs: pass
-  `Loading model weights took X GB` as `--weights-gib` and
-  `Available KV cache memory: X GiB` as `--observed-kv-gib`, and the activation
-  plus non-torch overhead falls out as the residual -- no NPU time required.
+Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
 
-## Device probe (NPU required, negligible memory)
+- `c8_mxfp_weight_support.py` -- can this checkpoint serve the C8-MXFP8 KV
+  cache, and how good are its V scales? Mirrors the framework's own name lookup,
+  so a GREEN means the scales really will be found. Reports the zero-scale
+  channel count, and names which KV-cache recipe the checkpoint selected when it
+  is not the MXFP8 one. Pure stdlib.
+- `compare_checkpoint_shapes.py` -- diff tensor names and shapes between a
+  quantized checkpoint and its bf16 original. Reads safetensors headers only.
+- `estimate_hbm_budget.py` -- will N nodes hold this checkpoint? Derived from
+  safetensors headers, no load.
+- `chat_template_thinking.py` -- with no `enable_thinking` kwarg, does the
+  checkpoint's chat template leave thinking on?
+- `probe_npu_memory.py` -- print the HBM totals torch actually sees (NPU
+  required, negligible memory).
 
-- `debug/probe_npu_memory.py` -- prints the HBM totals torch reports, which is
-  the denominator of every budget and is not the number npu-smi shows. Creates
-  an ACL context and exits; no weights, no tensors, no collectives.
+## setup/ -- build and install
 
-## QFA operator and graph validation (NPU required)
+- `build_qfa_ops.sh` -- rebuild the vendored QFA kernels. Note the installed
+  `_cann_ops_custom` is left holding QFA only; do not serve from that state.
+- `pip_install_qfa.sh` -- install the built package.
+- `diag_qfa_tiling_registry.sh` -- `ldd -r` over the custom-op libraries, for
+  the "do not registe tiling struct" class of failure.
+- `install-vllm-ascend.sh`, `create-container.sh` -- environment bring-up.
 
-- `debug/test_junlin_qfa_npu.py` -- numeric smoke test of the vendored
-  QuantFlashAttn against a CPU golden ported from the official test assets.
-- `debug/run_doc_examples_qfa_npu.py` -- the two official doc call examples
-  ported 1:1 onto the vendored API.
-- `debug/test_qfa_as_fia_npu.py` -- checks the FIA-call-site swap on device for
-  both shapes the call site builds.
-- `debug/diag_qfa_metadata_size.py` -- sweeps `num_blocks` across the int32
-  plane-offset ceiling that killed the metadata op on a real prefill.
-- `debug/test_qfa_fullgraph_repro_npu.py` -- reproduces the full-graph capture
-  arrangement outside the engine and sweeps one dimension at a time.
+## debug/ -- scratch space
 
-Build logs land in `debug/logs/`, which is gitignored.
+One-off diagnostics for whatever is being investigated right now. Nothing here
+is expected to survive: once a question is answered, its script goes away rather
+than accumulating. If a script turns out to be worth re-running later, it
+belongs in `bench/` or `checks/` instead.
 
-## Benchmark
-
-- `bench_qfa_vs_fia.py` -- `--auto` brings `27B.sh` up twice (baseline
-  `QFA=0 NO_PREFIX_CACHE=1`, candidate `QFA=1`), measures both and prints the
-  table. Keeping the two configurations symmetric is the script's job.
-
-## Runtime helper
+## runtime/ -- loaded by the server
 
 - `runtime/qwen38_checkpoint_layer_filter/` skips checkpoint tensors above the
   four-layer smoke-test limit before lazy safetensors loading. The single-node
   four-layer launcher loads it through `PYTHONPATH`.
 
-## Local regression tests
+## tests/ -- tests for the scripts themselves
 
 `tests/` holds the checkpoint-filter contract test, the HTTP image payload
 regression test, and the service/container default-value tests. They need
@@ -115,3 +94,9 @@ neither an NPU nor a running server, so they run on any machine:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s scripts/tests -p 'test_*.py'
 ```
+
+## local/ -- this machine only
+
+`local/` builds and runs the local venv that mirrors the server container, for
+patch-target checks and CPU unit tests before anything reaches the server. See
+`local/README.md`.
