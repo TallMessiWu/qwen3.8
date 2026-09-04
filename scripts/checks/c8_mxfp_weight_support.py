@@ -48,15 +48,22 @@ from pathlib import Path
 
 DEFAULT_MODEL_PATH = "/mnt/share/weight/Qwen3.5-35B-A3B-mxfp4-c8"
 
+# Two ways a checkpoint can ask for the MXFP8 KV cache. The older recipe puts
+# one key at the top of quant_model_description.json; the newer one drops that
+# key and tags each attention layer instead. Both describe the same thing --
+# K quantized dynamically, V carrying a static per-channel scale.
 REQUIRED_KV_CACHE_TYPE = "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"
+PER_LAYER_QUANT_TYPES = ("QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL",)
+LAYER_QUANT_TYPE_SUFFIX = ".self_attn.quant_type"
 
-# modelslim_config.py maps both of these onto the attn.v_cache_scale parameter
-# when enable_mxfp_c8_quant is on. Checkpoints use one or the other.
-V_SCALE_SUFFIXES = (".v_proj.kv_cache_scale", ".v_proj.v_scale")
+# All map onto the attn.v_cache_scale parameter. Checkpoints use one of them;
+# fa_v.scale is the newer spelling and reuses a name FAQuant also uses, so the
+# tensor's own shape and dtype are what tell the two recipes apart, not the name.
+V_SCALE_SUFFIXES = (".v_proj.kv_cache_scale", ".v_proj.v_scale", ".fa_v.scale")
 
 # K is quantized dynamically under this recipe, so a static K scale means the
 # checkpoint was produced with a different one.
-K_SCALE_SUFFIXES = (".k_proj.kv_cache_scale", ".k_proj.k_scale")
+K_SCALE_SUFFIXES = (".k_proj.kv_cache_scale", ".k_proj.k_scale", ".fa_k.scale")
 
 # Mirrors MXFP_KV_SCALE_GROUP_SIZE in vllm_ascend/device/mxfp_kv_cache.py:
 # the K scale cache groups head_dim into 64-wide slots, and building it
@@ -133,15 +140,17 @@ def describe_scale(raw_bytes):
     )
 
 
-def check_kv_cache_type(model_path, failures):
+def check_kv_cache_type(model_path, failures, warnings):
     """Section 1: which KV-cache quantization recipe the framework will pick.
 
-    Three recipes share this file and only one of them is the MXFP8 C8 that QFA
-    can read, so report which one the description actually selects instead of
-    only saying "not MXFP8":
-      kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL -> mxfp_c8.py, the one we want
-      kv_cache_type=C8                                   -> kv_c8.py, int8 dense C8
-      fa_quant_type=<non-empty>                          -> kv_c8.py FAKQuant path
+    Several recipes share modelslim_config.py and only the MXFP8 one is readable
+    by QFA, so name the one the description actually selects rather than only
+    saying "not MXFP8". Two spellings ask for MXFP8:
+      kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL   one key, at the top
+      <layer>.self_attn.quant_type=QK_MXFP8_DYNAMIC_...    one key per layer
+    and two ask for something else:
+      kv_cache_type=C8            kv_c8.py, int8 dense C8
+      fa_quant_type=<non-empty>   kv_c8.py FAKQuant, which QFA cannot read
     """
     print()
     print("--- 1. which KV-cache recipe does the description select? ---")
@@ -150,16 +159,50 @@ def check_kv_cache_type(model_path, failures):
         print("  quant_model_description.json: MISSING")
         failures.append("quant_model_description.json missing -> C8 never enables")
         return
+
     kv_cache_type = desc.get("kv_cache_type", "")
     fa_quant_type = desc.get("fa_quant_type", "")
-    print(f"  kv_cache_type  = {kv_cache_type!r}")
-    print(f"  fa_quant_type  = {fa_quant_type!r}")
-    if kv_cache_type == REQUIRED_KV_CACHE_TYPE:
-        print("  OK: selects the MXFP8 C8 path (mxfp_c8.py) -- the one QFA can read")
+    print(f"  top-level kv_cache_type = {kv_cache_type!r}")
+    print(f"  top-level fa_quant_type = {fa_quant_type!r}")
+
+    # Per-layer tags: collect every value so a checkpoint that mixes recipes
+    # across layers is visible rather than averaged away.
+    per_layer = defaultdict(list)
+    for key, value in desc.items():
+        if key.endswith(LAYER_QUANT_TYPE_SUFFIX):
+            idx = layer_index(key)
+            per_layer[str(value)].append(idx)
+    if per_layer:
+        print(f"  per-layer *{LAYER_QUANT_TYPE_SUFFIX}:")
+        for value, idxs in sorted(per_layer.items()):
+            known = " (MXFP8 C8)" if value in PER_LAYER_QUANT_TYPES else ""
+            shown = sorted(i for i in idxs if i is not None)
+            print(f"    {value!r} x{len(idxs)}{known}  layers {shown}")
+    else:
+        print(f"  per-layer *{LAYER_QUANT_TYPE_SUFFIX}: none")
+
+    mxfp_layers = sorted(
+        i for value, idxs in per_layer.items() if value in PER_LAYER_QUANT_TYPES for i in idxs if i is not None
+    )
+    by_top = kv_cache_type == REQUIRED_KV_CACHE_TYPE
+    if by_top or mxfp_layers:
+        how = "top-level kv_cache_type" if by_top else f"{len(mxfp_layers)} per-layer quant_type tag(s)"
+        print(f"  OK: selects the MXFP8 C8 path (mxfp_c8.py) via {how} -- the one QFA can read")
+        # The framework has one global switch, so a checkpoint tagging only some
+        # layers would turn C8 on for all of them.
+        other = sorted(
+            i for value, idxs in per_layer.items() if value not in PER_LAYER_QUANT_TYPES for i in idxs if i is not None
+        )
+        if other:
+            warnings.append(
+                f"layers {other} carry a different quant_type than {mxfp_layers}; "
+                "enable_mxfp_c8_quant is global, so C8 would apply to all of them alike"
+            )
         return
 
-    print(f"  expected: kv_cache_type == {REQUIRED_KV_CACHE_TYPE!r}")
-    failures.append(f"kv_cache_type != {REQUIRED_KV_CACHE_TYPE} -> C8 stays off, run falls back to bf16+FIA")
+    print(f"  expected: kv_cache_type == {REQUIRED_KV_CACHE_TYPE!r}, "
+          f"or a per-layer quant_type in {PER_LAYER_QUANT_TYPES}")
+    failures.append("no MXFP8 recipe selected -> C8 stays off, run falls back to bf16+FIA")
     if fa_quant_type:
         print("  note: fa_quant_type is set, so enable_fa_quant wins instead. That is the")
         print("        FAKQuant path in kv_c8.py, which on A5 caches K/V as float8_e4m3 with a")
@@ -263,6 +306,7 @@ def scan_tensors(tensors):
         "v_proj_out_features": {},
         "attn_module_suffixes": Counter(),
         "scale_like_suffixes": Counter(),
+        "fa_offsets": {},
     }
     for name, (shard, entry, data_start) in tensors.items():
         is_mtp = bool(MTP_RE.search(name))
@@ -282,6 +326,8 @@ def scan_tensors(tensors):
             found["mtp_v_scales" if is_mtp else "v_scales"][idx] = (name, shard, entry, data_start)
         if any(name.endswith(suffix) for suffix in K_SCALE_SUFFIXES):
             found["k_scale_names"].append(name)
+        if name.endswith(".offset") and ".fa_" in name:
+            found["fa_offsets"][idx] = (name, shard, entry, data_start)
     return found
 
 
@@ -433,10 +479,56 @@ def check_k_scales(found, warnings):
         print("  none, as expected")
         return
     print(f"  found {len(k_scale_names)} static K scale tensor(s), e.g. {k_scale_names[0]}")
-    warnings.append(
-        f"checkpoint carries {len(k_scale_names)} static K scale(s); "
-        "the C8-MXFP path quantizes K dynamically and ignores them"
-    )
+    if any(".fa_k." in n for n in k_scale_names):
+        # kvcache_quant_layers is collected from fa_k.scale, and is_fa_quant_layer
+        # gates a branch that sits *before* enable_mxfp_c8_quant in
+        # get_quant_method -- so these would take the layer away from MXFP8.
+        warnings.append(
+            f"{len(k_scale_names)} fa_k.scale tensor(s) present: with fa_quant_type also set "
+            "these populate kvcache_quant_layers, and the FAKQuant branch is checked before "
+            "the MXFP8 one in get_quant_method, so those layers would leave the MXFP8 path"
+        )
+    else:
+        warnings.append(
+            f"checkpoint carries {len(k_scale_names)} static K scale(s); "
+            "the C8-MXFP path quantizes K dynamically and ignores them"
+        )
+
+
+def check_offsets(found, warnings):
+    """Report any fa_*.offset tensors: MXFP8 has no use for them.
+
+    An E8M0 scale is a power of two applied symmetrically, so the MXFP8 path
+    neither loads nor needs an offset. A checkpoint that ships one is either
+    carrying a leftover from the affine recipe or expecting asymmetric
+    dequantization -- and those differ only in whether the values are zero,
+    which is worth knowing before deciding to ignore them.
+    """
+    print()
+    print("--- 5b. fa_*.offset tensors (MXFP8 has no offset) ---")
+    offsets = found["fa_offsets"]
+    if not offsets:
+        print("  none")
+        return
+    all_zero = True
+    for idx in sorted(offsets):
+        name, shard, entry, data_start = offsets[idx]
+        raw = read_u8_tensor(shard, entry, data_start)
+        shape, dtype = entry.get("shape"), entry.get("dtype")
+        if raw is None:
+            print(f"  layer {idx:<3} {name.rsplit('.', 2)[-2]}.offset  shape={shape} dtype={dtype} (not uint8)")
+            all_zero = False
+            continue
+        nonzero = sum(1 for b in raw if b != 0)
+        all_zero &= nonzero == 0
+        print(f"  layer {idx:<3} shape={shape} dtype={dtype}  non-zero bytes: {nonzero}/{len(raw)}")
+    if all_zero:
+        print("  -> all zero, so ignoring them costs nothing")
+    else:
+        warnings.append(
+            "fa_*.offset carries non-zero values; the MXFP8 path applies scale only, "
+            "so those offsets would be silently dropped -- check what the exporter meant by them"
+        )
 
 
 def check_mtp(found, warnings):
@@ -480,7 +572,7 @@ def main():
     failures = []
     warnings = []
 
-    check_kv_cache_type(model_path, failures)
+    check_kv_cache_type(model_path, failures, warnings)
     expected_width = expected_channel_width(model_path, failures, warnings)
 
     print()
@@ -499,6 +591,7 @@ def main():
     check_coverage(found, failures)
     check_scale_contents(found, expected_width, failures, warnings)
     check_k_scales(found, warnings)
+    check_offsets(found, warnings)
     check_mtp(found, warnings)
 
     print()
