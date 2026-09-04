@@ -54,6 +54,17 @@ if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
     fi
 fi
 
+# EP=0 drops expert parallelism. It is the only way to take the MoE
+# comm-method choice out of the picture: select_moe_comm_method returns
+# all-gather outright without EP, so the MC2/ALLTOALL switch at
+# mc2_tokens_capacity -- which equals the largest captured graph size -- never
+# fires. A 397B MoE wants EP on for real serving; this is a diagnostic.
+ep_args=(--enable-expert-parallel)
+if [[ "${EP:-1}" == "0" ]]; then
+    ep_args=()
+    echo "expert parallelism disabled (EP=0)." >&2
+fi
+
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
@@ -197,7 +208,7 @@ exec vllm serve "$MODEL_PATH" \
     --port "$VLLM_PORT" \
     --data-parallel-size 1 \
     --tensor-parallel-size 8 \
-    --enable-expert-parallel \
+    "${ep_args[@]}" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-batched-tokens 16384 \
     --max-num-seqs "$MAX_NUM_SEQS" \
