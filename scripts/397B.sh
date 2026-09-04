@@ -84,6 +84,19 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 # implies QFA off. C8=1 (default) honours whatever the checkpoint asks for.
 qfa_args=()
 if [[ "${C8:-1}" == "0" ]]; then
+    # VLLM_ASCEND_DISABLE_C8_MXFP only exists on branches carrying the C8 kill
+    # switch (junlin-qfa-c8switch). Everywhere else exporting it is a silent
+    # no-op: the server comes up with the C8 cache still on, and FIA then dies
+    # at head_dim 256 with an EZ0010 that names neither C8 nor this switch. One
+    # run was already lost reading that error as a result rather than a
+    # misconfiguration, so check the installed package instead of hoping.
+    # find_spec locates vllm_ascend without executing its __init__.
+    envs_py="$(python3 -c 'import importlib.util, pathlib; s = importlib.util.find_spec("vllm_ascend"); print(pathlib.Path(s.origin).parent / "envs.py")' 2>/dev/null || true)"
+    if [[ -n "$envs_py" && -r "$envs_py" ]] && ! grep -q VLLM_ASCEND_DISABLE_C8_MXFP "$envs_py"; then
+        echo "ERROR: C8=0 needs VLLM_ASCEND_DISABLE_C8_MXFP, which the installed vllm-ascend does not define." >&2
+        echo "       ($envs_py) Serve from the junlin-qfa-c8switch worktree, or drop C8=0." >&2
+        exit 2
+    fi
     export VLLM_ASCEND_DISABLE_C8_MXFP=1
     if [[ "${QFA:-0}" == "1" ]]; then
         echo "C8=0 forces a bf16 KV cache, which QFA cannot read; QFA=1 has no effect." >&2

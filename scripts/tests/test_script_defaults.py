@@ -109,6 +109,20 @@ class ScriptDefaultsTest(unittest.TestCase):
         ]
         self.assertEqual(diff, expected)
 
+    def test_c8_switch_refuses_a_branch_that_ignores_it(self):
+        # VLLM_ASCEND_DISABLE_C8_MXFP only exists on junlin-qfa-c8switch.
+        # Elsewhere exporting it changes nothing and the server starts with the
+        # C8 cache still on, so the run looks like a bf16 baseline and is not
+        # one. That already cost a debugging round, hence the guard.
+        for name in ("27B.sh", "397B.sh"):
+            with self.subTest(script=name):
+                text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+                guard = text.split('if [[ "${C8:-1}" == "0" ]]; then', 1)[1]
+                guard = guard.split("export VLLM_ASCEND_DISABLE_C8_MXFP=1", 1)[0]
+                self.assertIn("find_spec", guard)
+                self.assertIn("exit 2", guard)
+                self.assertIn("junlin-qfa-c8switch", guard)
+
     def test_container_install_defaults_to_qfa_worktree(self):
         create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
             encoding="utf-8"
