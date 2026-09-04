@@ -392,6 +392,41 @@ def report_naming_candidates(found):
     print("       framework matches the same hard-coded list and would drop it too.")
 
 
+def analyse_scale_packing(raw, count, expected):
+    """When the scale is short by an exact factor, say whether the bytes are packed.
+
+    Two readings fit a tensor with half the channels it should have: each byte
+    holds two 4-bit values, or one exponent is shared between two channels. The
+    byte pattern separates them. An E8M0 exponent for attention V lands in a
+    narrow band (roughly 115-127, i.e. 2^-12..2^0), so a per-channel scale shows
+    few distinct values clustered together and a near-constant high nibble. Two
+    independent 4-bit fields instead spread bytes across 0..255.
+
+    Worth checking rather than assuming: MX packs two FP4 *data* elements per
+    byte, but its scale is always a full E8M0 byte -- so a packed scale would be
+    a departure from the standard, not an application of it.
+    """
+    if raw is None or not count or expected != count * 2:
+        return
+    values = list(raw)
+    distinct = sorted(set(values))
+    high = sorted({v >> 4 for v in values})
+    low = sorted({v & 0xF for v in values})
+    print()
+    print(f"    channel count is exactly half of {expected}; is each byte packing two values?")
+    print(f"      distinct bytes ({len(distinct)}): {distinct[:12]}{'...' if len(distinct) > 12 else ''}")
+    print(f"      high nibbles: {high}    low nibbles: {low}")
+    as_exponents = [v - 127 for v in (distinct[0], distinct[-1])]
+    print(f"      read as E8M0: 2^{as_exponents[0]} .. 2^{as_exponents[1]}")
+    if len(high) == 1 and max(distinct) - min(distinct) < 32:
+        print("      -> NOT packed: the high nibble never varies and the bytes sit in a narrow")
+        print("         band, which is what one E8M0 exponent per channel looks like. The two")
+        print("         KV heads most likely share one set of per-head_dim scales.")
+    else:
+        print("      -> bytes are spread out and both nibbles vary, so packing is possible;")
+        print("         confirm the intended layout with whoever exported the checkpoint.")
+
+
 def check_scale_contents(found, expected_width, failures, warnings):
     """Section 4: shape, dtype, TP divisibility, and the zero-channel count."""
     print()
@@ -411,6 +446,8 @@ def check_scale_contents(found, expected_width, failures, warnings):
     total_zeros = 0
     total_channels = 0
     rows = []
+    mismatched = []
+    first_raw = None
     for idx in sorted(v_scales):
         name, shard, entry, data_start = v_scales[idx]
         dtype = entry.get("dtype")
@@ -421,15 +458,17 @@ def check_scale_contents(found, expected_width, failures, warnings):
             failures.append(f"layer {idx} V scale has dtype {dtype}, expected U8")
             continue
         count, zeros, lo, hi, distinct = describe_scale(raw)
+        if first_raw is None:
+            first_raw = raw
         total_zeros += zeros
         total_channels += count
         rows.append((idx, shape, count, zeros, lo, hi, distinct))
 
         width = found["v_proj_out_features"].get((False, idx))
         if width is not None and count != width:
-            failures.append(f"layer {idx} V scale has {count} channels but v_proj.weight has {width} rows")
-        if expected_width is not None and count != expected_width:
-            failures.append(f"layer {idx} V scale has {count} channels, expected {expected_width}")
+            mismatched.append((idx, count, width))
+        elif expected_width is not None and count != expected_width:
+            mismatched.append((idx, count, expected_width))
 
     header = f"  {'layer':<5} {'shape':<12} {'chans':<7} {'zeros':<7} {'min..max':<9} distinct"
     print(header)
@@ -437,6 +476,17 @@ def check_scale_contents(found, expected_width, failures, warnings):
         span = f"{lo}..{hi}"
         flag = "  <-- zeros" if zeros else ""
         print(f"  {idx:<5} {shape!s:<12} {count:<7} {zeros:<7} {span:<9} {distinct}{flag}")
+
+    if mismatched:
+        counts = {c for _, c, _ in mismatched}
+        wants = {w for _, _, w in mismatched}
+        layers = [i for i, _, _ in mismatched]
+        failures.append(
+            f"{len(mismatched)} layer(s) have {sorted(counts)} V-scale channels but "
+            f"{sorted(wants)} are expected ({len(layers)} layers: {layers[:6]}"
+            f"{'...' if len(layers) > 6 else ''}) -- _quant_weight_loader asserts on this"
+        )
+        analyse_scale_packing(first_raw, min(counts), min(wants))
 
     if not rows:
         return
