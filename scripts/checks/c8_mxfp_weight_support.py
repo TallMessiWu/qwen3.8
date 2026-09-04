@@ -285,7 +285,7 @@ def expected_channel_width(model_path, failures, warnings):
     if merged.get("attention_sinks") or merged.get("sinks"):
         warnings.append("config declares attention sinks; _qfa_serves declines those layers")
 
-    return width
+    return width, head_dim
 
 
 def scan_tensors(tensors):
@@ -427,7 +427,7 @@ def analyse_scale_packing(raw, count, expected):
         print("         confirm the intended layout with whoever exported the checkpoint.")
 
 
-def check_scale_contents(found, expected_width, failures, warnings):
+def check_scale_contents(found, expected_width, head_dim, failures, warnings):
     """Section 4: shape, dtype, TP divisibility, and the zero-channel count."""
     print()
     print("--- 4. V scale contents (zeros are the precision risk) ---")
@@ -447,6 +447,7 @@ def check_scale_contents(found, expected_width, failures, warnings):
     total_channels = 0
     rows = []
     mismatched = []
+    shared = []
     first_raw = None
     for idx in sorted(v_scales):
         name, shard, entry, data_start = v_scales[idx]
@@ -465,7 +466,13 @@ def check_scale_contents(found, expected_width, failures, warnings):
         rows.append((idx, shape, count, zeros, lo, hi, distinct))
 
         width = found["v_proj_out_features"].get((False, idx))
-        if width is not None and count != width:
+        if head_dim and count == head_dim and (width or expected_width) != head_dim:
+            # One head's worth of channels: the checkpoint shares a single set
+            # of scales across all KV heads. _quant_weight_loader tiles it, so
+            # this loads -- but every head then gets the same per-channel
+            # scale, which is a real precision choice, not a formatting detail.
+            shared.append(idx)
+        elif width is not None and count != width:
             mismatched.append((idx, count, width))
         elif expected_width is not None and count != expected_width:
             mismatched.append((idx, count, expected_width))
@@ -476,6 +483,13 @@ def check_scale_contents(found, expected_width, failures, warnings):
         span = f"{lo}..{hi}"
         flag = "  <-- zeros" if zeros else ""
         print(f"  {idx:<5} {shape!s:<12} {count:<7} {zeros:<7} {span:<9} {distinct}{flag}")
+
+    if shared:
+        warnings.append(
+            f"{len(shared)} layer(s) ship {head_dim} V-scale channels, one KV head's worth; "
+            "the loader tiles them across all KV heads, so every head shares one set of "
+            "per-channel scales -- confirm with the quantization side that this is intended"
+        )
 
     if mismatched:
         counts = {c for _, c, _ in mismatched}
@@ -623,7 +637,7 @@ def main():
     warnings = []
 
     check_kv_cache_type(model_path, failures, warnings)
-    expected_width = expected_channel_width(model_path, failures, warnings)
+    expected_width, head_dim = expected_channel_width(model_path, failures, warnings)
 
     print()
     print("--- 3. per-layer V scale ---")
@@ -639,7 +653,7 @@ def main():
 
     found = scan_tensors(tensors)
     check_coverage(found, failures)
-    check_scale_contents(found, expected_width, failures, warnings)
+    check_scale_contents(found, expected_width, head_dim, failures, warnings)
     check_k_scales(found, warnings)
     check_offsets(found, warnings)
     check_mtp(found, warnings)
