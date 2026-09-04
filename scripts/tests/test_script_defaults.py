@@ -76,8 +76,9 @@ class ScriptDefaultsTest(unittest.TestCase):
     def test_397b_differs_from_27b_only_in_model_and_parallelism(self):
         # The two launchers are read side by side during a QFA experiment, so a
         # switch that means one thing here and another there is a trap. Pin
-        # that by diffing them: anything beyond the header, the checkpoint and
-        # the parallel size has drifted and needs to be deliberate.
+        # that by diffing them: anything beyond the header, the checkpoint, the
+        # parallel size and EP's HCCL buffers has drifted and needs to be
+        # deliberate.
         lines_27b = (SCRIPTS_DIR / "27B.sh").read_text(encoding="utf-8").splitlines()
         lines_397b = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8").splitlines()
 
@@ -92,6 +93,14 @@ class ScriptDefaultsTest(unittest.TestCase):
             "+# Single-node Qwen3.5-397B launcher. Deliberately identical to 27B.sh apart",
             "+# from the checkpoint, TP8 and expert parallelism, so every switch means the",
             "+# same thing in both and the two can be read side by side during an experiment.",
+            "+# EP-only, which is why 27B.sh does not carry these. Expert parallelism moves",
+            "+# every token's hidden state between ranks twice per MoE layer, and the default",
+            "+# HCCL buffer is not sized for that -- the 2.4T launcher needed these same",
+            "+# values. All eight ranks sit in one node here, hence PCIe on and RoCE off.",
+            '+export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"',
+            '+export HCCL_BUFFSIZE_EP="${HCCL_BUFFSIZE_EP:-2048}"',
+            '+export HCCL_INTRA_PCIE_ENABLE="${HCCL_INTRA_PCIE_ENABLE:-1}"',
+            '+export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-0}"',
             '-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"',
             '+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"',
             "-    --tensor-parallel-size 1 \\",

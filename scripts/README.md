@@ -18,7 +18,8 @@ chased this week, cleared once that question is answered.
   flag), `C8`, `CAPTURE_SIZES`, `MAX_NUM_SEQS`, `CUDAGRAPH_MODE`. Despite the
   name it serves whatever `MODEL_PATH` points at, 35B included.
 - `397B.sh` -- single-node Qwen3.5-397B. A copy of `27B.sh` differing only in
-  the checkpoint, `--tensor-parallel-size 8` and `--enable-expert-parallel`;
+  the checkpoint, `--tensor-parallel-size 8`, `--enable-expert-parallel` and the
+  HCCL buffer sizing that EP's all-to-all needs;
   every switch behaves identically, which a test pins by diffing the two.
 - `2.4T-{0..3}.sh` -- the four-node 2.4T launchers, one per node.
 - `serve_qwen3.8_2.4t_4node.sh`, `serve_qwen3.8_2.4t_single_node_4layer.sh` --

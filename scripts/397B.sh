@@ -34,6 +34,14 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+# EP-only, which is why 27B.sh does not carry these. Expert parallelism moves
+# every token's hidden state between ranks twice per MoE layer, and the default
+# HCCL buffer is not sized for that -- the 2.4T launcher needed these same
+# values. All eight ranks sit in one node here, hence PCIe on and RoCE off.
+export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"
+export HCCL_BUFFSIZE_EP="${HCCL_BUFFSIZE_EP:-2048}"
+export HCCL_INTRA_PCIE_ENABLE="${HCCL_INTRA_PCIE_ENABLE:-1}"
+export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-0}"
 
 if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
     for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
