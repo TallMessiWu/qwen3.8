@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Single-node Qwen3.5-397B launcher: 8 NPUs, TP8 with expert parallelism.
-#
-# Same shape as 27B.sh -- the QFA / C8 / MTP / GRAPH switches behave identically
-# and mean the same thing -- but the model is a MoE that needs all eight cards,
-# so this adds expert parallelism, the HCCL buffer sizing the EP all-to-all
-# wants, and lazy safetensors loading.
+# Single-node Qwen3.5-397B launcher. Deliberately identical to 27B.sh apart
+# from the checkpoint, TP8 and expert parallelism, so every switch means the
+# same thing in both and the two can be read side by side during an experiment.
 
 set -euo pipefail
 
@@ -22,18 +19,6 @@ fi
 export ASCEND_RT_VISIBLE_DEVICES="$visible_devices"
 IFS=',' read -r -a device_args <<< "$ASCEND_RT_VISIBLE_DEVICES"
 
-# TP has to match the visible device count exactly: vLLM would otherwise fail
-# deep inside worker startup with a message that does not name the cause.
-TP_SIZE="${TP_SIZE:-8}"
-if ! [[ "$TP_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-    echo "TP_SIZE must be a positive integer, got '$TP_SIZE'." >&2
-    exit 2
-fi
-if [[ "${#device_args[@]}" -ne "$TP_SIZE" ]]; then
-    echo "TP_SIZE=$TP_SIZE but ASCEND_RT_VISIBLE_DEVICES exposes ${#device_args[@]} device(s)." >&2
-    exit 2
-fi
-
 if [[ -x "$cleaner_path" ]]; then
     echo "Cleaning NPU devices: $ASCEND_RT_VISIBLE_DEVICES"
     "$cleaner_path" "${device_args[@]}"
@@ -46,17 +31,9 @@ export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:Tru
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/lib64"
 export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
 export HCCL_IF_IP="${HCCL_IF_IP:-127.0.0.1}"
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
-# EP moves every token's hidden state between cards twice a MoE layer, so the
-# EP buffer is sized well above the default. Both stay inside one node here,
-# hence PCIe on and RoCE off.
-export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"
-export HCCL_BUFFSIZE_EP="${HCCL_BUFFSIZE_EP:-2048}"
-export HCCL_INTRA_PCIE_ENABLE="${HCCL_INTRA_PCIE_ENABLE:-1}"
-export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-0}"
 
 if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
     for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -72,39 +49,19 @@ fi
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
-# Weights are ~4 bits, so eight cards hold them with room to spare -- unlike
-# 27B and 2.4T, the memory ceiling here is not what limits the run. Start
-# conservative and raise it if the KV cache comes up short: the aclgraph pool is
-# captured after the KV allocation and is not counted in the profiling result,
-# so whatever this leaves unclaimed is what the graphs get.
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
-
-# EP=1 spreads the experts across the eight TP ranks instead of replicating
-# them. Off is only useful as a comparison point; a 397B MoE on one node wants
-# it on.
-ep_args=()
-if [[ "${EP:-1}" == "1" ]]; then
-    ep_args+=(--enable-expert-parallel)
-else
-    echo "expert parallelism disabled (EP=0)." >&2
-fi
-# MegaMoe's fused dispatch/combine. vllm-ascend defaults it off and silently
-# turns it back off for model configs it does not cover, so leave it off while
-# bringing a checkpoint up and flip it only to measure it.
-FUSED_MC2="${FUSED_MC2:-0}"
-if [[ "$FUSED_MC2" != "0" && "$FUSED_MC2" != "1" ]]; then
-    echo "FUSED_MC2 must be 0 or 1, got '$FUSED_MC2'." >&2
-    exit 2
-fi
-export VLLM_ASCEND_ENABLE_FUSED_MC2="$FUSED_MC2"
+# 0.85 was needed while QFA quantized the whole KV cache on every step, which
+# cost the aclgraph pool about 1.28x one attention layer's bf16 cache in
+# transient tensors. On junlin-qfa that quantization is gone -- the cache is
+# stored as MXFP8 -- so 0.95 may well fit again. Nobody has measured it since;
+# if capture reports no available memory, drop to 0.85 and say so.
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 
 # QFA=1 runs the causal full-attention path on the vendored QuantFlashAttn
 # instead of FIA (VLLM_ASCEND_ENABLE_QFA). It only takes effect on a C8-MXFP KV
-# cache -- the checkpoint's quant description has to select MXFP8 for the KV
-# cache and carry a per-layer V scale -- because that cache is the only thing
-# QFA can read. With a bf16 cache the flag is ignored and the run is the FIA
-# baseline. Qwen3.5 is a 3+1 hybrid, so only the full-attention quarter of the
-# layers has a KV cache at all; the GDN layers are unaffected either way.
+# cache -- the checkpoint's quant description has to say
+# kv_cache_type=K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL and carry a per-layer
+# v_proj.kv_cache_scale -- because that cache is the only thing QFA can read.
+# With a bf16 cache the flag is ignored and the run is the FIA baseline.
 # Prefix caching comes off because the MXFP8 cache shares E8M0 scales across
 # tokens, which shared blocks cannot track; a QFA-vs-FIA comparison therefore
 # has to pass --no-enable-prefix-caching to the baseline run as well, or the
@@ -137,12 +94,13 @@ fi
 
 # MAX_MODEL_LEN is what _qfa_max_seqlen_kv reads, and the captured
 # QuantFlashAttn bakes that constant in -- AdjustSinnerAndSouter tiles on it.
+# Lowering it is the only way to move that constant without touching code, and
+# the graph-capture crash reproduces nowhere else, so single-variable
+# experiments have to run here rather than in a standalone script.
 # MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split and the
-# graph plan below. It is lower than 27B's because the graph count follows it
-# one-for-one, and capturing that many graphs across eight ranks of a 397B
-# model costs real startup time.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+# graph plan below.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-100}"
 if ! [[ "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_NUM_SEQS must be a positive integer, got '$MAX_NUM_SEQS'." >&2
     exit 1
@@ -151,9 +109,8 @@ fi
 # MTP is num_speculative_tokens, not a flag: MTP=3 proposes three draft tokens
 # per step, MTP=0 turns speculative decoding off. It sets the width of a decode
 # step -- one accepted token plus MTP drafts -- which is what the graph plan
-# below is built on. Default off: this checkpoint is still being brought up,
-# and speculative decoding is one more thing to rule out when it will not load.
-MTP="${MTP:-0}"
+# below is built on.
+MTP="${MTP:-3}"
 if ! [[ "$MTP" =~ ^[0-9]+$ ]]; then
     echo "MTP must be a non-negative integer (num_speculative_tokens), got '$MTP'." >&2
     exit 1
@@ -174,8 +131,11 @@ fi
 # request count, stepping by decode_query_len up to the full batch. Sizes that
 # are not multiples of decode_query_len are pointless: vLLM's
 # adjust_cudagraph_sizes_for_spec_decode round_up's every entry to that
-# multiple. CAPTURE_SIZES overrides the whole list for single-variable
-# experiments, as does CUDAGRAPH_MODE for keeping attention out of the graph.
+# multiple, which is why the old hand-written list's leading 1 only ever
+# merged into 4. The count is MAX_NUM_SEQS graphs whatever MTP is, so capture
+# time and pool memory scale with the batch bound; CAPTURE_SIZES still
+# overrides the whole list for single-variable experiments, as does
+# CUDAGRAPH_MODE for keeping attention out of the graph entirely.
 default_capture_sizes=""
 for ((n = 1; n <= MAX_NUM_SEQS; n++)); do
     default_capture_sizes+="${default_capture_sizes:+,}$((n * decode_query_len))"
@@ -204,29 +164,6 @@ if [[ "${THINKING:-1}" == "0" ]]; then
     echo "thinking disabled (THINKING=0)." >&2
 fi
 
-if [[ ! -r "$MODEL_PATH/config.json" ]]; then
-    echo "ERROR: missing or unreadable $MODEL_PATH/config.json" >&2
-    exit 2
-fi
-if [[ ! -r "$MODEL_PATH/quant_model_description.json" ]]; then
-    echo "ERROR: --quantization ascend requires $MODEL_PATH/quant_model_description.json" >&2
-    exit 2
-fi
-
-# The multimodal flags are rejected outright by a text-only model, and this
-# checkpoint family ships in both shapes, so take the answer from config.json
-# rather than from the directory name.
-mm_args=()
-if grep -q '"vision_config"' "$MODEL_PATH/config.json"; then
-    mm_args+=(
-        --allowed-local-media-path /
-        --mm-processor-cache-gb 0
-        --mm-encoder-tp-mode data
-        --mm-processor-cache-type shm
-    )
-    echo "config.json declares a vision tower: multimodal serving on." >&2
-fi
-
 # Profiling is armed, not on: NPUWorker.profile() only builds the
 # TorchNPUProfilerWrapper when /start_profile is posted, so carrying the config
 # costs nothing until somebody asks for a trace. The path is relative and
@@ -237,11 +174,9 @@ exec vllm serve "$MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
-    --quantization ascend \
-    --safetensors-load-strategy lazy \
-    --dtype bfloat16 \
     --data-parallel-size 1 \
-    --tensor-parallel-size "$TP_SIZE" \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-batched-tokens 16384 \
     --max-num-seqs "$MAX_NUM_SEQS" \
@@ -251,9 +186,11 @@ exec vllm serve "$MODEL_PATH" \
     --compilation-config "$compilation_config" \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./profiling", "torch_profiler_with_stack": false}' \
     "${spec_args[@]}" \
-    "${ep_args[@]}" \
     --trust-remote-code \
     --async-scheduling \
-    "${mm_args[@]}" \
-    --additional-config "{\"enable_cpu_binding\":true,\"enable_fused_mc2\":$FUSED_MC2}" \
+    --allowed-local-media-path / \
+    --mm-processor-cache-gb 0 \
+    --mm-encoder-tp-mode data \
+    --mm-processor-cache-type shm \
+    --additional-config '{"enable_cpu_binding":true}' \
     "${qfa_args[@]}"

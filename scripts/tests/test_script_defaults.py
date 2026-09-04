@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import difflib
 import unittest
 from pathlib import Path
 
@@ -72,34 +73,32 @@ class ScriptDefaultsTest(unittest.TestCase):
         self.assertNotIn("num_speculative_tokens\":3}", text)
         self.assertNotIn("CAPTURE_SIZES:-1,4,8", text)
 
-    def test_397b_defaults_to_tp8_with_expert_parallelism(self):
-        text = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8")
-
-        self.assertIn(
-            'MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"',
-            text,
-        )
-        self.assertIn('TP_SIZE="${TP_SIZE:-8}"', text)
-        self.assertIn('--tensor-parallel-size "$TP_SIZE"', text)
-        # EP defaults on; the flag has to be conditional so EP=0 can serve as a
-        # comparison point rather than needing a second script.
-        self.assertIn('if [[ "${EP:-1}" == "1" ]]; then', text)
-        self.assertIn("--enable-expert-parallel", text)
-        self.assertIn("--quantization ascend", text)
-        self.assertIn("quant_model_description.json", text)
-
-    def test_397b_shares_the_27b_switch_vocabulary(self):
+    def test_397b_differs_from_27b_only_in_model_and_parallelism(self):
         # The two launchers are read side by side during a QFA experiment, so a
-        # switch that means one thing here and another there is a trap.
-        text = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8")
+        # switch that means one thing here and another there is a trap. Pin
+        # that by diffing them: anything beyond the header, the checkpoint and
+        # the parallel size has drifted and needs to be deliberate.
+        lines_27b = (SCRIPTS_DIR / "27B.sh").read_text(encoding="utf-8").splitlines()
+        lines_397b = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8").splitlines()
 
-        self.assertIn("VLLM_ASCEND_ENABLE_QFA=1", text)
-        self.assertIn("VLLM_ASCEND_DISABLE_C8_MXFP=1", text)
-        self.assertIn("decode_query_len=$((MTP + 1))", text)
-        self.assertIn("$((n * decode_query_len))", text)
-        # Unlike 27B this one starts with speculative decoding off: the
-        # checkpoint is still being brought up.
-        self.assertIn('MTP="${MTP:-0}"', text)
+        diff = [
+            line
+            for line in difflib.unified_diff(lines_27b, lines_397b, n=0, lineterm="")
+            if line[:1] in "+-" and not line.startswith(("+++", "---"))
+        ]
+        expected = [
+            "-# Single-node Qwen3.8-27B-MXFP8 baseline, retaining the user's host tuning and",
+            "-# optional npu-cleaner workflow while fixing the empty default device list.",
+            "+# Single-node Qwen3.5-397B launcher. Deliberately identical to 27B.sh apart",
+            "+# from the checkpoint, TP8 and expert parallelism, so every switch means the",
+            "+# same thing in both and the two can be read side by side during an experiment.",
+            '-MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"',
+            '+MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"',
+            "-    --tensor-parallel-size 1 \\",
+            "+    --tensor-parallel-size 8 \\",
+            "+    --enable-expert-parallel \\",
+        ]
+        self.assertEqual(diff, expected)
 
     def test_container_install_defaults_to_qfa_worktree(self):
         create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
