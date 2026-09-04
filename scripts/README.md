@@ -17,6 +17,10 @@ chased this week, cleared once that question is answered.
   switches the QFA work needs: `QFA`, `GRAPH`, `MTP` (a token count, not a
   flag), `C8`, `CAPTURE_SIZES`, `MAX_NUM_SEQS`, `CUDAGRAPH_MODE`. Despite the
   name it serves whatever `MODEL_PATH` points at, 35B included.
+- `397B.sh` -- single-node Qwen3.5-397B, TP8 with expert parallelism. Same
+  switches as `27B.sh` and they mean the same thing, plus `TP_SIZE`, `EP` and
+  `FUSED_MC2`. Defaults to `MTP=0` and adds the multimodal flags only when
+  `config.json` declares a vision tower.
 - `2.4T-{0..3}.sh` -- the four-node 2.4T launchers, one per node.
 - `serve_qwen3.8_2.4t_4node.sh`, `serve_qwen3.8_2.4t_single_node_4layer.sh` --
   the underlying serve commands those wrap.

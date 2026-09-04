@@ -7,12 +7,14 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).parents[1]
 PORT_CONSUMERS = (
     "27B.sh",
+    "397B.sh",
     "curl.sh",
     "serve_qwen3.8_2.4t_4node.sh",
     "serve_qwen3.8_2.4t_single_node_4layer.sh",
 )
 SERVICE_LAUNCHERS = (
     "27B.sh",
+    "397B.sh",
     "serve_qwen3.8_2.4t_4node.sh",
     "serve_qwen3.8_2.4t_single_node_4layer.sh",
 )
@@ -69,6 +71,35 @@ class ScriptDefaultsTest(unittest.TestCase):
         self.assertIn("$((n * decode_query_len))", text)
         self.assertNotIn("num_speculative_tokens\":3}", text)
         self.assertNotIn("CAPTURE_SIZES:-1,4,8", text)
+
+    def test_397b_defaults_to_tp8_with_expert_parallelism(self):
+        text = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"',
+            text,
+        )
+        self.assertIn('TP_SIZE="${TP_SIZE:-8}"', text)
+        self.assertIn('--tensor-parallel-size "$TP_SIZE"', text)
+        # EP defaults on; the flag has to be conditional so EP=0 can serve as a
+        # comparison point rather than needing a second script.
+        self.assertIn('if [[ "${EP:-1}" == "1" ]]; then', text)
+        self.assertIn("--enable-expert-parallel", text)
+        self.assertIn("--quantization ascend", text)
+        self.assertIn("quant_model_description.json", text)
+
+    def test_397b_shares_the_27b_switch_vocabulary(self):
+        # The two launchers are read side by side during a QFA experiment, so a
+        # switch that means one thing here and another there is a trap.
+        text = (SCRIPTS_DIR / "397B.sh").read_text(encoding="utf-8")
+
+        self.assertIn("VLLM_ASCEND_ENABLE_QFA=1", text)
+        self.assertIn("VLLM_ASCEND_DISABLE_C8_MXFP=1", text)
+        self.assertIn("decode_query_len=$((MTP + 1))", text)
+        self.assertIn("$((n * decode_query_len))", text)
+        # Unlike 27B this one starts with speculative decoding off: the
+        # checkpoint is still being brought up.
+        self.assertIn('MTP="${MTP:-0}"', text)
 
     def test_container_install_defaults_to_qfa_worktree(self):
         create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
