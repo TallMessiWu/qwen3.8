@@ -83,6 +83,16 @@ if [[ "${PREFILL_MC2:-0}" == "1" ]]; then
     additional_config+=',"enable_prefill_mc2":true'
     echo "prefill MC2 on: MC2 capacity sized from max-num-batched-tokens." >&2
 fi
+# FUSION=0 turns off vllm-ascend's three custom inductor fusion passes. They are
+# on by default and only take effect when torch.compile runs -- which is exactly
+# what GRAPH=1 turns on and GRAPH=0 turns off (GRAPH=0 sets compilation mode to
+# NONE, so the model runs as plain eager Python). Fusion reorders bf16 accumulation,
+# and a ~1e-4 per-layer drift compounds over 60 layers. Use this to tell "compiled
+# vs eager" apart from "graph captured vs not" without giving up FULL_DECODE_ONLY.
+if [[ "${FUSION:-1}" == "0" ]]; then
+    additional_config+=',"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false,"fuse_muls_add":false}'
+    echo "custom inductor fusion passes disabled (FUSION=0)." >&2
+fi
 additional_config+='}'
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"
