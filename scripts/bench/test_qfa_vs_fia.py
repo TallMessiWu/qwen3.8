@@ -31,21 +31,49 @@ token and BLOCK per page -- measuring one model's numbers against the other's
 server answers nothing. Each case runs in its own subprocess: an AICPU abort
 poisons the device.
 
---bench times the two operators instead of comparing them, over the shapes the
-27B config actually produces. What it answers is "what will QFA be worth once
-the cache is MXFP8", which is measurable today: QFA reads MXFP8 whatever wrote
-it, so its main-op time is already the post-migration number. The on-the-fly
-quantization is timed separately rather than subtracted -- it is the cost that
-disappears, not part of the operator.
+--bench times deployments instead of comparing them: C8 and QFA ship together,
+so the number that decides anything is C16+FIA against C8+QFA with each side
+carrying its own per-step costs. It also prints the two operators alone, on
+inputs of different width -- an unfair comparison on purpose, because it is
+what the attention layer's time actually becomes.
 
-Attention decode is bound by KV bandwidth and QFA reads half the bytes, so the
-interesting output is how the ratio moves with context length, not any single
-number.
+Three operators over the same logical K/V:
+
+  C16+FIA  FIA over a bf16 cache. Today's deployment, and the baseline.
+  C8+FIA   FIA v2 over the MXFP8 cache, quant modes as
+           _build_c8_mxfp_fia_v2_kwargs sets them. Neither deployment runs
+           this, but it splits the C16 -> C8+QFA gap into the half the
+           narrower cache buys and the half the kernel buys, and those two
+           are worth very different amounts if one of them turns out to be
+           where the whole win lives.
+  C8+QFA   the proposed deployment.
+
+and the per-step per-layer costs only one side pays:
+
+  q-quant   C8: the query is projected fresh in bf16 every step, and both C8
+            operators take MXFP8.
+  kv-quant  C8: this step's new K/V are quantized before the scatter. K is
+            dynamic MXFP8; V rides the checkpoint's static per-channel scale.
+  kv-tpose  C8+FIA: FIA wants BNSD and the cache is stored BSND, so every
+            forward copies it (_transpose_kv_cache). QFA reads it in place.
+            Timed over this batch's blocks only -- the engine transposes the
+            whole cache, so treat it as a floor, not the cost.
+  meta      C8+QFA: the AICPU plan. Once per step for every layer, so it only
+            enters a per-layer number once --attn-layers says how many full
+            attention layers there are.
+
+Scatter is not timed: both deployments scatter, and C8 scatters fewer bytes,
+so charging it to C8 alone would flatter C16.
+
+Attention decode is bound by KV bandwidth and the MXFP8 cache is roughly half
+the bytes, so the interesting output is how the ratios move with context
+length, not any single number.
 
 Usage (inside the serving container, no server running):
   python scripts/bench/test_qfa_vs_fia.py
   python scripts/bench/test_qfa_vs_fia.py --case dense
   python scripts/bench/test_qfa_vs_fia.py --bench
+  python scripts/bench/test_qfa_vs_fia.py --bench --attn-layers 24
   python scripts/bench/test_qfa_vs_fia.py --model 35b
   python scripts/bench/test_qfa_vs_fia.py --model 35b --bench
   python scripts/bench/test_qfa_vs_fia.py --model 35b --all   # both halves
@@ -77,6 +105,12 @@ DECODE_REQS, DECODE_KV = 4, 300
 
 # WINDOW is MXFP8's scale grouping, not a model shape -- it stays 64.
 SHAPE_FLAGS = ("num_heads", "num_kv_heads", "head_dim", "block_size", "prefill_len")
+
+# attention_v1's MXFP8_{QUERY,KEY,VALUE}_QUANT_MODE, for the C8+FIA leg. 6 is
+# per-32-along-D, 8 is grouped down the sequence -- the same asymmetry QFA has.
+MXFP8_QUERY_QUANT_MODE = 6
+MXFP8_KEY_QUANT_MODE = 6
+MXFP8_VALUE_QUANT_MODE = 8
 
 
 def apply_shape(args) -> None:
@@ -388,8 +422,9 @@ def _time(fn, iters: int, warmup: int) -> float:
     return (time.perf_counter() - start) / iters
 
 
-def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters: int, warmup: int) -> int:
-    """Time FIA, QFA, the throwaway quantization, and the per-step metadata."""
+def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int,
+              iters: int, warmup: int) -> int:
+    """Time both deployments' attention layer, plus the C8+FIA middle leg."""
     import json
 
     import torch
@@ -402,7 +437,7 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
     bootstrap_ops()
 
     def _qfa_quant(x, d):
-        """Mirror of attention_v1._qfa_quant (see run_case)."""
+        """Mirror of attention_v1._qfa_quant_q (see run_case)."""
         fp8, scale = torch_npu.npu_dynamic_mx_quant(
             x.reshape(-1, d), dst_type=torch.float8_e4m3fn, scale_alg=0)
         return (
@@ -475,10 +510,67 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
             actual_seq_lengths=cum_q, actual_seq_lengths_kv=fia_kvlen,
             num_key_value_heads=NKV, num_heads=NQ, scale=D ** -0.5, sparse_mode=3)
 
-    def call_quant():
+    # C8+FIA. attention_v1 hands FIA v2 the cache transposed to BNSD, scales
+    # and all; QFA takes the stored BSND order, which is why the transpose is
+    # timed separately below rather than folded in here.
+    if paged:
+        c8_key = k_fp8.transpose(1, 2).contiguous()
+        c8_value = v_fp8.transpose(1, 2).contiguous()
+        c8_k_descale = k_descale.transpose(1, 2).contiguous()
+        c8_v_descale = v_descale.transpose(1, 2).contiguous()
+    else:
+        c8_key, c8_value = k_fp8, v_fp8
+        c8_k_descale, c8_v_descale = k_descale, v_descale
+
+    def call_c8_fia():
+        torch_npu.npu_fused_infer_attention_score_v2(
+            q_fp8, c8_key, c8_value, atten_mask=mask,
+            block_table=table, input_layout="TND", block_size=BLOCK,
+            actual_seq_qlen=cum_q, actual_seq_kvlen=fia_kvlen,
+            num_query_heads=NQ, num_key_value_heads=NKV,
+            softmax_scale=D ** -0.5, sparse_mode=3,
+            dequant_scale_query=q_descale,
+            dequant_scale_key=c8_k_descale,
+            dequant_scale_value=c8_v_descale,
+            query_quant_mode=MXFP8_QUERY_QUANT_MODE,
+            key_quant_mode=MXFP8_KEY_QUANT_MODE,
+            value_quant_mode=MXFP8_VALUE_QUANT_MODE,
+            query_dtype=torch.float8_e4m3fn,
+            key_dtype=torch.float8_e4m3fn,
+            value_dtype=torch.float8_e4m3fn,
+            dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_value_dtype=torch_npu.float8_e8m0fnu)
+
+    def call_kv_transpose():
+        # What _transpose_kv_cache costs C8+FIA every forward. This copies only
+        # the blocks this batch touches; the engine copies the whole cache, so
+        # the number is a floor.
+        k_fp8.transpose(1, 2).contiguous()
+        v_fp8.transpose(1, 2).contiguous()
+        k_descale.transpose(1, 2).contiguous()
+        v_descale.transpose(1, 2).contiguous()
+
+    def call_q_quant():
         # q only. K/V come out of the C8 cache already MXFP8 -- quantizing them
         # per step was the pre-C8 path and is not what the engine does now.
         _qfa_quant(q, D)
+
+    # This step's new K/V, on their way into the cache. Prefill writes the whole
+    # chunk, decode its 1 + 3 MTP tokens -- total_q either way.
+    new_k = torch.randn(total_q, NKV, D, dtype=torch.bfloat16).npu()
+    new_v_flat = torch.randn(total_q, NKV * D, dtype=torch.bfloat16).npu()
+    v_static_recip = torch.rand(NKV * D, dtype=torch.float32).npu() + 0.5
+
+    def call_kv_quant():
+        # Copied from AscendC8MXFPAttentionBackendImpl.forward, argument for
+        # argument. K goes in 3-D with no scale_alg -- not the 2-D scale_alg=0
+        # shape _qfa_quant uses for the query, and different enough to time
+        # differently. V is flattened onto the checkpoint's static per-channel
+        # reciprocal, which is why it is npu_quantize and not a dynamic quant.
+        torch_npu.npu_dynamic_mx_quant(new_k, dst_type=torch.float8_e4m3fn)
+        torch_npu.npu_quantize(
+            new_v_flat, v_static_recip, None, torch.float8_e4m3fn, -1, False)
 
     result = {
         "shape": label,
@@ -486,11 +578,24 @@ def run_bench(label: str, kind: str, batch: int, q_len: int, kv_len: int, iters:
         "batch": batch,
         "q_len": q_len,
         "kv_len": kv_len,
-        "fia_ms": _time(call_fia, iters, warmup) * 1e3,
-        "qfa_ms": _time(call_qfa, iters, warmup) * 1e3,
-        "quant_ms": _time(call_quant, iters, warmup) * 1e3,
+        "c16_fia_ms": _time(call_fia, iters, warmup) * 1e3,
+        "c8_qfa_ms": _time(call_qfa, iters, warmup) * 1e3,
+        "q_quant_ms": _time(call_q_quant, iters, warmup) * 1e3,
+        "kv_quant_ms": _time(call_kv_quant, iters, warmup) * 1e3,
         "metadata_ms": _time(call_metadata, iters, warmup) * 1e3,
     }
+    # C8+FIA is the explanatory leg, not a deployment, so it is timed last and
+    # allowed to fail alone: the two real paths already have their numbers by
+    # here, and a rejected shape (or an abort that takes the device with it)
+    # then costs a table cell rather than the row. dense is the likely one --
+    # the engine's prefill reads the paged cache, so PrefillNoCache TND is a
+    # shape this script made up rather than one FIA v2 has to accept.
+    try:
+        result["c8_fia_ms"] = _time(call_c8_fia, iters, warmup) * 1e3
+        if paged:
+            result["kv_tpose_ms"] = _time(call_kv_transpose, iters, warmup) * 1e3
+    except Exception as exc:  # noqa: BLE001 -- one leg missing is not the run failing
+        result["c8_fia_err"] = f"{type(exc).__name__}: {str(exc)[:70]}"
     print("BENCH-RESULT " + json.dumps(result), flush=True)
     return 0
 
@@ -512,7 +617,11 @@ def run_bench_sweep(args) -> int:
         if line:
             rows.append(json.loads(line[len("BENCH-RESULT "):]))
             last = rows[-1]
-            print(f"   FIA {last['fia_ms']:.3f} ms   QFA {last['qfa_ms']:.3f} ms", flush=True)
+            c8_fia = f"{last['c8_fia_ms']:.3f}" if "c8_fia_ms" in last else "n/a"
+            print(f"   C16+FIA {last['c16_fia_ms']:.3f} ms   C8+FIA {c8_fia} ms   "
+                  f"C8+QFA {last['c8_qfa_ms']:.3f} ms", flush=True)
+            if "c8_fia_err" in last:
+                print(f"   C8+FIA rejected: {last['c8_fia_err']}", flush=True)
         else:
             tail = (proc.stdout + proc.stderr).strip().splitlines()
             reason = tail[-1][:44] if tail else f"exit {proc.returncode}"
@@ -522,39 +631,88 @@ def run_bench_sweep(args) -> int:
             # error to the point of uselessness. Print the real tail here.
             for line in tail[-4:]:
                 print(f"     | {line}", flush=True)
-    _print_bench_table(rows)
+    _print_bench_table(rows, args.attn_layers)
     return 0 if any("error" not in r for r in rows) else 1
 
 
-def _print_bench_table(rows: list) -> None:
+def _c8_step_ms(row: dict, attn_layers: int | None) -> float:
+    """What one attention layer costs the C8+QFA deployment in one step."""
+    meta_share = row["metadata_ms"] / attn_layers if attn_layers else 0.0
+    return row["c8_qfa_ms"] + row["q_quant_ms"] + row["kv_quant_ms"] + meta_share
+
+
+def _print_bench_table(rows: list, attn_layers: int | None) -> None:
+    ok = [r for r in rows if "error" not in r]
+
     head = (
-        f"{'shape':<16}{'FIA ms':>9}{'QFA ms':>9}{'speedup':>9}"
-        f"{'q-quant':>10}{'step ms':>10}{'meta ms':>9}"
+        f"{'shape':<16}{'C16 FIA':>10}{'C8 FIA':>9}{'C8 QFA':>9}"
+        f"{'q-quant':>9}{'kv-quant':>10}{'kv-tpose':>10}{'meta':>9}"
     )
     print("\n" + head)
     print("-" * len(head))
     for row in rows:
         if row.get("error"):
-            print(f"{row['shape']:<16}{row['error']:>46}")
+            print(f"{row['shape']:<16}{row['error']:>66}")
             continue
-        step = row["qfa_ms"] + row["quant_ms"]
-        speedup = row["fia_ms"] / row["qfa_ms"] if row["qfa_ms"] else float("nan")
+        c8_fia = f"{row['c8_fia_ms']:.3f}" if "c8_fia_ms" in row else "n/a"
+        tpose = f"{row['kv_tpose_ms']:.3f}" if "kv_tpose_ms" in row else "-"
         print(
-            f"{row['shape']:<16}{row['fia_ms']:>9.3f}{row['qfa_ms']:>9.3f}"
-            f"{speedup:>8.2f}x{row['quant_ms']:>10.3f}{step:>10.3f}{row['metadata_ms']:>9.3f}"
+            f"{row['shape']:<16}{row['c16_fia_ms']:>10.3f}{c8_fia:>9}{row['c8_qfa_ms']:>9.3f}"
+            f"{row['q_quant_ms']:>9.3f}{row['kv_quant_ms']:>10.3f}{tpose:>10}"
+            f"{row['metadata_ms']:>9.3f}"
         )
-    print(
-        "\nspeedup = FIA / QFA, per attention layer, both reading what the C8 cache holds:\n"
-        "  FIA bf16, QFA MXFP8. Decode is KV-bandwidth bound and QFA reads half the\n"
-        "  bytes, so watch how the ratio moves with context length.\n"
-        "q-quant = quantizing this step's query, per layer per step. K/V are\n"
-        "  not quantized: the C8 cache already holds them as MXFP8. Not part of\n"
-        "  the operator; never subtract it.\n"
-        "step ms = QFA + q-quant, one attention layer per decode step.\n"
-        "meta ms = the AICPU plan, paid once per step for all layers, not per layer.\n"
-        "  It is not optional: the doc calls it a scheduling hint, but passing None\n"
-        "  is rejected outright (EZ0004) -- hence no no-metadata column."
+
+    mark = "" if attn_layers else "*"
+    head2 = (
+        f"{'shape':<16}{'op FIA/QFA':>13}{'path C16/C8' + mark:>14}"
+        f"{'cache C16/C8FIA':>18}{'kernel C8FIA/QFA':>19}"
     )
+    print("\n" + head2)
+    print("-" * len(head2))
+    for row in ok:
+        op = row["c16_fia_ms"] / row["c8_qfa_ms"]
+        path = row["c16_fia_ms"] / _c8_step_ms(row, attn_layers)
+        if "c8_fia_ms" in row:
+            cache = f"{row['c16_fia_ms'] / row['c8_fia_ms']:.2f}x"
+            kernel = f"{row['c8_fia_ms'] / row['c8_qfa_ms']:.2f}x"
+        else:
+            cache = kernel = "n/a"
+        print(
+            f"{row['shape']:<16}{op:>12.2f}x{path:>13.2f}x{cache:>18}{kernel:>19}"
+        )
+
+    layers = f"/{attn_layers}" if attn_layers else ""
+    print(
+        "\nThe first table is one attention layer, one step, in milliseconds.\n"
+        "  C16 FIA   FIA over the bf16 cache -- today's deployment.\n"
+        "  C8 FIA    FIA v2 over the MXFP8 cache. Not deployed; it is here to\n"
+        "            split the gap into cache and kernel.\n"
+        "  C8 QFA    the proposed deployment's operator.\n"
+        "  q-quant   C8 only: this step's query, projected in bf16, made MXFP8.\n"
+        "  kv-quant  C8 only: this step's new K/V, on their way into the cache.\n"
+        "  kv-tpose  C8+FIA only: BSND cache -> the BNSD FIA wants, every\n"
+        "            forward. Over this batch's blocks only, so it is a FLOOR --\n"
+        "            the engine transposes the whole cache. QFA pays none of it.\n"
+        "  meta      C8+QFA only: the AICPU plan, once per step for ALL layers.\n"
+        "\nThe second table is what those add up to.\n"
+        f"  op FIA/QFA        the operators alone, bf16 in against MXFP8 in.\n"
+        f"  path C16/C8       C16 FIA  /  (C8 QFA + q-quant + kv-quant + meta{layers}).\n"
+        "                    The deployment answer: what the layer's time becomes.\n"
+        "  cache C16/C8FIA   one operator, two cache widths -- the bandwidth half.\n"
+        "  kernel C8FIA/QFA  one cache, two operators -- the kernel half. Excludes\n"
+        "                    kv-tpose, which C8+FIA also owes.\n"
+        "  cache x kernel should land near op FIA/QFA; if it does not, one of the\n"
+        "  three operators is being fed a shape it handles differently.\n"
+        "\nDecode is KV-bandwidth bound and MXFP8 is about half the bytes, so read\n"
+        "the ratios as a curve against context length, not as single numbers."
+    )
+    if not attn_layers:
+        print(
+            "\n* path C16/C8 EXCLUDES meta: the plan is paid once per step for every\n"
+            "  full-attention layer, and this script cannot know how many Qwen3.8 has\n"
+            "  (the model is hybrid -- linear and full attention interleave). Pass\n"
+            "  --attn-layers N to fold in meta/N and get the real per-layer number."
+        )
 
 
 def run_all_cases(args) -> int:
@@ -586,12 +744,18 @@ def run_all_cases(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", choices=CASES)
-    ap.add_argument("--bench", action="store_true", help="time the two operators instead of comparing")
+    ap.add_argument("--bench", action="store_true",
+                    help="time C16+FIA against C8+QFA instead of comparing them")
     ap.add_argument("--all", action="store_true",
                     help="accuracy cases first, then the bench sweep")
     ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--attn-layers", type=int,
+                    help="full-attention layers, to spread the AICPU plan over "
+                         "them. Qwen3.8 interleaves linear and full attention, "
+                         "so only the full ones pay it; without this the "
+                         "deployment ratio leaves the plan out entirely.")
     ap.add_argument("--model", choices=sorted(MODELS), default="27b", help="shape preset")
     for _name in SHAPE_FLAGS:
         ap.add_argument("--" + _name.replace("_", "-"), type=int, help="override the preset")
