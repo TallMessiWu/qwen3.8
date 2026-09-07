@@ -58,9 +58,10 @@ and the per-step per-layer costs only one side pays:
             forward copies it (_transpose_kv_cache). QFA reads it in place.
             Timed over this batch's blocks only -- the engine transposes the
             whole cache, so treat it as a floor, not the cost.
-  meta      C8+QFA: the AICPU plan. Once per step for every layer, so it only
-            enters a per-layer number once --attn-layers says how many full
-            attention layers there are.
+  meta      C8+QFA: the AICPU plan. Paid once per step for every layer, so a
+            per-layer number gets meta / attn_layers -- the full-attention
+            count from the --model preset, since the stack is hybrid 3:1 and
+            the linear layers never call QFA.
 
 Scatter is not timed: both deployments scatter, and C8 scatters fewer bytes,
 so charging it to C8 alone would flatter C16.
@@ -73,7 +74,7 @@ Usage (inside the serving container, no server running):
   python scripts/bench/test_qfa_vs_fia.py
   python scripts/bench/test_qfa_vs_fia.py --case dense
   python scripts/bench/test_qfa_vs_fia.py --bench
-  python scripts/bench/test_qfa_vs_fia.py --bench --attn-layers 24
+  python scripts/bench/test_qfa_vs_fia.py --bench --attn-layers 15  # 397B stack
   python scripts/bench/test_qfa_vs_fia.py --model 35b
   python scripts/bench/test_qfa_vs_fia.py --model 35b --bench
   python scripts/bench/test_qfa_vs_fia.py --model 35b --all   # both halves
@@ -89,11 +90,18 @@ import sys
 # kernel block size differ -- and the decode bandwidth ratio this script exists
 # to measure depends on exactly those (NKV * D bytes per token, BLOCK per page),
 # so measuring 27B's numbers against a 35B server would answer nothing.
+# attn_layers is the full-attention count, which the AICPU plan is spread over:
+# these are hybrid stacks, and only the full-attention layers run QFA at all.
+# Both are 3:1 with full_attention_interval 4, so it is num_hidden_layers // 4 --
+# Qwen/Qwen3.8-27B is 64 layers, 16 of them full attention. 35b is not in the
+# Qwen3.8 line (which is 27B, Flash-Next and 2.4T-A95B); the served shape
+# 16/2/256 is Qwen3.5-35B-A3B's, 40 layers and 10 full. Other stacks in this
+# repo, if this script ever points at one: 397B-A17B 60/15, 2.4T-A95B 92/23.
 MODELS = {
     "27b": {"num_heads": 24, "num_kv_heads": 4, "head_dim": 256,
-            "block_size": 128, "prefill_len": 1594},
+            "block_size": 128, "prefill_len": 1594, "attn_layers": 16},
     "35b": {"num_heads": 16, "num_kv_heads": 2, "head_dim": 256,
-            "block_size": 512, "prefill_len": 1552},
+            "block_size": 512, "prefill_len": 1552, "attn_layers": 10},
 }
 
 # Defaults are 27B's, as they always were. apply_shape() overwrites them from
@@ -101,10 +109,14 @@ MODELS = {
 # names stay so the call sites below need no threading.
 NQ, NKV, D, BLOCK, WINDOW = 24, 4, 256, 128, 64
 PREFILL_LEN = 1594
+ATTN_LAYERS = 16
 DECODE_REQS, DECODE_KV = 4, 300
 
 # WINDOW is MXFP8's scale grouping, not a model shape -- it stays 64.
-SHAPE_FLAGS = ("num_heads", "num_kv_heads", "head_dim", "block_size", "prefill_len")
+# attn_layers rides along here because it comes from --model and overrides the
+# same way, even though it is a stack depth rather than a tensor shape.
+SHAPE_FLAGS = ("num_heads", "num_kv_heads", "head_dim", "block_size", "prefill_len",
+               "attn_layers")
 
 # attention_v1's MXFP8_{QUERY,KEY,VALUE}_QUANT_MODE, for the C8+FIA leg. 6 is
 # per-32-along-D, 8 is grouped down the sequence -- the same asymmetry QFA has.
@@ -115,7 +127,7 @@ MXFP8_VALUE_QUANT_MODE = 8
 
 def apply_shape(args) -> None:
     """Resolve the preset plus any per-field override into the globals."""
-    global NQ, NKV, D, BLOCK, PREFILL_LEN
+    global NQ, NKV, D, BLOCK, PREFILL_LEN, ATTN_LAYERS
     preset = MODELS[args.model]
     resolved = {name: getattr(args, name) or preset[name] for name in SHAPE_FLAGS}
     NQ = resolved["num_heads"]
@@ -123,9 +135,11 @@ def apply_shape(args) -> None:
     D = resolved["head_dim"]
     BLOCK = resolved["block_size"]
     PREFILL_LEN = resolved["prefill_len"]
+    ATTN_LAYERS = resolved["attn_layers"]
     print(
         f"shapes: model={args.model} num_heads={NQ} num_kv_heads={NKV} "
-        f"head_dim={D} block_size={BLOCK} prefill_len={PREFILL_LEN}",
+        f"head_dim={D} block_size={BLOCK} prefill_len={PREFILL_LEN} "
+        f"attn_layers={ATTN_LAYERS}",
         flush=True,
     )
 
@@ -631,7 +645,7 @@ def run_bench_sweep(args) -> int:
             # error to the point of uselessness. Print the real tail here.
             for line in tail[-4:]:
                 print(f"     | {line}", flush=True)
-    _print_bench_table(rows, args.attn_layers)
+    _print_bench_table(rows, ATTN_LAYERS)
     return 0 if any("error" not in r for r in rows) else 1
 
 
@@ -706,12 +720,16 @@ def _print_bench_table(rows: list, attn_layers: int | None) -> None:
         "\nDecode is KV-bandwidth bound and MXFP8 is about half the bytes, so read\n"
         "the ratios as a curve against context length, not as single numbers."
     )
-    if not attn_layers:
+    if attn_layers:
         print(
-            "\n* path C16/C8 EXCLUDES meta: the plan is paid once per step for every\n"
-            "  full-attention layer, and this script cannot know how many Qwen3.8 has\n"
-            "  (the model is hybrid -- linear and full attention interleave). Pass\n"
-            "  --attn-layers N to fold in meta/N and get the real per-layer number."
+            f"\nmeta is spread over {attn_layers} full-attention layers -- the stack is\n"
+            "  hybrid 3:1 (full_attention_interval 4) and the linear layers never call\n"
+            "  QFA. Override with --attn-layers if the served checkpoint differs."
+        )
+    else:
+        print(
+            "\n* path C16/C8 EXCLUDES meta: --attn-layers 0 was passed, so the plan has\n"
+            "  nothing to be spread over. Drop the flag to use the model's own count."
         )
 
 
@@ -751,11 +769,7 @@ def main() -> int:
     ap.add_argument("--shape", choices=BENCH_NAMES, help="bench a single shape")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--attn-layers", type=int,
-                    help="full-attention layers, to spread the AICPU plan over "
-                         "them. Qwen3.8 interleaves linear and full attention, "
-                         "so only the full ones pay it; without this the "
-                         "deployment ratio leaves the plan out entirely.")
+
     ap.add_argument("--model", choices=sorted(MODELS), default="27b", help="shape preset")
     for _name in SHAPE_FLAGS:
         ap.add_argument("--" + _name.replace("_", "-"), type=int, help="override the preset")
