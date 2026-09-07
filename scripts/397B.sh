@@ -210,7 +210,19 @@ for ((n = 1; n <= MAX_NUM_SEQS; n++)); do
 done
 capture_sizes="${CAPTURE_SIZES:-$default_capture_sizes}"
 cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
-compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\"}"
+# COMPILE_BACKEND=eager keeps dynamo tracing and aclgraph capture but skips
+# inductor's optimisation entirely. GRAPH=0 was found to set compilation mode to
+# NONE -- the model then runs as plain eager Python -- so "graph on/off" was never
+# just about capture, it also turned the compiler on and off. This switch splits
+# those two apart: eager backend still captures, so if the long-prompt EOS goes
+# away here, the culprit is an inductor rewrite rather than the capture itself.
+compile_backend="${COMPILE_BACKEND:-}"
+compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\""
+if [[ -n "$compile_backend" ]]; then
+    compilation_config+=",\"backend\":\"$compile_backend\""
+    echo "compile backend forced to $compile_backend." >&2
+fi
+compilation_config+="}"
 if [[ "${GRAPH:-1}" == "0" ]]; then
     compilation_config='{"cudagraph_mode":"NONE"}'
     echo "aclgraph capture disabled (GRAPH=0)." >&2
