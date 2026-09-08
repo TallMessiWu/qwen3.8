@@ -1,41 +1,55 @@
 #!/usr/bin/env python3
-"""Survey msprobe dump trees so eager and graph steps can be aligned by content.
+"""Survey msprobe dump trees before spending any time comparing them.
 
-The step index is NOT comparable between an eager dump and a graph dump: in
-graph mode model_runner_v1 starts the debugger at the end of load_model (only
-when cudagraph_mode != NONE) and every _dummy_run then calls
-_finalize_dump_data(dump=False), which still advances debugger.step(). So
-profile_run and each capture warmup consume step numbers that the eager run
-never spends. Align by what a step *contains* instead -- the token count of the
-forward -- which is what this prints.
+Two things make a naive eager-vs-graph comparison worthless, and this script
+checks for both.
+
+1. The step index is NOT comparable between the two trees. model_runner_v1
+   picks the dumper off cudagraph_mode -- PrecisionDebugger when it is NONE,
+   AclGraphDumper otherwise -- and only starts the graph one at the end of
+   load_model. Every _dummy_run then calls _finalize_dump_data(dump=False),
+   which advances debugger.step() without writing anything, so profile_run and
+   each capture warmup burn a step number that an eager run never spends.
+   Align by what a step *contains* -- the token width of its forward -- which
+   is the column this prints.
+
+2. A dump only answers a question about a bug if the bug happened while it was
+   being collected. The truncation symptom is "one completion token", i.e. a
+   prefill step followed by exactly one decode step. A tree with many decode
+   steps recorded a healthy generation, and comparing two healthy runs only
+   measures ordinary graph-vs-eager drift.
 
 Usage:
     python3 scripts/debug/msprobe_survey.py eager graph
+    python3 scripts/debug/msprobe_survey.py --mtp 3 eager graph
 
-RED/GREEN judgement is printed at the end:
-  - GREEN: both trees contain a prefill-sized step (leading dim >> decode
-    width) and the attention op is visible in both -> a compare is meaningful.
-  - RED: the graph tree has no attention op or no prefill-sized step -> the
-    dump cannot answer a QFA/attention question and re-collection is needed.
+RED/GREEN judgement is printed at the end. Every RED means "do not compare
+these trees yet", with the reason named.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
-import sys
 from collections import Counter
 from pathlib import Path
 
-# Substrings that identify the C8_MXFP attention operator in a dump key.
-ATTN_MARKERS = ("quant_flash", "fused_infer_attention", "npu_dynamic_mx_quant", "reshape_and_cache")
+# Substrings identifying interesting ops in a dump key. GDN matters because the
+# graph-vs-eager divergence was last bisected to the GDN layers; attention
+# matters because QFA is the op under test.
+MARKERS = {
+    "attn": ("quant_flash", "fused_infer_attention", "npu_dynamic_mx_quant", "reshape_and_cache"),
+    "gdn": ("gated_delta", "chunk_gated", "causal_conv", "conv1d", "recurrent"),
+    "moe": ("moe_", "grouped_matmul", "moe_init_routing", "all_gather", "dispatch"),
+}
 
 STEP_RE = re.compile(r"^step(\d+)$")
 RANK_RE = re.compile(r"^rank(\d+)?$")
 
 
 def leading_dims(entry: dict) -> list[int]:
-    """Leading dimension of every tensor in an entry's inputs."""
+    """Leading dimension of every input tensor in one dump entry."""
     dims = []
     for item in entry.get("input_args") or []:
         if isinstance(item, dict) and item.get("type") == "torch.Tensor":
@@ -54,21 +68,21 @@ def survey_rank(dump_json: Path) -> dict:
 
     data = payload.get("data") or {}
     dims: Counter = Counter()
-    attn_hits: Counter = Counter()
+    hits: Counter = Counter()
     for key, entry in data.items():
         if not isinstance(entry, dict):
             continue
         dims.update(leading_dims(entry))
-        for marker in ATTN_MARKERS:
-            if marker in key:
-                attn_hits[marker] += 1
+        lowered = key.lower()
+        for group, markers in MARKERS.items():
+            if any(m in lowered for m in markers):
+                hits[group] += 1
     return {
         "task": payload.get("task"),
         "level": payload.get("level"),
         "entries": len(data),
         "dims": dims,
-        "attn": attn_hits,
-        "first_keys": list(data)[:3],
+        "hits": hits,
     }
 
 
@@ -79,8 +93,7 @@ def survey_tree(root: Path) -> list[dict]:
         key=lambda p: int(STEP_RE.match(p.name).group(1)),  # type: ignore[union-attr]
     )
     for step in steps:
-        ranks = sorted(p for p in step.iterdir() if p.is_dir() and RANK_RE.match(p.name))
-        for rank in ranks:
+        for rank in sorted(p for p in step.iterdir() if p.is_dir() and RANK_RE.match(p.name)):
             dump_json = rank / "dump.json"
             row = {
                 "step": int(STEP_RE.match(step.name).group(1)),  # type: ignore[union-attr]
@@ -95,54 +108,88 @@ def survey_tree(root: Path) -> list[dict]:
 
 def print_tree(root: Path, rows: list[dict]) -> None:
     print(f"\n===== {root} =====")
-    print(f"{'step':>5} {'rank':>6} {'cons':>5} {'entries':>8}  {'top leading dims (count)':<40} attn ops")
+    header = f"{'step':>5} {'rank':>6} {'cons':>5} {'stck':>5} {'entries':>8}  {'top leading dims':<32} markers"
+    print(header)
     for row in rows:
         if "error" in row:
-            print(f"{row['step']:>5} {row['rank']:>6} {'-':>5} {'-':>8}  ERROR: {row['error']}")
+            print(f"{row['step']:>5} {row['rank']:>6} {'-':>5} {'-':>5} {'-':>8}  ERROR: {row['error']}")
             continue
         top = ", ".join(f"{d}x{n}" for d, n in row["dims"].most_common(3)) or "-"
-        attn = ", ".join(f"{k}:{v}" for k, v in row["attn"].items()) or "NONE"
-        print(f"{row['step']:>5} {row['rank']:>6} {str(row['construct']):>5} {row['entries']:>8}  {top:<40} {attn}")
+        marks = ", ".join(f"{k}:{v}" for k, v in sorted(row["hits"].items())) or "NONE"
+        print(
+            f"{row['step']:>5} {row['rank']:>6} {str(row['construct']):>5} {str(row['stack']):>5} "
+            f"{row['entries']:>8}  {top:<32} {marks}"
+        )
 
 
 def dominant_dim(row: dict) -> int:
-    if "dims" not in row or not row["dims"]:
+    if not row.get("dims"):
         return 0
     return row["dims"].most_common(1)[0][0]
 
 
-def verdict(name: str, rows: list[dict]) -> bool:
+def verdict(name: str, rows: list[dict], decode_width: int) -> bool:
     ok = True
-    rank0 = [r for r in rows if r.get("rank") in ("rank0", "rank") and "dims" in r]
+    rank0 = [r for r in rows if r.get("rank") == "rank0" and "dims" in r]
     if not rank0:
         print(f"[RED ] {name}: no readable rank0 dump.json")
         return False
 
-    widths = sorted({dominant_dim(r) for r in rank0})
-    print(f"[info] {name}: rank0 dominant token widths across steps = {widths}")
-    if max(widths) < 32:
-        print(f"[RED ] {name}: no prefill-sized step (max width {max(widths)}); the long prompt is not in this dump")
-        ok = False
-    else:
-        prefill_steps = [r["step"] for r in rank0 if dominant_dim(r) == max(widths)]
-        print(f"[GREEN] {name}: prefill-sized step(s) = {prefill_steps} (width {max(widths)})")
+    widths = {r["step"]: dominant_dim(r) for r in rank0}
+    print(f"[info] {name}: {len(rank0)} rank0 steps, dominant widths = {sorted(set(widths.values()))}")
 
-    with_attn = [r["step"] for r in rank0 if r.get("attn")]
-    if not with_attn:
-        print(f"[RED ] {name}: no attention op in any step -- the dump cannot answer a QFA question")
+    # A prefill step is one materially wider than a uniform decode step.
+    prefill = [s for s, w in widths.items() if w > decode_width * 4]
+    if not prefill:
+        print(f"[RED ] {name}: no prefill-sized step (max width {max(widths.values())}); long prompt not in this dump")
         ok = False
     else:
-        print(f"[GREEN] {name}: attention op present in steps {with_attn[:5]}{'...' if len(with_attn) > 5 else ''}")
+        print(f"[GREEN] {name}: prefill step(s) {prefill} at width {max(widths.values())}")
+
+    # The symptom under investigation is a single completion token. One decode
+    # step means it reproduced; many decode steps mean this dump recorded a
+    # healthy generation and has nothing to say about the bug.
+    decode = [s for s, w in widths.items() if 0 < w <= decode_width]
+    empty = [s for s, w in widths.items() if w == 0]
+    print(f"[info] {name}: {len(decode)} decode-shaped steps (width<={decode_width}), {len(empty)} empty steps")
+    if len(decode) > 2:
+        print(
+            f"[RED ] {name}: {len(decode)} decode steps -- this run generated many tokens, so the "
+            "one-token truncation did NOT reproduce here. Comparing it measures ordinary drift, not the bug."
+        )
+        ok = False
+    elif decode:
+        print(f"[GREEN] {name}: {len(decode)} decode step(s) -- consistent with the one-token truncation")
+
+    # graph_visualize needs the full trio; statistics-only steps cannot be walked.
+    incomplete = sorted({r["step"] for r in rows if "error" not in r and not (r["construct"] and r["stack"])})
+    if incomplete:
+        print(f"[warn] {name}: steps without construct.json+stack.json (graph_visualize cannot use them): {incomplete}")
+
+    for group in MARKERS:
+        seen = [r["step"] for r in rank0 if r.get("hits", {}).get(group)]
+        if seen:
+            print(f"[GREEN] {name}: {group} ops present in steps {seen[:6]}{'...' if len(seen) > 6 else ''}")
+        else:
+            print(f"[warn] {name}: no {group} op matched any dump key -- that layer is invisible in this tree")
     return ok
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print(__doc__)
-        return 2
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("trees", nargs="+", help="msprobe dump roots, e.g. eager graph")
+    ap.add_argument(
+        "--mtp",
+        type=int,
+        default=3,
+        help="num_speculative_tokens; a uniform decode step is mtp+1 tokens wide per request (default 3)",
+    )
+    args = ap.parse_args()
+    decode_width = args.mtp + 1
+
     all_ok = True
     surveys = []
-    for arg in argv[1:]:
+    for arg in args.trees:
         root = Path(arg)
         if not root.is_dir():
             print(f"[RED ] {root} is not a directory")
@@ -154,16 +201,26 @@ def main(argv: list[str]) -> int:
 
     print("\n===== verdict =====")
     for root, rows in surveys:
-        all_ok &= verdict(root.name, rows)
+        all_ok &= verdict(root.name, rows, decode_width)
+        print()
 
     if len(surveys) == 2:
-        (_, a), (_, b) = surveys
+        (ra, a), (rb, b) = surveys
         a0 = [r for r in a if r.get("rank") == "rank0" and "dims" in r]
         b0 = [r for r in b if r.get("rank") == "rank0" and "dims" in r]
-        print(f"\n[info] step counts: {surveys[0][0].name}={len(a0)} {surveys[1][0].name}={len(b0)}")
-        print("[info] align by the token-width column above, NOT by the step index.")
+        print(f"[info] step counts: {ra.name}={len(a0)} {rb.name}={len(b0)}")
+        wa = {dominant_dim(r) for r in a0}
+        wb = {dominant_dim(r) for r in b0}
+        shared = sorted(wa & wb)
+        print(f"[info] token widths present in both: {shared or 'NONE'}")
+        print("[info] pair steps by that width, never by step index.")
+        if not shared:
+            print("[RED ] the two trees share no token width -- they did not run the same request")
+            all_ok = False
+
+    print(f"\n{'[GREEN] survey passed' if all_ok else '[RED ] survey failed -- see reasons above'}")
     return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    raise SystemExit(main())

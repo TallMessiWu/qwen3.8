@@ -93,6 +93,44 @@ if [[ "${FUSION:-1}" == "0" ]]; then
     additional_config+=',"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false,"fuse_muls_add":false}'
     echo "custom inductor fusion passes disabled (FUSION=0)." >&2
 fi
+# DUMP arms the msprobe dump, and it goes INSIDE this one JSON on purpose:
+# vLLM keeps only the last --additional-config, so a second flag would silently
+# drop enable_cpu_binding and everything else built above.
+#
+# Never do this by hand-commenting the flag out of the exec block instead. A
+# trailing "\" followed by a comment line ends the command right there: "#"
+# opens a comment that runs to that line's real newline, and a "\" *inside* a
+# comment continues nothing. Whatever follows becomes a separate command -- and
+# since the launcher uses exec, that command never runs at all. Commenting out
+# --additional-config that way therefore drops "${qfa_args[@]}" with it and
+# serves QFA with prefix caching on, which the MXFP8 cache cannot support. That
+# has already invalidated one round of msprobe A/B data.
+#
+# DUMP=1 derives the path from GRAPH so an eager run and a graph run cannot
+# overwrite each other; DUMP=<path> sets it outright; unset or 0 is off.
+if [[ -n "${DUMP:-}" && "${DUMP}" != "0" ]]; then
+    if [[ "${DUMP}" == "1" ]]; then
+        if [[ "${GRAPH:-1}" == "0" ]]; then
+            dump_path="$PWD/msprobe-eager"
+        else
+            dump_path="$PWD/msprobe-graph"
+        fi
+    else
+        dump_path="${DUMP}"
+    fi
+    dump_task="${DUMP_TASK:-statistics}"
+    dump_level="${DUMP_LEVEL:-mix}"
+    additional_config+=",\"dump_config\":{\"task\":\"$dump_task\",\"level\":\"$dump_level\""
+    additional_config+=",\"dump_path\":\"$dump_path\",\"rank\":[],\"list\":[]}"
+    echo "msprobe dump on: task=$dump_task level=$dump_level path=$dump_path" >&2
+    # model_runner_v1 picks the dumper off cudagraph_mode: PrecisionDebugger when
+    # it is NONE, AclGraphDumper otherwise. Two different classes, and _dummy_run
+    # calls _finalize_dump_data(dump=False), which advances the step counter
+    # without writing anything -- so profile_run and every capture warmup burn a
+    # step number that an eager run never spends. Align the two trees by what a
+    # step contains, not by its index: scripts/debug/msprobe_survey.py.
+    echo "  eager and graph dumps are NOT step-index comparable; see msprobe_survey.py" >&2
+fi
 additional_config+='}'
 
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/qwen3.5-397b-w4a4_multi}"
@@ -162,6 +200,15 @@ fi
 # MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split and the
 # graph plan below.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
+# TP is here rather than inline because splitting the eight cards into two
+# four-rank servers (one eager, one graph) is a routine way to collect a matched
+# pair of dumps in one sitting, and editing the exec block by hand is what broke
+# it last time.
+TP="${TP:-8}"
+if ! [[ "$TP" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TP must be a positive integer, got '$TP'." >&2
+    exit 1
+fi
 # Bounds one scheduler step. On an EP MoE it also bounds the MoE comm choice:
 # a step wider than mc2_tokens_capacity falls to all-to-all, which miscomputes
 # under aclgraph. With enable_prefill_mc2 the capacity is
@@ -266,7 +313,7 @@ exec vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
     --data-parallel-size 1 \
-    --tensor-parallel-size 8 \
+    --tensor-parallel-size "$TP" \
     "${ep_args[@]}" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
