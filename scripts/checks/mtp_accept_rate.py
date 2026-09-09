@@ -58,6 +58,23 @@ _PROMPTS_V1 = [
     "把下面这句话翻译成英文：昇腾 NPU 上的算子需要先经过图捕获才能重放。",
 ]
 
+# Neutral filler for --pad-prompt. Acceptance climbing with output position
+# leaves two candidates tangled together: total KV length, and the number of
+# decode steps since the prefill. Padding the prompt moves the first without
+# moving the second, so a padded run that is healthy from output position 0
+# says "length", and one that is still broken says "steps since prefill".
+# The text is explicitly ignorable so the answer itself stays comparable --
+# check the printed first response to confirm it did not drift.
+_PAD_UNIT = "（以下背景材料与本问题无关，可以直接忽略。）"
+
+
+def _pad_prompt(prompt: str, pad_chars: int) -> str:
+    if pad_chars <= 0:
+        return prompt
+    repeats = pad_chars // len(_PAD_UNIT) + 1
+    return (_PAD_UNIT * repeats)[:pad_chars] + "\n\n" + prompt
+
+
 _METRIC_LINE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{[^}]*\})?\s+(?P<value>[^\s]+)$")
 _LABEL_KV = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
@@ -214,7 +231,7 @@ def _warmup(args, base: str, prompts: list[str]) -> None:
 
 def drive(args) -> tuple[SpecCounters, int, list[str]]:
     base = f"http://{args.host}:{args.port}"
-    prompts = list(_PROMPTS_V1)
+    prompts = [_pad_prompt(p, args.pad_prompt) for p in _PROMPTS_V1]
     _warmup(args, base, prompts)
     delta, total_completion, texts, elapsed = _measure(args, base, prompts, args.max_tokens)
 
@@ -245,7 +262,7 @@ def sweep(args, stops: list[int]) -> int:
     that slice of the sequence, using nothing but the existing counters.
     """
     base = f"http://{args.host}:{args.port}"
-    prompts = list(_PROMPTS_V1)
+    prompts = [_pad_prompt(p, args.pad_prompt) for p in _PROMPTS_V1]
     _warmup(args, base, prompts)
 
     rows = []
@@ -258,7 +275,7 @@ def sweep(args, stops: list[int]) -> int:
         prev_stop, prev = stop, delta
 
     print()
-    print(f"=== acceptance by output position [{args.label}] ===")
+    print(f"=== acceptance by output position [{args.label}] pad={args.pad_prompt} ===")
     print(f"{'band':<14}{'drafts':>10}{'accepted':>10}{'acc/draft':>12}{'pos0':>9}{'pos1':>9}{'pos2':>9}")
     ok = False
     for lo, hi, band, _, _, _ in rows:
@@ -360,6 +377,13 @@ def main() -> int:
     p.add_argument("--concurrency", type=int, default=1, help="hold this equal across both sides of an A/B")
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--label", default="run")
+    p.add_argument(
+        "--pad-prompt",
+        type=int,
+        default=0,
+        metavar="CHARS",
+        help="prepend this many characters of ignorable filler, to lengthen the KV without adding decode steps",
+    )
     p.add_argument("--json", dest="json_out", default=None, help="write the result here for a later --compare")
     p.add_argument("--num-spec", type=int, default=None, help="expected num_speculative_tokens, for a sanity warning")
     p.add_argument(
