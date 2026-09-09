@@ -132,6 +132,47 @@ def tensor_stats(entry: dict) -> list[tuple[str, dict]]:
     return found
 
 
+def tensor_path(root: Path, rank: str, step: int, data_name: str) -> Path | None:
+    """Where task="tensor" parks the actual payload for one dump entry."""
+    if not data_name:
+        return None
+    direct = root / f"step{step}" / rank / "dump_tensor_data" / data_name
+    if direct.exists():
+        return direct
+    matches = list((root / f"step{step}" / rank).rglob(data_name))
+    return matches[0] if matches else None
+
+
+def compare_saved_tensors(pa: Path, pb: Path) -> str | None:
+    """Compare two saved tensors, describing the first place they differ.
+
+    This is the answer to msprobe's "Invalid statistics detected. Please use
+    tensor mode to collect the affected data": the ops whose summary is NaN or
+    absent are exactly the ones a statistics run cannot compare, and they are
+    disproportionately the interesting ones. With task="tensor" the payload is
+    on disk, so compare it directly instead of giving up on those entries.
+    """
+    try:
+        import torch
+    except ImportError:
+        return "torch unavailable, cannot read saved tensors"
+    try:
+        ta = torch.load(pa, map_location="cpu", weights_only=True)
+        tb = torch.load(pb, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - a bad payload must not kill the sweep
+        return f"could not load: {type(exc).__name__}: {exc}"
+    if not hasattr(ta, "shape") or not hasattr(tb, "shape"):
+        return None if ta is tb or ta == tb else "non-tensor payloads differ"
+    if tuple(ta.shape) != tuple(tb.shape):
+        return f"shape {tuple(ta.shape)} vs {tuple(tb.shape)}"
+    fa, fb = ta.reshape(-1).float(), tb.reshape(-1).float()
+    same = (fa == fb) | (fa.isnan() & fb.isnan())
+    if bool(same.all()):
+        return None
+    idx = int((~same).nonzero()[0])
+    return f"first differing element [{idx}] of {fa.numel()}: A={fa[idx].item()!r} B={fb[idx].item()!r}"
+
+
 def invalid_reason(stat: dict) -> str | None:
     """Why msprobe could not summarise this tensor, if it could not.
 
@@ -201,7 +242,19 @@ def differs(a, b, rtol: float) -> bool:
     return a != b
 
 
-def compare(data_a: dict, data_b: dict, rtol: float, show: int, stacks: dict, grep: str | None) -> None:
+def compare(
+    data_a: dict,
+    data_b: dict,
+    rtol: float,
+    show: int,
+    stacks: dict,
+    grep: str | None,
+    root_a: Path,
+    root_b: Path,
+    rank: str,
+    step_a: int,
+    step_b: int,
+) -> None:
     keys_a = [k for k in data_a if not grep or grep in k]
     keys_b = [k for k in data_b if not grep or grep in k]
     print(f"\nops compared: A={len(keys_a)}  B={len(keys_b)}")
@@ -234,8 +287,23 @@ def compare(data_a: dict, data_b: dict, rtol: float, show: int, stacks: dict, gr
             continue
         for (label, ta), (_, tb) in zip(sa, sb):
             if invalid_reason(ta) or invalid_reason(tb):
-                skipped += 1
-                continue
+                # Statistics unusable. Under task="tensor" the payload is on
+                # disk, so fall back to it rather than skipping the entry --
+                # these are the ops the warning is about.
+                pa = tensor_path(root_a, rank, step_a, ta.get("data_name", ""))
+                pb = tensor_path(root_b, rank, step_b, tb.get("data_name", ""))
+                if pa is None or pb is None:
+                    skipped += 1
+                    continue
+                verdict = compare_saved_tensors(pa, pb)
+                if verdict is None:
+                    continue
+                print(f"\n[{reported}] {key}  ({label})  [tensor payload]")
+                print(f"      {verdict}")
+                for frame in stack_for(stacks, key):
+                    print(f"      at {frame}")
+                reported += 1
+                break
             bad = [k for k in STAT_KEYS if k in ta and k in tb and differs(ta[k], tb[k], rtol)]
             if bad:
                 print(f"\n[{reported}] {key}  ({label})")
@@ -281,7 +349,7 @@ def main() -> int:
     report_invalid(str(root_a.name), str(root_b.name), scan_invalid(data_a, args.grep), scan_invalid(data_b, args.grep))
 
     stacks = load_stacks(root_a, args.rank, step_a) or load_stacks(root_b, args.rank, step_b)
-    compare(data_a, data_b, args.rtol, args.show, stacks, args.grep)
+    compare(data_a, data_b, args.rtol, args.show, stacks, args.grep, root_a, root_b, args.rank, step_a, step_b)
     return 0
 
 
