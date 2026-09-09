@@ -179,16 +179,8 @@ def _text_of(resp: dict, endpoint: str) -> str:
     return choices[0].get("text") or ""
 
 
-def drive(args) -> tuple[SpecCounters, int, list[str]]:
-    base = f"http://{args.host}:{args.port}"
-    prompts = list(_PROMPTS_V1)
-
-    # Warm-up outside the measured window: the first decode of a fresh server
-    # can still be paying for lazy compilation, and its drafts would otherwise
-    # land in the delta.
-    for prompt in prompts[: args.warmup]:
-        one_request(base, args.model, prompt, args.endpoint, min(32, args.max_tokens), args.timeout)
-
+def _measure(args, base: str, prompts: list[str], max_tokens: int) -> tuple[SpecCounters, int, list[str], float]:
+    """Run the prompt set once at ``max_tokens`` and return the counter delta."""
     before = scrape(base, args.timeout)
     t0 = time.monotonic()
 
@@ -196,7 +188,7 @@ def drive(args) -> tuple[SpecCounters, int, list[str]]:
     total_completion = 0
 
     def run(prompt: str) -> dict:
-        return one_request(base, args.model, prompt, args.endpoint, args.max_tokens, args.timeout)
+        return one_request(base, args.model, prompt, args.endpoint, max_tokens, args.timeout)
 
     for _ in range(args.repeats):
         if args.concurrency <= 1:
@@ -210,7 +202,21 @@ def drive(args) -> tuple[SpecCounters, int, list[str]]:
 
     elapsed = time.monotonic() - t0
     after = scrape(base, args.timeout)
-    delta = after.minus(before)
+    return after.minus(before), total_completion, texts, elapsed
+
+
+def _warmup(args, base: str, prompts: list[str]) -> None:
+    # Outside every measured window: a fresh server's first decode can still be
+    # paying for lazy compilation, and those drafts would land in the delta.
+    for prompt in prompts[: args.warmup]:
+        one_request(base, args.model, prompt, args.endpoint, min(32, args.max_tokens), args.timeout)
+
+
+def drive(args) -> tuple[SpecCounters, int, list[str]]:
+    base = f"http://{args.host}:{args.port}"
+    prompts = list(_PROMPTS_V1)
+    _warmup(args, base, prompts)
+    delta, total_completion, texts, elapsed = _measure(args, base, prompts, args.max_tokens)
 
     if delta.drafts <= 0:
         raise HarnessError(
@@ -222,6 +228,62 @@ def drive(args) -> tuple[SpecCounters, int, list[str]]:
 
     print(f"wall clock {elapsed:.1f}s, {total_completion} completion tokens")
     return delta, total_completion, texts
+
+
+def sweep(args, stops: list[int]) -> int:
+    """Acceptance resolved by position in the generated sequence.
+
+    Aggregate acceptance cannot tell "the draft is uniformly a bit wrong" apart
+    from "the first few steps after a prefill are very wrong": a short run is
+    mostly early steps, a long run mostly late ones, and the two hypotheses
+    predict the same average. So run the same prompt set at an increasing
+    max_tokens and subtract consecutive runs. Greedy decoding makes every run
+    regenerate the identical prefix, so the difference between the K1 and K2
+    runs is exactly the work spent on output positions [K1, K2).
+
+    Each band therefore reports the acceptance the draft actually achieved in
+    that slice of the sequence, using nothing but the existing counters.
+    """
+    base = f"http://{args.host}:{args.port}"
+    prompts = list(_PROMPTS_V1)
+    _warmup(args, base, prompts)
+
+    rows = []
+    prev_stop = 0
+    prev = SpecCounters()
+    for stop in stops:
+        delta, completion, _, elapsed = _measure(args, base, prompts, stop)
+        band = delta.minus(prev)
+        rows.append((prev_stop, stop, band, delta, completion, elapsed))
+        prev_stop, prev = stop, delta
+
+    print()
+    print(f"=== acceptance by output position [{args.label}] ===")
+    print(f"{'band':<14}{'drafts':>10}{'accepted':>10}{'acc/draft':>12}{'pos0':>9}{'pos1':>9}{'pos2':>9}")
+    ok = False
+    for lo, hi, band, _, _, _ in rows:
+        if band.drafts <= 0:
+            print(f"{f'[{lo},{hi})':<14}{0:>10}{'':>10}{'  (no new drafts: generation already finished)':<}")
+            continue
+        ok = True
+        per_draft = band.accepted / band.drafts
+        cells = []
+        prevpos = band.drafts
+        for pos in sorted(band.per_pos):
+            count = band.per_pos[pos]
+            cells.append(f"{(count / prevpos if prevpos else 0.0):>9.3f}")
+            prevpos = count
+        while len(cells) < 3:
+            cells.append(f"{'':>9}")
+        print(f"{f'[{lo},{hi})':<14}{band.drafts:>10.0f}{band.accepted:>10.0f}{per_draft:>12.4f}" + "".join(cells[:3]))
+
+    if not ok:
+        print("\nno band produced drafts; lower the first stop or raise --repeats")
+        return 2
+    print("\npos columns are conditional acceptance within the band.")
+    print("Flat columns mean a uniform per-step error; a rising curve means the")
+    print("damage is concentrated in the steps right after a prefill.")
+    return 0
 
 
 def report(delta: SpecCounters, total_completion: int, label: str, num_spec: int | None) -> dict:
@@ -307,10 +369,34 @@ def main() -> int:
         help="GREEN when accepted/draft is at least this. Omit to only report.",
     )
     p.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), default=None)
+    p.add_argument(
+        "--sweep",
+        default=None,
+        metavar="K1,K2,...",
+        help="ascending max_tokens stops; reports acceptance per output-position band",
+    )
     args = p.parse_args()
 
     if args.compare:
         return compare(*args.compare)
+
+    if args.sweep:
+        try:
+            stops = [int(s) for s in args.sweep.split(",") if s.strip()]
+        except ValueError:
+            print("--sweep takes a comma-separated list of integers", file=sys.stderr)
+            return 2
+        if len(stops) < 2 or stops != sorted(stops) or len(set(stops)) != len(stops):
+            print("--sweep needs at least two strictly increasing stops", file=sys.stderr)
+            return 2
+        try:
+            return sweep(args, stops)
+        except HarnessError as exc:
+            print(f"HARNESS ERROR: {exc}", file=sys.stderr)
+            return 2
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            print(f"HARNESS ERROR: request failed: {exc}", file=sys.stderr)
+            return 2
 
     try:
         delta, total_completion, texts = drive(args)
