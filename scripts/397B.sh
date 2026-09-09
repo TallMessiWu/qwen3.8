@@ -221,6 +221,21 @@ if ! [[ "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+# ASYNC=0 drops --async-scheduling. Worth a switch rather than a hand edit:
+# the flag sits inside the backslash-continued `exec vllm serve` list, and
+# commenting a line out there ends the command at that point -- every later
+# argument becomes a separate command that `exec` guarantees never runs. That
+# silently dropped --no-enable-prefix-caching once and cost a full round of
+# msprobe data. The async scheduler overlaps the next step's host-side input
+# prep with the current step's device work, so it is the one knob that changes
+# whether a staging buffer can be rewritten while the previous step's copy is
+# still in flight.
+async_args=(--async-scheduling)
+if [[ "${ASYNC:-1}" == "0" ]]; then
+    async_args=()
+    echo "async scheduling disabled (ASYNC=0)." >&2
+fi
+
 # MTP is num_speculative_tokens, not a flag: MTP=3 proposes three draft tokens
 # per step, MTP=0 turns speculative decoding off. It sets the width of a decode
 # step -- one accepted token plus MTP drafts -- which is what the graph plan
@@ -342,7 +357,7 @@ exec vllm serve "$MODEL_PATH" \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./profiling", "torch_profiler_with_stack": false}' \
     "${spec_args[@]}" \
     --trust-remote-code \
-    --async-scheduling \
+    "${async_args[@]}" \
     --allowed-local-media-path / \
     --mm-processor-cache-gb 0 \
     --mm-encoder-tp-mode data \
