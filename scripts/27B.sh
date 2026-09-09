@@ -138,7 +138,24 @@ if [[ "$MTP" == "0" ]]; then
     decode_query_len=1
     echo "MTP speculative decoding disabled (MTP=0)." >&2
 else
-    spec_args=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTP}")
+    # SPEC_EAGER=1 runs the DRAFT model eagerly and leaves the target model's
+    # graph settings untouched. It is the only single-variable switch for "is
+    # the merged draft graph at fault": under a full-graph cudagraph_mode the
+    # proposer wraps its whole multi-step draft loop in one ACLGraphWrapper,
+    # and llm_base_proposer.py gates that on
+    # `not speculative_config.enforce_eager`. That field is read nowhere else
+    # -- neither vLLM nor vllm-ascend feeds it back into the target's
+    # CompilationConfig -- so CUDAGRAPH_MODE keeps capturing the target
+    # exactly as before while the draft falls back to plain Python.
+    # Contrast with GRAPH=0 and CUDAGRAPH_MODE=PIECEWISE, which both take the
+    # draft graph away *and* change the target at the same time.
+    spec_config="{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTP"
+    if [[ "${SPEC_EAGER:-0}" == "1" ]]; then
+        spec_config+=",\"enforce_eager\":true"
+        echo "draft model forced eager (SPEC_EAGER=1); target graph untouched." >&2
+    fi
+    spec_config+="}"
+    spec_args=(--speculative-config "$spec_config")
     decode_query_len=$((MTP + 1))
 fi
 
