@@ -35,7 +35,8 @@ their own.
 
 - `gsm8.sh` -- GSM8K, zero-shot chain-of-thought chat prompt.
 - `gpqa.sh` -- GPQA, zero-shot chain-of-thought chat prompt.
-- `run_ais_bench.sh` -- the shared entry point both of them exec.
+- `mmmu.sh` -- MMMU, multimodal, so the server has to accept images.
+- `run_ais_bench.sh` -- the shared entry point all three of them exec.
 
 Aim them at a service with environment variables, not by copying `ais_bench`'s
 model configs:

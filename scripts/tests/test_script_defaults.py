@@ -23,6 +23,18 @@ MODEL_NAME_CONSUMERS = SERVICE_LAUNCHERS + ("curl.sh",)
 QFA_VLLM_ASCEND_REPO = (
     "/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa"
 )
+EVAL_WRAPPERS = {
+    "gsm8.sh": "gsm8k_gen_0_shot_cot_chat_prompt",
+    "gpqa.sh": "gpqa_gen_0_shot_cot_chat_prompt",
+    "mmmu.sh": "mmmu_gen",
+}
+EVAL_ENV_VARS = (
+    "VLLM_IP",
+    "VLLM_PORT",
+    "VLLM_URL",
+    "MODEL_NAME",
+    "AIS_MODEL_CFG",
+)
 
 
 class ScriptDefaultsTest(unittest.TestCase):
@@ -213,6 +225,48 @@ class ScriptDefaultsTest(unittest.TestCase):
         )
         self.assertIn('"origin/${VLLM_ASCEND_QFA_BRANCH}"', readme)
         self.assertIn('"${VLLM_ASCEND_QFA}"; do', readme)
+
+    def test_eval_wrappers_document_every_env_var(self):
+        # Whoever opens gpqa.sh should not have to open a second file to learn
+        # that VLLM_IP exists. The switches are documented in each wrapper, so
+        # pin that the list stays complete wherever it is repeated.
+        sources = {name: (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+                   for name in EVAL_WRAPPERS}
+        sources["run_ais_bench.sh"] = (
+            SCRIPTS_DIR / "run_ais_bench.sh"
+        ).read_text(encoding="utf-8")
+
+        for name, text in sources.items():
+            for var in EVAL_ENV_VARS:
+                with self.subTest(script=name, var=var):
+                    self.assertIn(var, text)
+
+    def test_eval_wrappers_differ_only_in_dataset(self):
+        # Three near-identical wrappers drift the way 27B.sh and 397B.sh did.
+        # Normalise away the script name and the dataset, then require what is
+        # left to be byte-identical, so a fix to one reaches all three.
+        normalised = {}
+        for name, dataset in EVAL_WRAPPERS.items():
+            text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(f'run_ais_bench.sh" {dataset} "$@"', text)
+            body = [
+                line
+                for line in text.splitlines()
+                # The opening comment names the benchmark; MMMU also warns that
+                # the server has to accept images. Both are meant to differ.
+                if not line.startswith("# ") or "精度评测" not in line
+            ]
+            normalised[name] = "\n".join(body).replace(
+                dataset, "<DATASET>").replace(name, "<SCRIPT>")
+
+        reference_name, reference = next(iter(normalised.items()))
+        for name, body in normalised.items():
+            with self.subTest(script=name):
+                self.assertEqual(
+                    body,
+                    reference,
+                    f"{name} has drifted from {reference_name}",
+                )
 
 
 if __name__ == "__main__":

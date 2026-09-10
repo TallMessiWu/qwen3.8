@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GPQA 精度评测，跑在已经起好的 vLLM 服务上。
+# MMMU 精度评测，跑在已经起好的 vLLM 服务上。多模态数据集，服务侧要能收图。
 #
 # 用环境变量指定服务，不用复制 ais_bench 的 config 文件（为什么不能在 config 里
 # 读环境变量、这些开关又是怎么生效的，见 run_ais_bench.sh 顶部注释）：
@@ -14,11 +14,11 @@ set -euo pipefail
 #
 # 脚本名之后的参数原样透传给 ais_bench，例如 --work-dir、--batch-size、--debug。
 #
-#   ./gpqa.sh
-#   VLLM_PORT=7969 ./gpqa.sh                        # 同机的另一个服务
-#   VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gpqa.sh       # 别的机器上的服务
-#   VLLM_URL=http://gw.example/prefix/ ./gpqa.sh    # 带路径的网关
-#   MODEL_NAME=qwen3.8 ./gpqa.sh --batch-size 16
+#   ./mmmu.sh
+#   VLLM_PORT=7969 ./mmmu.sh                        # 同机的另一个服务
+#   VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./mmmu.sh       # 别的机器上的服务
+#   VLLM_URL=http://gw.example/prefix/ ./mmmu.sh    # 带路径的网关
+#   MODEL_NAME=qwen3.8 ./mmmu.sh --batch-size 16
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec "$script_dir/run_ais_bench.sh" gpqa_gen_0_shot_cot_chat_prompt "$@"
+exec "$script_dir/run_ais_bench.sh" mmmu_gen "$@"

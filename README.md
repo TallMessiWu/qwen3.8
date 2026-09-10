@@ -250,7 +250,8 @@ bash scripts/setup/create-container.sh \
     │   ├── curl.sh                  # 多模态请求冒烟
     │   ├── gsm8.sh                  # GSM8K 精度评测，需已起服务
     │   ├── gpqa.sh                  # GPQA 精度评测，需已起服务
-    │   ├── run_ais_bench.sh        # 两个评测脚本共用的 ais_bench 入口
+    │   ├── mmmu.sh                  # MMMU 多模态精度评测，需已起服务
+    │   ├── run_ais_bench.sh        # 三个评测脚本共用的 ais_bench 入口
     │   ├── bench/                   # 算子精度与性能基准，长期复用
     │   ├── checks/                  # 权重与设备体检，长期复用
     │   ├── setup/                   # 构建与安装入口

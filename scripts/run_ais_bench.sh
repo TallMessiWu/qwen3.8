@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ais_bench 精度评测的公共入口，gsm8.sh / gpqa.sh 都走这里。
+# ais_bench 精度评测的公共入口，gsm8.sh / gpqa.sh / mmmu.sh 都走这里。
+# 直接调用时第一个参数是数据集名：./run_ais_bench.sh <dataset> [附加参数...]
 #
-# 为什么不去改 ais_bench 自带的 configs/models/vllm_api/*.py：
+# 支持的环境变量：
+#
+#   VLLM_IP         服务 IP 或主机名，默认 localhost
+#   VLLM_PORT       服务端口，默认 6969
+#   VLLM_URL        完整 URL，给了它就忽略 VLLM_IP / VLLM_PORT
+#   MODEL_NAME      模型名，不给则由服务的 /v1/models 自行探测
+#   AIS_MODEL_CFG   ais_bench 的模型配置模板，默认 vllm_api_general_chat.py
+#
+# 数据集名之后的参数原样透传给 ais_bench，例如 --work-dir、--batch-size、--debug。
+#
+# 为什么走命令行覆盖，而不是改 ais_bench 自带的 configs/models/vllm_api/*.py：
 # 那些文件里 import 了 ais_bench 自己的模块，mmengine 的 Config._is_lazy_import
 # 因此判定为 lazy import，走 _parse_lazy_import 解析。lazy 模式下文件里的任何函数
 # 调用都不会真的执行，只会被包成 LazyObject，一调用就 raise RuntimeError，报成
@@ -12,13 +23,9 @@ set -euo pipefail
 #
 # 出路是 ais_bench 的 api_model_args 参数组：--host-ip / --host-port / --url /
 # --model-name 等会在 config 加载后覆盖模型字段，且只覆盖 config 里已存在的 key。
-# 变量在 shell 层就展开成命令行参数，config 文件保持原样，一个都不用复制。
-#
-#   VLLM_PORT=7969 ./gsm8.sh                     # 同机的另一个服务
-#   VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gsm8.sh    # 别的机器上的服务
-#   VLLM_URL=http://gw.example/prefix/ ./gsm8.sh # 带路径的网关，此时 IP/PORT 被忽略
-#   MODEL_NAME=qwen3.8 ./gsm8.sh                 # 不设则由服务的 /v1/models 自行探测
-#   AIS_MODEL_CFG=vllm_api_stream_chat.py ./gsm8.sh   # 换一份 ais_bench 自带模板
+# 上面这些变量在 shell 层就展开成命令行参数，config 文件保持原样，一个都不用复制。
+# 要固化一套参数时照 ais_bench 自己的做法写薄配置：with read_base() 继承
+# vllm_api_general_chat 再改字段，但那样仍然读不了环境变量，端口还是得走命令行。
 
 if [[ $# -lt 1 ]]; then
     echo "用法: $0 <dataset> [ais_bench 附加参数...]" >&2
