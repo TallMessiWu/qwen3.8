@@ -79,15 +79,16 @@ any change to the attention call site.
   Three-way accuracy (QFA / FIA on dequantized input / FIA on bf16), which
   separates the quantization loss from the operator difference, plus `--bench`
   for timings across prefill and decode shapes.
-- `replay_qfa_dump.py` -- feeds a dump captured from a live server back into
-  the operator and checks it reproduces the recorded output bit-for-bit. Proves
-  a dump is self-contained enough to reproduce a problem away from the engine,
-  which is what an operator bug report has to ship. Capture the dump by setting
-  `VLLM_ASCEND_QFA_DUMP_DIR` (see `vllm_ascend/attention/qfa_dump.py`); it only
-  works in eager mode, since a D2H copy inside a graph capture fails with
-  EE1016 and no Python runs on replay.
+- `test_moe_ep_routing.py` -- does ALLGATHER+EP route every token to the right
+  expert? Eight ranks under `torchrun`, no model and no expert weights: feeding
+  dispatch's output straight back into combine makes each expert an identity
+  map, so after the cross-EP all-reduce the expected output is the input
+  itself. A missing or double-claimed entry in `expert_map` breaks that
+  equality immediately. Covers QuantType.NONE in eager only, so a GREEN rules
+  out "the routing logic is wrong" without vouching for the quantized or
+  graph paths.
 
-## checks/ -- checkpoint and device inspection
+## checks/ -- checkpoint, device and dump inspection
 
 Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
 
@@ -104,6 +105,21 @@ Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
   checkpoint's chat template leave thinking on?
 - `probe_npu_memory.py` -- print the HBM totals torch actually sees (NPU
   required, negligible memory).
+- `mtp_accept_rate.py` -- snapshot `/metrics` around a fixed prompt set and
+  report speculative-decoding acceptance as absolute counts plus per-position
+  conditional rates. The Prometheus counter is a survival curve, not a
+  per-position rate, so read it through this rather than off the log line.
+- `msprobe_survey.py` -- are two msprobe dump trees comparable at all? Step
+  indices are not: the dumper class is picked off `cudagraph_mode`, and every
+  `_dummy_run` burns a step number without writing one, so profile_run and each
+  capture warmup shift the graph tree relative to the eager one. Aligns by what
+  a step contains instead, and can check that the symptom actually reproduced
+  while the dump was being collected.
+- `msprobe_first_divergence.py` -- given two comparable trees, which op is the
+  first to stop matching? In a single-variable A/B the answer is one line and
+  everything after it is downstream noise, which a full graph diff buries.
+  Reports ops whose statistics msprobe could not compute first, because an op
+  that is invalid in one arm only is already the answer.
 
 ## setup/ -- build and install
 
@@ -120,6 +136,8 @@ One-off diagnostics for whatever is being investigated right now. Nothing here
 is expected to survive: once a question is answered, its script goes away rather
 than accumulating. If a script turns out to be worth re-running later, it
 belongs in `bench/` or `checks/` instead.
+
+Currently empty, which is the intended resting state.
 
 ## runtime/ -- loaded by the server
 

@@ -162,7 +162,7 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 两条分支的 QFA 进图机制不同，排查时不要互相套用结论：`junlin-c8-mxfp` 是原生 `npugraph_ex`，`junlin-qfa` 是 task group + update 重发。
 
-2026-09-10 清理过一轮分支。`junlin-qfa-c8switch`（C8 开关拿 bf16 基线）、`feat-qfa-dump`（QFA 输入输出 dump 插桩）、`debug-moe-comm-tokens`（MoE 通信判据打印）以及全部 `archive-*` 备份都已从本地和 fork 删除，远端只剩 `main`、`junlin-qfa`、`junlin-c8-mxfp` 三条。注意 `scripts/bench/replay_qfa_dump.py` 的配套插桩（`vllm_ascend/attention/qfa_dump.py`）随 `feat-qfa-dump` 一起没了，这个回放脚本目前是孤儿。
+2026-09-10 清理过一轮分支。`junlin-qfa-c8switch`（C8 开关拿 bf16 基线）、`feat-qfa-dump`（QFA 输入输出 dump 插桩）、`debug-moe-comm-tokens`（MoE 通信判据打印）以及全部 `archive-*` 备份都已从本地和 fork 删除，远端只剩 `main`、`junlin-qfa`、`junlin-c8-mxfp` 三条。`scripts/bench/replay_qfa_dump.py` 的配套插桩（`vllm_ascend/attention/qfa_dump.py`）随 `feat-qfa-dump` 一起没了，回放脚本因此跑不起来，同日一并删除；真要重做 QFA dump，捕获侧和回放侧得一起写回来。
 
 其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 

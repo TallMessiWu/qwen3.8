@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""不起模型、8 卡验 ALLGATHER+EP 的专家路由——判据闭式，几分钟出结果。
+"""不起模型、8 卡验 ALLGATHER+EP 的专家路由是否自洽——判据闭式，几分钟出结果。
 
-实测确认（2026-09-07）：芯片是 **A5**，423-token 那一步选的是 **ALLGATHER**，
-不是此前一直以为的 ALLTOALL——A5 的分支里 `world_size(8) <= num_experts_per_tok(10)`
-命中，EP8 下根本走不到 ALLTOALL。所以要量的是这条路。
+验的是一个恒等式，与具体权重、具体故障都无关，所以换 EP 尺寸、换专家数、
+rebase 了 vllm-ascend 的路由代码之后都值得重跑。
 
 判据：把 dispatch 的输出原样喂回 combine（等于让每个专家做恒等映射），
 combine 用 `npu_moe_token_unpermute(probs=topk_weights)` 按权重加权求和，于是
-单个 rank 拿到的是"本 rank 名下那些专家"的权重和乘 x。跨 EP group all_reduce 之后，
-每个 token 的系数就是它全部 topk 权重之和；把权重归一化成 1，**期望输出就是 x 自己**。
+单个 rank 拿到的是「本 rank 名下那些专家」的权重和乘 x。跨 EP group all_reduce
+之后，每个 token 的系数就是它全部 topk 权重之和；把权重归一化成 1，
+**期望输出就是 x 自己**。
 
 不需要参考实现、不需要专家权重、不需要跑 MLP。而 expert_map 只要漏掉或重复认领
-任何一个专家，这个等式立刻不成立——这正是当前最大的嫌疑：
+任何一个专家，这个等式立刻不成立：
 
     if expert_map is not None:                 # EP=1 才进
         mask = expert_map[topk_ids] != -1
         topk_weights = topk_weights * mask      # 不属于本 rank 的权重置零
 
 两个阶段，都很便宜：
-  map     纯逻辑检查，不跑 MoE：把八个 rank 的 expert_map 拼起来，验每个全局专家
-          恰好被一个 rank 认领一次。秒级。
+  map        纯逻辑检查，不跑 MoE：把八个 rank 的 expert_map 拼起来，验每个全局专家
+             恰好被一个 rank 认领一次。秒级。
   roundtrip  上面那个恒等式，按 token 数扫描。
 
 用法（服务器容器内）：
-    torchrun --nproc_per_node=8 scripts/debug/probe_moe_allgather_ep.py --smoke
-    torchrun --nproc_per_node=8 scripts/debug/probe_moe_allgather_ep.py
+    torchrun --nproc_per_node=8 scripts/bench/test_moe_ep_routing.py --smoke
+    torchrun --nproc_per_node=8 scripts/bench/test_moe_ep_routing.py
 
 判读：
   map 阶段 RED        → expert_map 本身就错（漏认领/重复认领），直接锁定，
@@ -33,13 +33,16 @@ combine 用 `npu_moe_token_unpermute(probs=topk_weights)` 按权重加权求和�
                         全尺寸都红 → 与 token 数无关，是 EP 切分或掩码的问题；
                         只有大尺寸红 → 查 npu_moe_init_routing 的 active_num
                         （= num_tokens * top_k）有没有上限。
-  全 GREEN            → ALLGATHER+EP 的路由在 eager 下是干净的。那么 397B 那个只在
-                        GRAPH=1 出现的空输出就与这段无关，得回去查 aclgraph 本身
-                        改变了什么（这个脚本覆盖不到，它全程 eager）。
+  全 GREEN            → ALLGATHER+EP 的路由在 eager 下是干净的。
 
-⚠️ 覆盖边界：本脚本走 QuantType.NONE 且全程 eager。真机是 w4a4 MXFP4，且故障只在
-aclgraph 开启时出现——所以全 GREEN 只能排除"路由逻辑本身写错了"，不能替量化路径
-或图模式背书。
+⚠️ 覆盖边界（决定了「全 GREEN」能推出什么）：本脚本走 QuantType.NONE 且全程 eager。
+所以全 GREEN 只能排除「路由逻辑本身写错了」，不能替量化路径或图模式背书。
+2026-09-07 用它查 397B 长 prompt 空输出时就是这个结果：路由全 GREEN，真因在别处——
+MoE 的 TP 规约判据被 dynamo 烘成了捕获期的常量（见 AGENTS.md「当前状态」）。
+这是它的典型用法：**便宜地砍掉一整片嫌疑区，而不是指认真凶。**
+
+选通信方式的分支与芯片代次有关（A5 上 EP8 命中 `world_size <= num_experts_per_tok`
+就走不到 ALLTOALL），所以换芯片之后先确认这一步实际选的是哪条路再判读结果。
 """
 
 from __future__ import annotations

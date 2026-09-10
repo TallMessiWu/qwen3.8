@@ -14,14 +14,17 @@ checks for both.
    is the column this prints.
 
 2. A dump only answers a question about a bug if the bug happened while it was
-   being collected. The truncation symptom is "one completion token", i.e. a
-   prefill step followed by exactly one decode step. A tree with many decode
-   steps recorded a healthy generation, and comparing two healthy runs only
-   measures ordinary graph-vs-eager drift.
+   being collected. Two healthy runs compared against each other only measure
+   ordinary graph-vs-eager drift. Say what the symptom looks like in step
+   terms and this checks for it: `--max-decode-steps 1` for a truncation that
+   shows up as a single completion token, a larger bound for a symptom that
+   needs a few tokens to appear. Left unset, the step census is printed
+   without a verdict.
 
 Usage:
-    python3 scripts/debug/msprobe_survey.py eager graph
-    python3 scripts/debug/msprobe_survey.py --mtp 3 eager graph
+    python3 scripts/checks/msprobe_survey.py eager graph
+    python3 scripts/checks/msprobe_survey.py --mtp 3 eager graph
+    python3 scripts/checks/msprobe_survey.py --max-decode-steps 1 eager graph
 
 RED/GREEN judgement is printed at the end. Every RED means "do not compare
 these trees yet", with the reason named.
@@ -35,9 +38,10 @@ import re
 from collections import Counter
 from pathlib import Path
 
-# Substrings identifying interesting ops in a dump key. GDN matters because the
-# graph-vs-eager divergence was last bisected to the GDN layers; attention
-# matters because QFA is the op under test.
+# Substrings identifying interesting ops in a dump key. The three groups are the
+# places a Qwen3.5 graph-vs-eager divergence has actually been traced to so far,
+# so the census tells you at a glance whether a tree even recorded the layers you
+# intend to compare.
 MARKERS = {
     "attn": ("quant_flash", "fused_infer_attention", "npu_dynamic_mx_quant", "reshape_and_cache"),
     "gdn": ("gated_delta", "chunk_gated", "causal_conv", "conv1d", "recurrent"),
@@ -128,7 +132,7 @@ def dominant_dim(row: dict) -> int:
     return row["dims"].most_common(1)[0][0]
 
 
-def verdict(name: str, rows: list[dict], decode_width: int) -> bool:
+def verdict(name: str, rows: list[dict], decode_width: int, max_decode_steps: int | None) -> bool:
     ok = True
     rank0 = [r for r in rows if r.get("rank") == "rank0" and "dims" in r]
     if not rank0:
@@ -146,20 +150,24 @@ def verdict(name: str, rows: list[dict], decode_width: int) -> bool:
     else:
         print(f"[GREEN] {name}: prefill step(s) {prefill} at width {max(widths.values())}")
 
-    # The symptom under investigation is a single completion token. One decode
-    # step means it reproduced; many decode steps mean this dump recorded a
-    # healthy generation and has nothing to say about the bug.
+    # A dump is only worth comparing if the symptom reproduced while it was being
+    # collected. What that looks like in step terms depends on the symptom, so
+    # the caller states it: --max-decode-steps N. Without it, report the census
+    # and leave the judgement to the reader.
     decode = [s for s, w in widths.items() if 0 < w <= decode_width]
     empty = [s for s, w in widths.items() if w == 0]
     print(f"[info] {name}: {len(decode)} decode-shaped steps (width<={decode_width}), {len(empty)} empty steps")
-    if len(decode) > 2:
+    if max_decode_steps is None:
+        print(f"[info] {name}: no --max-decode-steps given, not judging whether the symptom reproduced")
+    elif len(decode) > max_decode_steps:
         print(
-            f"[RED ] {name}: {len(decode)} decode steps -- this run generated many tokens, so the "
-            "one-token truncation did NOT reproduce here. Comparing it measures ordinary drift, not the bug."
+            f"[RED ] {name}: {len(decode)} decode steps, expected at most {max_decode_steps} -- this run "
+            "generated more tokens than the symptom does, so it did NOT reproduce here. Comparing it "
+            "measures ordinary drift, not the bug."
         )
         ok = False
     elif decode:
-        print(f"[GREEN] {name}: {len(decode)} decode step(s) -- consistent with the one-token truncation")
+        print(f"[GREEN] {name}: {len(decode)} decode step(s) -- within the expected {max_decode_steps}")
 
     # graph_visualize needs the full trio; statistics-only steps cannot be walked.
     incomplete = sorted({r["step"] for r in rows if "error" not in r and not (r["construct"] and r["stack"])})
@@ -184,6 +192,16 @@ def main() -> int:
         default=3,
         help="num_speculative_tokens; a uniform decode step is mtp+1 tokens wide per request (default 3)",
     )
+    ap.add_argument(
+        "--max-decode-steps",
+        type=int,
+        default=None,
+        help=(
+            "how many decode steps the symptom under investigation should produce; more than this "
+            "means the run stayed healthy and the tree has nothing to say about the bug. "
+            "Omit to print the census without judging it."
+        ),
+    )
     args = ap.parse_args()
     decode_width = args.mtp + 1
 
@@ -201,7 +219,7 @@ def main() -> int:
 
     print("\n===== verdict =====")
     for root, rows in surveys:
-        all_ok &= verdict(root.name, rows, decode_width)
+        all_ok &= verdict(root.name, rows, decode_width, args.max_decode_steps)
         print()
 
     if len(surveys) == 2:

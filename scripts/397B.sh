@@ -128,7 +128,7 @@ if [[ -n "${DUMP:-}" && "${DUMP}" != "0" ]]; then
     # calls _finalize_dump_data(dump=False), which advances the step counter
     # without writing anything -- so profile_run and every capture warmup burn a
     # step number that an eager run never spends. Align the two trees by what a
-    # step contains, not by its index: scripts/debug/msprobe_survey.py.
+    # step contains, not by its index: scripts/checks/msprobe_survey.py.
     echo "  eager and graph dumps are NOT step-index comparable; see msprobe_survey.py" >&2
 fi
 additional_config+='}'

@@ -22,9 +22,9 @@ Pair with msprobe_survey.py, which decides whether two trees are comparable at
 all; this script assumes they already are.
 
 Usage:
-    python3 scripts/debug/msprobe_first_divergence.py A_ROOT B_ROOT
-    python3 scripts/debug/msprobe_first_divergence.py --step-a 3 --step-b 5 A B
-    python3 scripts/debug/msprobe_first_divergence.py --grep quant_flash A B
+    python3 scripts/checks/msprobe_first_divergence.py A_ROOT B_ROOT
+    python3 scripts/checks/msprobe_first_divergence.py --step-a 3 --step-b 5 A B
+    python3 scripts/checks/msprobe_first_divergence.py --grep quant_flash A B
 
 Exit code: 0 when the trees were read and compared, 2 when they were not.
 """
@@ -324,7 +324,11 @@ def compare(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("trees", nargs=2, metavar=("A_ROOT", "B_ROOT"))
+    # Two positionals rather than nargs=2 with a tuple metavar: argparse only
+    # supports tuple metavars on optionals, and formatting --help for a
+    # positional with one raises "too many values to unpack".
+    ap.add_argument("a_root", metavar="A_ROOT", help="msprobe dump root of arm A")
+    ap.add_argument("b_root", metavar="B_ROOT", help="msprobe dump root of arm B")
     ap.add_argument("--rank", default="rank0")
     ap.add_argument("--step-a", type=int, default=None)
     ap.add_argument("--step-b", type=int, default=None)
@@ -333,7 +337,7 @@ def main() -> int:
     ap.add_argument("--grep", default=None, help="only consider op keys containing this substring")
     args = ap.parse_args()
 
-    root_a, root_b = Path(args.trees[0]), Path(args.trees[1])
+    root_a, root_b = Path(args.a_root), Path(args.b_root)
     for root in (root_a, root_b):
         if not root.is_dir():
             print(f"not a directory: {root}", file=sys.stderr)
