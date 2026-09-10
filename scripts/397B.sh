@@ -87,8 +87,9 @@ fi
 # on by default and only take effect when torch.compile runs -- which is exactly
 # what GRAPH=1 turns on and GRAPH=0 turns off (GRAPH=0 sets compilation mode to
 # NONE, so the model runs as plain eager Python). Fusion reorders bf16 accumulation,
-# and a ~1e-4 per-layer drift compounds over 60 layers. Use this to tell "compiled
-# vs eager" apart from "graph captured vs not" without giving up FULL_DECODE_ONLY.
+# and a ~1e-4 per-layer drift compounds over the model's full depth. Use this to
+# tell "compiled vs eager" apart from "graph captured vs not" without giving up
+# FULL_DECODE_ONLY.
 if [[ "${FUSION:-1}" == "0" ]]; then
     additional_config+=',"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false,"fuse_muls_add":false}'
     echo "custom inductor fusion passes disabled (FUSION=0)." >&2

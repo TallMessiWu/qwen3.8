@@ -45,6 +45,58 @@ if [[ "${ENABLE_HOST_TUNING:-1}" == "1" ]]; then
     fi
 fi
 
+additional_config='{"enable_cpu_binding":true'
+# FUSION=0 turns off vllm-ascend's three custom inductor fusion passes. They are
+# on by default and only take effect when torch.compile runs -- which is exactly
+# what GRAPH=1 turns on and GRAPH=0 turns off (GRAPH=0 sets compilation mode to
+# NONE, so the model runs as plain eager Python). Fusion reorders bf16 accumulation,
+# and a ~1e-4 per-layer drift compounds over the model's full depth. Use this to
+# tell "compiled vs eager" apart from "graph captured vs not" without giving up
+# FULL_DECODE_ONLY.
+if [[ "${FUSION:-1}" == "0" ]]; then
+    additional_config+=',"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false,"fuse_muls_add":false}'
+    echo "custom inductor fusion passes disabled (FUSION=0)." >&2
+fi
+# DUMP arms the msprobe dump, and it goes INSIDE this one JSON on purpose:
+# vLLM keeps only the last --additional-config, so a second flag would silently
+# drop enable_cpu_binding and everything else built above.
+#
+# Never do this by hand-commenting the flag out of the exec block instead. A
+# trailing "\" followed by a comment line ends the command right there: "#"
+# opens a comment that runs to that line's real newline, and a "\" *inside* a
+# comment continues nothing. Whatever follows becomes a separate command -- and
+# since the launcher uses exec, that command never runs at all. Commenting out
+# --additional-config that way therefore drops "${qfa_args[@]}" with it and
+# serves QFA with prefix caching on, which the MXFP8 cache cannot support. That
+# has already invalidated one round of msprobe A/B data.
+#
+# DUMP=1 derives the path from GRAPH so an eager run and a graph run cannot
+# overwrite each other; DUMP=<path> sets it outright; unset or 0 is off.
+if [[ -n "${DUMP:-}" && "${DUMP}" != "0" ]]; then
+    if [[ "${DUMP}" == "1" ]]; then
+        if [[ "${GRAPH:-1}" == "0" ]]; then
+            dump_path="$PWD/msprobe-eager"
+        else
+            dump_path="$PWD/msprobe-graph"
+        fi
+    else
+        dump_path="${DUMP}"
+    fi
+    dump_task="${DUMP_TASK:-statistics}"
+    dump_level="${DUMP_LEVEL:-mix}"
+    additional_config+=",\"dump_config\":{\"task\":\"$dump_task\",\"level\":\"$dump_level\""
+    additional_config+=",\"dump_path\":\"$dump_path\",\"rank\":[],\"list\":[]}"
+    echo "msprobe dump on: task=$dump_task level=$dump_level path=$dump_path" >&2
+    # model_runner_v1 picks the dumper off cudagraph_mode: PrecisionDebugger when
+    # it is NONE, AclGraphDumper otherwise. Two different classes, and _dummy_run
+    # calls _finalize_dump_data(dump=False), which advances the step counter
+    # without writing anything -- so profile_run and every capture warmup burn a
+    # step number that an eager run never spends. Align the two trees by what a
+    # step contains, not by its index: scripts/checks/msprobe_survey.py.
+    echo "  eager and graph dumps are NOT step-index comparable; see msprobe_survey.py" >&2
+fi
+additional_config+='}'
+
 MODEL_PATH="${MODEL_PATH:-/mnt/share/weight/Qwen3.8-27B-mxfp8}"
 VLLM_PORT="${VLLM_PORT:-6969}"
 MODEL_NAME="${MODEL_NAME:-qwen3.8}"
@@ -112,6 +164,15 @@ fi
 # MAX_NUM_SEQS bounds the batch, and with it the plan's per-core split and the
 # graph plan below.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-133120}"
+# TP is here rather than inline because splitting the eight cards into two
+# four-rank servers (one eager, one graph) is a routine way to collect a matched
+# pair of dumps in one sitting, and editing the exec block by hand is what broke
+# it last time.
+TP="${TP:-1}"
+if ! [[ "$TP" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TP must be a positive integer, got '$TP'." >&2
+    exit 1
+fi
 # Bounds one scheduler step. On an EP MoE it also bounds the MoE comm choice:
 # a step wider than mc2_tokens_capacity falls to all-to-all, which miscomputes
 # under aclgraph. With enable_prefill_mc2 the capacity is
@@ -192,7 +253,30 @@ for ((n = 1; n <= MAX_NUM_SEQS; n++)); do
 done
 capture_sizes="${CAPTURE_SIZES:-$default_capture_sizes}"
 cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
-compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\"}"
+# COMPILE_BACKEND=eager keeps dynamo tracing and aclgraph capture but skips
+# inductor's optimisation entirely. GRAPH=0 was found to set compilation mode to
+# NONE -- the model then runs as plain eager Python -- so "graph on/off" was never
+# just about capture, it also turned the compiler on and off. This switch splits
+# those two apart: eager backend still captures, so if the long-prompt EOS goes
+# away here, the culprit is an inductor rewrite rather than the capture itself.
+# COMPILE_MODE pins CompilationConfig.mode (3 = VLLM_COMPILE, 0 = NONE). It is
+# needed because GRAPH is not one switch but two: passing cudagraph_mode=NONE
+# makes vLLM turn torch.compile off as well ("Inductor compilation was disabled
+# by user settings"), so GRAPH=0 runs eager Python *and* skips capture, and the
+# two effects could never be told apart. COMPILE_MODE=3 with CUDAGRAPH_MODE=NONE
+# compiles but does not capture, which finally separates them.
+compile_mode="${COMPILE_MODE:-}"
+compile_backend="${COMPILE_BACKEND:-}"
+compilation_config="{\"cudagraph_capture_sizes\":[$capture_sizes],\"cudagraph_mode\":\"$cudagraph_mode\""
+if [[ -n "$compile_backend" ]]; then
+    compilation_config+=",\"backend\":\"$compile_backend\""
+    echo "compile backend forced to $compile_backend." >&2
+fi
+if [[ -n "$compile_mode" ]]; then
+    compilation_config+=",\"mode\":$compile_mode"
+    echo "compilation mode pinned to $compile_mode." >&2
+fi
+compilation_config+="}"
 if [[ "${GRAPH:-1}" == "0" ]]; then
     compilation_config='{"cudagraph_mode":"NONE"}'
     echo "aclgraph capture disabled (GRAPH=0)." >&2
@@ -225,7 +309,7 @@ exec vllm serve "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
     --data-parallel-size 1 \
-    --tensor-parallel-size 1 \
+    --tensor-parallel-size "$TP" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --max-num-seqs "$MAX_NUM_SEQS" \
@@ -241,5 +325,5 @@ exec vllm serve "$MODEL_PATH" \
     --mm-processor-cache-gb 0 \
     --mm-encoder-tp-mode data \
     --mm-processor-cache-type shm \
-    --additional-config '{"enable_cpu_binding":true}' \
+    --additional-config "$additional_config" \
     "${qfa_args[@]}"
