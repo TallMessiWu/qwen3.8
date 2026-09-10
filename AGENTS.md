@@ -150,12 +150,20 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 ## 当前状态
 
-两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。在途分支（都基于 upstream/main，各有独立 worktree）：
+两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。在途分支各有独立 worktree：
 
-- `junlin-qfa` —— QFA 算子接入主线，官方 master QFA 已 vendor 进 csrc。容器默认 editable 安装的就是它。
-- `junlin-qfa-c8switch` —— 在它之上加 `VLLM_ASCEND_DISABLE_C8_MXFP`，用来强制关掉 C8 拿 bf16 基线。
-- `feat-qfa-dump` —— 在它之上加 QFA 输入输出的 dump 插桩（`vllm_ascend/attention/qfa_dump.py`），配合 `scripts/bench/replay_qfa_dump.py` 回放。
+- `junlin-qfa` —— QFA 算子接入主线，基于 upstream/main，官方 master QFA 已 vendor 进 csrc。容器默认 editable 安装的就是它。
+- `junlin-c8-mxfp` —— 跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP + PD 分离），基于该 PR 头部。
 
-旧的 `archive-qfa-mxfp8-attn`（原 `feat/qfa-mxfp8-attn`）已废弃归档，勿参考。其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
+两条分支各自带着同样的两个真机故障修复，都是「值在错误的时刻被固定」这一类：
+
+1. **MoE 三处 TP 规约按当前通信方式重算**。`ALLGATHER` 是唯一不在融合 kernel 里做 TP 规约的通信方式，而通信方式随每步 token 数变化；原来那个判据在编译区里求值一次、被烘成捕获期 dummy run 的值，长 prompt 下 all_reduce 整个没执行，模型直接吐 EOS。三个消费点必须同时改，只改一处会让 shared 被规约两次、从吐 EOS 变成整段乱码。
+2. **C8_MXFP 的 V scale 缓存不能在捕获期标记为已填充**。ACL 图捕获只记录不执行，而记录「填过了」的那行 Python 是真执行的，于是 V 的 scale 缓存永远全零、反量化后 attention 恰好吐零。target 不受影响，draft 第一次走到这段就是捕获本身，表现为一开 draft 图 MTP 接受率就塌。
+
+两条分支的 QFA 进图机制不同，排查时不要互相套用结论：`junlin-c8-mxfp` 是原生 `npugraph_ex`，`junlin-qfa` 是 task group + update 重发。
+
+2026-09-10 清理过一轮分支。`junlin-qfa-c8switch`（C8 开关拿 bf16 基线）、`feat-qfa-dump`（QFA 输入输出 dump 插桩）、`debug-moe-comm-tokens`（MoE 通信判据打印）以及全部 `archive-*` 备份都已从本地和 fork 删除，远端只剩 `main`、`junlin-qfa`、`junlin-c8-mxfp` 三条。注意 `scripts/bench/replay_qfa_dump.py` 的配套插桩（`vllm_ascend/attention/qfa_dump.py`）随 `feat-qfa-dump` 一起没了，这个回放脚本目前是孤儿。
+
+其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
 
 所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。

@@ -116,6 +116,27 @@ git -C "${VLLM_ASCEND_QFA}" submodule status --recursive
 `junlin-qfa...origin/junlin-qfa`。
 `upstream` 只用于 fetch/pull，不要向它 push。
 
+### 另一条在途分支
+
+fork 上目前只有三条分支：`main`、`junlin-qfa`，以及上面脚本不会创建的
+`junlin-c8-mxfp`。后者跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP +
+PD 分离），QFA 的进图机制与 `junlin-qfa` 不同——它是原生 `npugraph_ex`，
+`junlin-qfa` 是 task group + update 重发，排查问题时结论不要互相套用。
+两条分支各自带着同样的两个真机故障修复，详见 `AGENTS.md` 的「当前状态」。
+
+需要它时按下面拉起 worktree：
+
+```bash
+git -C "${VLLM_ASCEND_MAIN}" worktree add --track \
+  -b junlin-c8-mxfp "${VLLM_ASCEND_ROOT}/junlin-c8-mxfp" \
+  origin/junlin-c8-mxfp
+git -C "${VLLM_ASCEND_ROOT}/junlin-c8-mxfp" submodule update --init --recursive
+```
+
+容器默认仍从 `junlin-qfa` 做 editable 安装；要改用这条分支，给
+`create-container.sh` 传 `--vllm-ascend-repo`
+指向 `.../vllm-ascend/junlin-c8-mxfp`。
+
 ## 创建 A5 容器
 
 ### 前置条件
