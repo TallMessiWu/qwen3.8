@@ -28,6 +28,18 @@ chased this week, cleared once that question is answered.
 - `curl.sh` -- multimodal smoke request against a running server.
 - `npu-cleaner.sh` -- frees devices left busy by a killed run.
 
+## Accuracy evals
+
+Run against an already-serving endpoint, so they need a server but no NPU of
+their own. Both wrap `ais_bench` and forward any extra arguments straight
+through. `--dump-eval-details` leaves the per-question requests and answers
+under `outputs/` in the working directory, which is what makes a wrong answer
+reviewable afterwards. The endpoint, port and model name live in `ais_bench`'s
+own `vllm_api_general_chat.py`, not in these wrappers.
+
+- `gsm8.sh` -- GSM8K, zero-shot chain-of-thought chat prompt.
+- `gpqa.sh` -- GPQA, zero-shot chain-of-thought chat prompt.
+
 ## bench/ -- operator accuracy and performance (NPU required)
 
 Long-lived. Re-run these after a CANN upgrade, a vendored-operator rebase, or
