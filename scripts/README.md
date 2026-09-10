@@ -31,14 +31,39 @@ chased this week, cleared once that question is answered.
 ## Accuracy evals
 
 Run against an already-serving endpoint, so they need a server but no NPU of
-their own. Both wrap `ais_bench` and forward any extra arguments straight
-through. `--dump-eval-details` leaves the per-question requests and answers
-under `outputs/` in the working directory, which is what makes a wrong answer
-reviewable afterwards. The endpoint, port and model name live in `ais_bench`'s
-own `vllm_api_general_chat.py`, not in these wrappers.
+their own.
 
 - `gsm8.sh` -- GSM8K, zero-shot chain-of-thought chat prompt.
 - `gpqa.sh` -- GPQA, zero-shot chain-of-thought chat prompt.
+- `run_ais_bench.sh` -- the shared entry point both of them exec.
+
+Aim them at a service with environment variables, not by copying `ais_bench`'s
+model configs:
+
+```bash
+VLLM_PORT=7969 ./gsm8.sh                     # another service on this box
+VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gpqa.sh    # a service on another box
+VLLM_URL=http://gw.example/prefix/ ./gsm8.sh # a gateway with a path
+MODEL_NAME=qwen3.8 ./gsm8.sh                 # else /v1/models gets probed
+AIS_MODEL_CFG=vllm_api_stream_chat.py ./gsm8.sh
+```
+
+Editing the endpoint into `configs/models/vllm_api/*.py` is exactly what this
+avoids, and putting `os.environ.get(...)` in one of those files does not work:
+they import `ais_bench` modules, so mmengine parses them in lazy-import mode,
+where no call in the file is ever executed. The call returns a `LazyObject`
+that raises `RuntimeError` on invocation, surfacing as `TMAN-CFG-001 invalid
+syntax`. mmengine's own `{{$ENV:default}}` substitution is skipped on that path
+too. `ais_bench` instead has an `api_model_args` group -- `--host-ip`,
+`--host-port`, `--url`, `--model-name` among others -- applied after a config
+is loaded, overwriting only keys the config already has. The wrappers expand
+the variables in the shell and pass those flags, leaving the shipped configs
+untouched. `VLLM_URL` and the `VLLM_IP`/`VLLM_PORT` pair are mutually
+exclusive, because a non-empty `url` makes `ais_bench` ignore host and port.
+
+Extra arguments are forwarded verbatim, so `./gsm8.sh --work-dir ./outputs/run1`
+works. `--dump-eval-details` is always on, which is what leaves the per-question
+requests and answers under `outputs/` for a wrong answer to be read back.
 
 ## bench/ -- operator accuracy and performance (NPU required)
 

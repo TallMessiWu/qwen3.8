@@ -28,3 +28,6 @@ Thumbs.db
 
 # 本机开发环境：vllm v0.27.1 只读 worktree + uv 缓存产物
 /.dev/
+
+# ais_bench 评测产物（gsm8.sh / gpqa.sh 默认写到执行目录下的 outputs/）
+outputs/
