@@ -97,6 +97,17 @@ Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
   so a GREEN means the scales really will be found. Reports the zero-scale
   channel count, and names which KV-cache recipe the checkpoint selected when it
   is not the MXFP8 one. Pure stdlib.
+- `packed_shard_quant_uniformity.py` -- would this checkpoint's
+  `quant_model_description.json` trip the fused-shard check that
+  `get_quant_type_for_layer` runs at model init? Replays it verbatim over every
+  fused module the model actually builds, so a RED names the exact prefix and
+  whether it raises on a missing shard or on shards disagreeing about their
+  quant type. PR #16051 moved `packed_modules_mapping` from a vllm-ascend table
+  to vLLM's own model class, so the set of checked groups now follows the
+  vendor; `--from-vllm` resolves it from the installed vLLM and says whether the
+  table baked into the script has gone stale. Also reports the two things the
+  check cannot see: experts past expert 0, and the MTP drafter's unpacked GDN
+  projection. Pure stdlib, config plus description only, no safetensors.
 - `compare_checkpoint_shapes.py` -- diff tensor names and shapes between a
   quantized checkpoint and its bf16 original. Reads safetensors headers only.
 - `estimate_hbm_budget.py` -- will N nodes hold this checkpoint? Derived from
