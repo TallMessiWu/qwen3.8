@@ -18,7 +18,7 @@ source .venv/bin/activate
 | Python | 3.11 | 3.11 |
 | vllm | 0.27.1 | 0.27.1（同一份源码，`VLLM_TARGET_DEVICE=empty` 装，不编译 kernel） |
 | torch | 2.10.0 + torch-npu | 2.10.0（PyPI 默认 wheel，带 CUDA） |
-| vllm-ascend | editable `junlin-qfa` | editable `junlin-qfa`（同一个 worktree） |
+| vllm-ascend | editable `junlin-c8-mxfp` | editable `junlin-c8-mxfp`（同一个 worktree） |
 | torch_npu | 真 NPU | `tests/ut/conftest.py` 自动注入的 MagicMock |
 
 vllm 源码取自 `.dev/vllm-0.27.1`——从 `vllm/` submodule 派生的只读 worktree。

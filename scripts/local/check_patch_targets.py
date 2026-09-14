@@ -191,8 +191,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--worktree",
-        default="vllm-ascend/junlin-qfa",
-        help="要检查的 vllm-ascend worktree（相对仓库根），默认 junlin-qfa",
+        default="vllm-ascend/junlin-c8-mxfp",
+        help="要检查的 vllm-ascend worktree（相对仓库根），默认 junlin-c8-mxfp",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="AMBER 同时打印完整参数列表")
     args = parser.parse_args()

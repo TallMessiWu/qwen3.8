@@ -37,7 +37,7 @@ qwen3.8/                   # 主仓（git，分支 main）
     └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa`（QFA 在途分支，基于 upstream/main），`main` 仍作为个人 fork 基线维护。
+服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp`（C8 MXFP8 在途分支，基于上游 PR 15484），`main` 仍作为个人 fork 基线维护。
 
 **主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和各任务分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
@@ -76,7 +76,7 @@ git worktree remove ../feat-xxx                        # 收尾清理
 
 `scripts/local/setup-devenv.sh` 在本机建一套刻意对齐真机容器的 venv：Python 3.11 +
 vllm 0.27.1（`VLLM_TARGET_DEVICE=empty`，不编译 kernel）+ torch 2.10.0（带 CUDA，
-吃 5080）+ editable 的 `vllm-ascend/junlin-qfa`。`torch_npu` 不装，由 vllm-ascend 自己的
+吃 5080）+ editable 的 `vllm-ascend/junlin-c8-mxfp`。`torch_npu` 不装，由 vllm-ascend 自己的
 `tests/ut/conftest.py` 在探测不到 `npu-smi` 时注入 MagicMock——跟 CI 的 CPU runner 同一口径。
 
 ```bash
@@ -152,8 +152,8 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。在途分支各有独立 worktree：
 
-- `junlin-qfa` —— QFA 算子接入主线，基于 upstream/main，官方 master QFA 已 vendor 进 csrc。容器默认 editable 安装的就是它。
-- `junlin-c8-mxfp` —— 跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP + PD 分离），基于该 PR 头部。
+- `junlin-c8-mxfp` —— 跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP + PD 分离），基于该 PR 头部。容器和本机 venv 默认 editable 安装的就是它。它的 QFA 来自外部 `cann_ops_transformer` 包，csrc 里没有算子源码，也没有 `VLLM_ASCEND_ENABLE_QFA` 开关。
+- `junlin-qfa` —— QFA 算子接入主线，基于 upstream/main，官方 master QFA 已 vendor 进 csrc。`scripts/setup/` 下三个 `*qfa*` 构建脚本仍默认指向它，因为只有它能从 csrc 编出 QFA。
 
 两条分支各自带着同样的两个真机故障修复，都是「值在错误的时刻被固定」这一类：
 

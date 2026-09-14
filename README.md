@@ -15,7 +15,7 @@
 在 Linux 服务器执行下面整段命令。它会克隆或更新主仓，初始化 `vllm` 和
 `vllm-ascend/main`，配置只读的官方 `upstream`，并创建常驻的
 `vllm-ascend/upstream-main` 与
-`vllm-ascend/junlin-qfa` worktree（容器默认使用的 QFA 分支）。
+`vllm-ascend/junlin-c8-mxfp` worktree（容器默认使用的 C8 MXFP8 分支）。
 
 ```bash
 set -euo pipefail
@@ -27,8 +27,8 @@ QWEN38_ROOT=/home/hajimi/qwen3.8
 VLLM_ASCEND_ROOT="${QWEN38_ROOT}/vllm-ascend"
 VLLM_ASCEND_MAIN="${VLLM_ASCEND_ROOT}/main"
 VLLM_ASCEND_UPSTREAM_MAIN="${VLLM_ASCEND_ROOT}/upstream-main"
-VLLM_ASCEND_QFA_BRANCH=junlin-qfa
-VLLM_ASCEND_QFA="${VLLM_ASCEND_ROOT}/${VLLM_ASCEND_QFA_BRANCH//\//-}"
+VLLM_ASCEND_C8_BRANCH=junlin-c8-mxfp
+VLLM_ASCEND_C8="${VLLM_ASCEND_ROOT}/${VLLM_ASCEND_C8_BRANCH//\//-}"
 VLLM_ASCEND_UPSTREAM_URL=https://github.com/vllm-project/vllm-ascend.git
 
 mkdir -p "$(dirname "${QWEN38_ROOT}")"
@@ -76,27 +76,27 @@ git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" branch \
   --set-upstream-to=upstream/main upstream-main
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" pull --ff-only --recurse-submodules
 
-if git -C "${VLLM_ASCEND_QFA}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git -C "${VLLM_ASCEND_QFA}" switch "${VLLM_ASCEND_QFA_BRANCH}"
+if git -C "${VLLM_ASCEND_C8}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "${VLLM_ASCEND_C8}" switch "${VLLM_ASCEND_C8_BRANCH}"
 elif git -C "${VLLM_ASCEND_MAIN}" show-ref --verify --quiet \
-  "refs/heads/${VLLM_ASCEND_QFA_BRANCH}"; then
+  "refs/heads/${VLLM_ASCEND_C8_BRANCH}"; then
   git -C "${VLLM_ASCEND_MAIN}" worktree add \
-    "${VLLM_ASCEND_QFA}" "${VLLM_ASCEND_QFA_BRANCH}"
+    "${VLLM_ASCEND_C8}" "${VLLM_ASCEND_C8_BRANCH}"
 else
   git -C "${VLLM_ASCEND_MAIN}" worktree add --track \
-    -b "${VLLM_ASCEND_QFA_BRANCH}" "${VLLM_ASCEND_QFA}" \
-    "origin/${VLLM_ASCEND_QFA_BRANCH}"
+    -b "${VLLM_ASCEND_C8_BRANCH}" "${VLLM_ASCEND_C8}" \
+    "origin/${VLLM_ASCEND_C8_BRANCH}"
 fi
 
-git -C "${VLLM_ASCEND_QFA}" branch \
-  --set-upstream-to="origin/${VLLM_ASCEND_QFA_BRANCH}" \
-  "${VLLM_ASCEND_QFA_BRANCH}"
-git -C "${VLLM_ASCEND_QFA}" pull --ff-only --recurse-submodules
+git -C "${VLLM_ASCEND_C8}" branch \
+  --set-upstream-to="origin/${VLLM_ASCEND_C8_BRANCH}" \
+  "${VLLM_ASCEND_C8_BRANCH}"
+git -C "${VLLM_ASCEND_C8}" pull --ff-only --recurse-submodules
 
 for worktree in \
   "${VLLM_ASCEND_MAIN}" \
   "${VLLM_ASCEND_UPSTREAM_MAIN}" \
-  "${VLLM_ASCEND_QFA}"; do
+  "${VLLM_ASCEND_C8}"; do
   git -C "${worktree}" submodule sync --recursive
   git -C "${worktree}" submodule update --init --recursive
 done
@@ -105,37 +105,41 @@ git -C "${QWEN38_ROOT}" submodule status --recursive
 git -C "${VLLM_ASCEND_MAIN}" worktree list
 git -C "${VLLM_ASCEND_MAIN}" status -sb
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" status -sb
-git -C "${VLLM_ASCEND_QFA}" status -sb
+git -C "${VLLM_ASCEND_C8}" status -sb
 git -C "${VLLM_ASCEND_MAIN}" submodule status --recursive
 git -C "${VLLM_ASCEND_UPSTREAM_MAIN}" submodule status --recursive
-git -C "${VLLM_ASCEND_QFA}" submodule status --recursive
+git -C "${VLLM_ASCEND_C8}" submodule status --recursive
 ```
 
 三个分支状态应分别显示 `main...origin/main`、
 `upstream-main...upstream/main` 和
-`junlin-qfa...origin/junlin-qfa`。
+`junlin-c8-mxfp...origin/junlin-c8-mxfp`。
 `upstream` 只用于 fetch/pull，不要向它 push。
 
 ### 另一条在途分支
 
-fork 上目前只有三条分支：`main`、`junlin-qfa`，以及上面脚本不会创建的
-`junlin-c8-mxfp`。后者跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP +
-PD 分离），QFA 的进图机制与 `junlin-qfa` 不同——它是原生 `npugraph_ex`，
-`junlin-qfa` 是 task group + update 重发，排查问题时结论不要互相套用。
-两条分支各自带着同样的两个真机故障修复，详见 `AGENTS.md` 的「当前状态」。
+fork 上目前只有三条分支：`main`、`junlin-c8-mxfp`，以及上面脚本不会创建的
+`junlin-qfa`。后者是 QFA 算子接入主线，基于 `upstream/main`，把官方 master 的
+QFA 原样 vendor 进 `csrc`；默认的 `junlin-c8-mxfp` 则跟随上游 PR 15484
+（C8 MXFP8 KV cache + QFA + MTP + PD 分离），QFA 从外部 `cann_ops_transformer`
+包取，`csrc` 里没有算子源码。两者的 QFA 进图机制也不同——`junlin-c8-mxfp` 是
+原生 `npugraph_ex`，`junlin-qfa` 是 task group + update 重发，排查问题时结论
+不要互相套用。两条分支各自带着同样的两个真机故障修复，详见 `AGENTS.md` 的
+「当前状态」。
 
 需要它时按下面拉起 worktree：
 
 ```bash
 git -C "${VLLM_ASCEND_MAIN}" worktree add --track \
-  -b junlin-c8-mxfp "${VLLM_ASCEND_ROOT}/junlin-c8-mxfp" \
-  origin/junlin-c8-mxfp
-git -C "${VLLM_ASCEND_ROOT}/junlin-c8-mxfp" submodule update --init --recursive
+  -b junlin-qfa "${VLLM_ASCEND_ROOT}/junlin-qfa" \
+  origin/junlin-qfa
+git -C "${VLLM_ASCEND_ROOT}/junlin-qfa" submodule update --init --recursive
 ```
 
-容器默认仍从 `junlin-qfa` 做 editable 安装；要改用这条分支，给
-`create-container.sh` 传 `--vllm-ascend-repo`
-指向 `.../vllm-ascend/junlin-c8-mxfp`。
+`scripts/setup/` 下的 `build_qfa_ops.sh`、`pip_install_qfa.sh` 和
+`diag_qfa_tiling_registry.sh` 仍默认指向这个 worktree，因为只有它能从 `csrc`
+编出 QFA 算子。容器要改用它做 editable 安装时，给 `create-container.sh` 传
+`--vllm-ascend-repo` 指向 `.../vllm-ascend/junlin-qfa`。
 
 ## 创建 A5 容器
 
@@ -156,8 +160,8 @@ git -C "${VLLM_ASCEND_ROOT}/junlin-c8-mxfp" submodule update --init --recursive
 - 安装脚本默认位于
   `/home/hajimi/qwen3.8/scripts/setup/install-vllm-ascend.sh`，可通过
   `--install-script` 覆盖。
-- editable 安装使用的 checkout 默认为 QFA 分支 worktree
-  `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa`，
+- editable 安装使用的 checkout 默认为 C8 MXFP8 分支 worktree
+  `/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp`，
   可通过 `--vllm-ascend-repo` 覆盖。如果传入
   `--vllm-ascend-version` 从镜像源安装指定包版本，则不要求本地 checkout
   存在。
@@ -186,7 +190,7 @@ bash scripts/setup/create-container.sh
 脚本会创建 privileged、host network、host PID 的 8 卡容器，挂载宿主机
 目录，配置 root 的 `.bashrc`，然后调用 `install-vllm-ascend.sh`。默认不会
 解析 vLLM 依赖，而是以 `--no-deps` 强制安装 `vllm==0.27.1`；vLLM-Ascend
-从默认 checkout `vllm-ascend/junlin-qfa` 以 editable 模式安装。
+从默认 checkout `vllm-ascend/junlin-c8-mxfp` 以 editable 模式安装。
 
 创建完成后进入容器：
 
@@ -210,12 +214,12 @@ bash scripts/setup/install-vllm-ascend.sh --help
 | `--image` | 默认 vendor A5 镜像 |
 | `--container-name` | `hajimi-vllm` |
 | `--install-script` | `/home/hajimi/qwen3.8/scripts/setup/install-vllm-ascend.sh` |
-| `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa` |
+| `--vllm-ascend-repo` | `/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp` |
 | `--proxy-file` | `/home/hajimi/proxy.sh`，不存在时跳过 |
 | `--shell-workdir` | `/home/hajimi/qwen3.8/scripts` |
 | `--python-bin` | `python3` |
 | `--vllm-version` | `0.27.1`，可覆盖为其他版本 |
-| `--vllm-ascend-version` | 不传时 editable 安装 junlin-qfa checkout；传入时安装指定包版本 |
+| `--vllm-ascend-version` | 不传时 editable 安装 junlin-c8-mxfp checkout；传入时安装指定包版本 |
 | `--pip-index-url` | `https://mirrors.aliyun.com/pypi/simple` |
 | `--pytorch-index-url` | `https://download.pytorch.org/whl/cpu` |
 
@@ -226,7 +230,7 @@ bash scripts/setup/create-container.sh \
   --image vllm-ascend:custom-a5 \
   --container-name qwen38-test \
   --install-script /mnt/qwen3.8/scripts/setup/install-vllm-ascend.sh \
-  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/junlin-qfa \
+  --vllm-ascend-repo /mnt/qwen3.8/vllm-ascend/junlin-c8-mxfp \
   --proxy-file /mnt/proxy.sh \
   --shell-workdir /mnt/qwen3.8/scripts \
   --shell-fallback-dir /mnt \
@@ -284,7 +288,7 @@ bash scripts/setup/create-container.sh \
     └── vllm-ascend/
         ├── main/                    # 个人 fork submodule，跟踪 origin/main
         ├── upstream-main/           # 本地 worktree，跟踪 upstream/main
-        └── junlin-qfa/              # 默认容器使用，跟踪 origin/junlin-qfa
+        └── junlin-c8-mxfp/          # 默认容器使用，跟踪 origin/junlin-c8-mxfp
 ```
 
 完成容器创建后，容器不会再复制一份源码，而是通过 bind mount 看到宿主机
@@ -301,7 +305,7 @@ hajimi-vllm 容器
 ├── /root/.bashrc                     # 追加代理加载和默认工作目录配置
 └── Python 环境
     ├── vllm                          # 默认安装 0.27.1，或安装指定版本
-    └── vllm-ascend                   # editable 装 junlin-qfa，或指定包版本
+    └── vllm-ascend                   # editable 装 junlin-c8-mxfp，或指定包版本
 ```
 
 ### 一键初始化仓库做了什么
@@ -316,9 +320,9 @@ hajimi-vllm 容器
    `upstream/main`。该远端只用于 fetch/pull。
 5. 创建或更新 `vllm-ascend/upstream-main` worktree，让它跟踪
    `upstream/main`，与个人 fork 的 `main` checkout 分开维护。
-6. 创建或更新 `vllm-ascend/junlin-qfa` worktree，让它跟踪个人
-   fork 的 `junlin-qfa` 分支（QFA 算子接入，基于 upstream/main）。容器
-   默认就从这个 worktree 做 editable 安装。
+6. 创建或更新 `vllm-ascend/junlin-c8-mxfp` worktree，让它跟踪个人
+   fork 的 `junlin-c8-mxfp` 分支（C8 MXFP8 KV cache，基于上游 PR 15484）。
+   容器默认就从这个 worktree 做 editable 安装。
 7. 在三个 vLLM-Ascend worktree 中同步递归 submodule，最后打印 submodule、
    worktree 和分支状态，供人工确认初始化结果。
 
@@ -337,7 +341,7 @@ hajimi-vllm 容器
 6. 安装器先以 `--no-deps` 强制安装 vLLM。默认版本为 `0.27.1`，可通过
    `--vllm-version` 覆盖。
 7. 如果传入 `--vllm-ascend-version`，从 Python 镜像源安装指定版本；否则先
-   同步并初始化选定 checkout（默认 junlin-qfa worktree）的递归 submodule，
+   同步并初始化选定 checkout（默认 junlin-c8-mxfp worktree）的递归 submodule，
    再清理 `csrc/output` 和 `csrc/build_out`，最后执行 editable 安装。
 8. 安装结束后打印 vLLM、vLLM-Ascend 版本和 `vllm_ascend` 的实际导入路径。
    安装失败时容器保留运行状态，便于进入容器检查构建环境。

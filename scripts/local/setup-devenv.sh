@@ -7,7 +7,7 @@
 #   - vllm 0.27.1，从主仓 vllm submodule 的 v0.27.1 worktree 以 VLLM_TARGET_DEVICE=empty
 #     安装：不编译任何 CUDA kernel，不需要 nvcc，装的是与真机一致的那份 Python 源码
 #   - torch 2.10.0（PyPI 默认 wheel，自带 CUDA，可用本机 GPU 跑数值等价性验证）
-#   - vllm-ascend 以 editable 方式指向 junlin-qfa worktree，--no-deps 跳过 torch-npu /
+#   - vllm-ascend 以 editable 方式指向 junlin-c8-mxfp worktree，--no-deps 跳过 torch-npu /
 #     triton-ascend 这些本机装不了也用不上的依赖
 #
 # torch_npu 不安装：vllm-ascend 的 tests/ut/conftest.py 会在探测不到 npu-smi 时
@@ -18,7 +18,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VLLM_REF="${VLLM_REF:-v0.27.1}"
 VLLM_WORKTREE="${VLLM_WORKTREE:-$REPO_ROOT/.dev/vllm-0.27.1}"
-ASCEND_WORKTREE="${ASCEND_WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-qfa}"
+ASCEND_WORKTREE="${ASCEND_WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-c8-mxfp}"
 SOC_VERSION="${SOC_VERSION:-ascend910b1}"
 
 cd "$REPO_ROOT"

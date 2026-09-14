@@ -20,8 +20,8 @@ SERVICE_LAUNCHERS = (
     "serve_qwen3.8_2.4t_single_node_4layer.sh",
 )
 MODEL_NAME_CONSUMERS = SERVICE_LAUNCHERS + ("curl.sh",)
-QFA_VLLM_ASCEND_REPO = (
-    "/home/hajimi/qwen3.8/vllm-ascend/junlin-qfa"
+DEFAULT_VLLM_ASCEND_REPO = (
+    "/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp"
 )
 EVAL_WRAPPERS = {
     "gsm8.sh": "gsm8k_gen_0_shot_cot_chat_prompt",
@@ -163,7 +163,7 @@ class ScriptDefaultsTest(unittest.TestCase):
                 self.assertIn("exit 2", guard)
                 self.assertIn("junlin-qfa-c8switch", guard)
 
-    def test_container_install_defaults_to_qfa_worktree(self):
+    def test_container_install_defaults_to_c8_mxfp_worktree(self):
         create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
             encoding="utf-8"
         )
@@ -172,19 +172,19 @@ class ScriptDefaultsTest(unittest.TestCase):
         )
 
         self.assertIn(
-            f"VLLM_ASCEND_REPO={QFA_VLLM_ASCEND_REPO}", create_container
+            f"VLLM_ASCEND_REPO={DEFAULT_VLLM_ASCEND_REPO}", create_container
         )
-        self.assertIn(f"repo={QFA_VLLM_ASCEND_REPO}", installer)
+        self.assertIn(f"repo={DEFAULT_VLLM_ASCEND_REPO}", installer)
 
-    def test_readme_bootstrap_includes_qfa_worktree(self):
+    def test_readme_bootstrap_includes_c8_mxfp_worktree(self):
         readme = (SCRIPTS_DIR.parent / "README.md").read_text(encoding="utf-8")
 
         self.assertIn(
-            "VLLM_ASCEND_QFA_BRANCH=junlin-qfa",
+            "VLLM_ASCEND_C8_BRANCH=junlin-c8-mxfp",
             readme,
         )
-        self.assertIn('"origin/${VLLM_ASCEND_QFA_BRANCH}"', readme)
-        self.assertIn('"${VLLM_ASCEND_QFA}"; do', readme)
+        self.assertIn('"origin/${VLLM_ASCEND_C8_BRANCH}"', readme)
+        self.assertIn('"${VLLM_ASCEND_C8}"; do', readme)
 
     def test_eval_wrappers_document_every_env_var(self):
         # Whoever opens gpqa.sh should not have to open a second file to learn
