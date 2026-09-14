@@ -31,3 +31,6 @@ Thumbs.db
 
 # ais_bench 评测产物（gsm8.sh / gpqa.sh 默认写到执行目录下的 outputs/）
 outputs/
+
+# 评测脚本按端点生成的 ais_bench 模型配置（scripts/run_ais_bench.sh 产物）
+scripts/.ais_bench_configs/

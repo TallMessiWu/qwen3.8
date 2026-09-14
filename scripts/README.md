@@ -37,6 +37,9 @@ their own.
 - `gpqa.sh` -- GPQA, zero-shot chain-of-thought chat prompt.
 - `mmmu.sh` -- MMMU, multimodal, so the server has to accept images.
 - `run_ais_bench.sh` -- the shared entry point all three of them exec.
+- `gen_ais_bench_model_cfg.py` -- rewrites the endpoint into a copy of
+  `ais_bench`'s own model template, for builds too old to take it on the
+  command line. `run_ais_bench.sh` calls it; it also runs standalone.
 
 Aim them at a service with environment variables, not by copying `ais_bench`'s
 model configs:
@@ -46,21 +49,37 @@ VLLM_PORT=7969 ./gsm8.sh                     # another service on this box
 VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gpqa.sh    # a service on another box
 VLLM_URL=http://gw.example/prefix/ ./gsm8.sh # a gateway with a path
 MODEL_NAME=qwen3.8 ./gsm8.sh                 # else /v1/models gets probed
-AIS_MODEL_CFG=vllm_api_stream_chat.py ./gsm8.sh
+AIS_MODEL_CFG=vllm_api_stream_chat ./gsm8.sh
 ```
 
-Editing the endpoint into `configs/models/vllm_api/*.py` is exactly what this
+Hand-editing the endpoint into `configs/models/vllm_api/*.py` is what this
 avoids, and putting `os.environ.get(...)` in one of those files does not work:
 they import `ais_bench` modules, so mmengine parses them in lazy-import mode,
 where no call in the file is ever executed. The call returns a `LazyObject`
 that raises `RuntimeError` on invocation, surfacing as `TMAN-CFG-001 invalid
 syntax`. mmengine's own `{{$ENV:default}}` substitution is skipped on that path
-too. `ais_bench` instead has an `api_model_args` group -- `--host-ip`,
-`--host-port`, `--url`, `--model-name` among others -- applied after a config
-is loaded, overwriting only keys the config already has. The wrappers expand
-the variables in the shell and pass those flags, leaving the shipped configs
-untouched. `VLLM_URL` and the `VLLM_IP`/`VLLM_PORT` pair are mutually
-exclusive, because a non-empty `url` makes `ais_bench` ignore host and port.
+too. `VLLM_URL` and the `VLLM_IP`/`VLLM_PORT` pair are mutually exclusive,
+because a non-empty `url` makes `ais_bench` ignore host and port.
+
+How the endpoint actually reaches `ais_bench` depends on its version, and the
+entry point probes for it rather than being told:
+
+- From the `api_model_args` group added on 2026-08-27 (tag
+  `v3.1-20260827-master`), `--host-ip`, `--host-port`, `--url` and
+  `--model-name` are applied after a config loads, overwriting only keys it
+  already has. The variables expand in the shell into those flags.
+- Older builds reject those flags outright. There the generator reads the
+  template `ais_bench` installed, rewrites the address fields, and writes the
+  result under `.ais_bench_configs/models/`, which `--config-dir` then puts
+  ahead of the shipped directory. Datasets still resolve from the shipped one,
+  because the lookup takes both and a missing directory is not an error. Each
+  endpoint gets its own file, so two services can be evaluated at once, and
+  `site-packages` is never touched.
+
+The rewrite is a regex over someone else's file, so it asserts each field
+matches exactly once and aborts otherwise: a silent miss would leave the eval
+pointed at the template's default port, which reads as a completed run against
+the wrong box. `scripts/tests/test_ais_bench_model_cfg.py` pins that.
 
 Extra arguments are forwarded verbatim, so `./gsm8.sh --work-dir ./outputs/run1`
 works. `--dump-eval-details` is always on, which is what leaves the per-question
