@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Cron entry point for the four-node 2.4T service.  Runs on the HOST, once per
-# machine, and does three things: make sure the serving container is up, pick
-# the rank this machine owns, and launch that rank's 2.4T-N.sh inside the
-# container through an interactive shell so ~/.bashrc is sourced.
+# Scheduled entry point for the four-node 2.4T service, for `at` or cron to
+# call.  Runs on the HOST, once per machine, and does three things: make sure
+# the serving container is up, pick the rank this machine owns, and launch that
+# rank's 2.4T-N.sh inside the container through an interactive shell so
+# ~/.bashrc is sourced.
 #
-# All four machines run an identical copy of this script and an identical
-# crontab line.  The rank is derived from the machine's own IPv4 address, so
-# nothing here is per-machine; override with NODE_RANK to force one.
+# All four machines run an identical copy of this script; only the schedule
+# differs, and only so that node 0 goes first.  The rank is derived from the
+# machine's own IPv4 address, so nothing here is per-machine; override with
+# NODE_RANK to force one.
 #
 # This is a restart, not a health check: 2.4T-N.sh calls npu-cleaner.sh, which
 # SIGKILLs every process holding an NPU.  Firing this while the service is
 # healthy therefore kills and relaunches it, which is the intended behaviour.
-# Point cron at it on whatever cadence the service should be recycled on, and
-# use --check first to prove the container plumbing works.
+# Schedule it accordingly: `at` for a single run, cron on whatever cadence the
+# service should be recycled on.  Use --check first to prove the plumbing works.
 
 set -euo pipefail
 

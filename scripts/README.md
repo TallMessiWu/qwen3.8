@@ -33,7 +33,7 @@ chased this week, cleared once that question is answered.
 
 ### Scheduling the four-node service
 
-`autostart-2.4T.sh` is what cron calls. All four machines get a byte-identical
+`autostart-2.4T.sh` is what the scheduler calls, `at` or cron. All four machines get a byte-identical
 copy: the rank comes from the machine's own IPv4 address, matched against the
 same `LOCAL_IP` values the launchers carry, so nothing inside the script is
 per-machine. `--rank N` overrides that when the address table is wrong or a box
@@ -67,8 +67,26 @@ profile files instead, and either would start the server in a stripped
 environment that fails much later. It touches no NPU and does not restart
 anything.
 
-Then install the entry in **root's** crontab (`sudo crontab -e`), because
-talking to docker needs it. Node 0 at 01:00:
+To fire it a single time, use `at` rather than a crontab entry that has to be
+removed afterwards. Node 0 at 01:00, nodes 1 to 3 at 01:10, each on its own
+machine, and as root because talking to docker needs it:
+
+```bash
+echo 'bash /home/hajimi/qwen3.8/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.8/scripts/logs/autostart-once.log 2>&1' | sudo at 01:00
+```
+
+`atq` lists what is queued and `atrm <id>` drops one. If `atd` is not running
+(`systemctl is-active atd` says), a transient systemd timer does the same job
+without installing anything:
+
+```bash
+sudo systemd-run --on-calendar='2026-09-15 01:00' --unit=qwen38-autostart /home/hajimi/qwen3.8/scripts/autostart-2.4T.sh
+```
+
+An absolute timestamp matches once, so the unit fires and then cleans itself up.
+
+For a recurring restart instead, install the entry in **root's** crontab
+(`sudo crontab -e`). Node 0 at 01:00:
 
 ```cron
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
