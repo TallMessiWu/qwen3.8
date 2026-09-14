@@ -25,8 +25,68 @@ chased this week, cleared once that question is answered.
 - `2.4T-{0..3}.sh` -- the four-node 2.4T launchers, one per node.
 - `serve_qwen3.8_2.4t_4node.sh`, `serve_qwen3.8_2.4t_single_node_4layer.sh` --
   the underlying serve commands those wrap.
+- `autostart-2.4T.sh` -- the cron entry point for those four. Runs on the
+  host, brings the container up if it is down, and launches this machine's
+  rank inside it. See below.
 - `curl.sh` -- multimodal smoke request against a running server.
 - `npu-cleaner.sh` -- frees devices left busy by a killed run.
+
+### Scheduling the four-node service
+
+`autostart-2.4T.sh` is what cron calls. All four machines get a byte-identical
+copy and an identical crontab line: the rank comes from the machine's own IPv4
+address, matched against the same `LOCAL_IP` values the launchers carry, so
+nothing about the entry is per-machine. `--rank N` overrides that when the
+address table is wrong or a box is being tested from elsewhere.
+
+It is a restart, not a health check. `2.4T-N.sh` calls `npu-cleaner.sh`, which
+SIGKILLs everything holding an NPU, so a tick that lands while the service is
+healthy kills and relaunches it. That is the intended behaviour -- schedule it
+on the cadence the service should be recycled on, not every five minutes. A
+`flock` keeps two ticks from overlapping, since a second one would reap the
+first mid-load, and ranks 1-3 wait for node 0 to bind the DP handshake port
+before starting, because they connect to it rather than the other way round.
+
+`SCRIPTS_DIR` defaults to `/home/hajimi/qwen3.5/scripts`, which is where the
+launchers are invoked from on these machines. This repository deploys to
+`/home/hajimi/qwen3.8`; set `SCRIPTS_DIR` if the copy cron should run lives
+there instead. The script refuses to start rather than guessing when the
+launcher is not readable at that path.
+
+Prove the container plumbing before scheduling anything:
+
+```bash
+bash autostart-2.4T.sh --check
+```
+
+That dumps what `bash -c` and `bash -ic` each end up with inside the container
+and requires them to differ, which is the only way to show `~/.bashrc` is
+really being sourced -- `bash -c` never reads it and `bash -lc` reads the
+profile files instead, and either would start the server in a stripped
+environment that fails much later. It touches no NPU and does not restart
+anything.
+
+Then install the entry in **root's** crontab (`sudo crontab -e`), because
+talking to docker needs it:
+
+```cron
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 4 * * * /home/hajimi/qwen3.5/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.5/scripts/logs/autostart-cron.log 2>&1
+@reboot sleep 120 && /home/hajimi/qwen3.5/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.5/scripts/logs/autostart-cron.log 2>&1
+```
+
+The `@reboot` sleep gives the docker daemon and the NPU driver time to come up
+first. The server's own output goes to a timestamped file per run under
+`logs/`, kept for `LOG_KEEP_DAYS` (7) days; the crontab redirect above only
+catches this script's own progress lines. Nothing is written under `/tmp`.
+
+Switches worth knowing: `STAGGER_SECONDS` (20) is the flat head start ranks 1-3
+give node 0 before probing it, `WAIT_NODE0_SECONDS` (300) caps the probe,
+`KILL_STALE` (1) reaps a surviving API-server frontend that `npu-cleaner.sh`
+would miss because it holds no NPU, and `CONTAINER_NAME` (`hajimi-vllm`) has to
+match `setup/create-container.sh`. The script never runs `docker run`: a
+missing container is an error telling you to run `setup/create-container.sh`
+once, because `docker run` alone would skip the vLLM-Ascend install.
 
 ## Accuracy evals
 

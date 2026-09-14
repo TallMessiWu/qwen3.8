@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import difflib
+import re
 import unittest
 from pathlib import Path
 
@@ -227,6 +228,69 @@ class ScriptDefaultsTest(unittest.TestCase):
                     reference,
                     f"{name} has drifted from {reference_name}",
                 )
+
+
+    def test_autostart_agrees_with_the_four_node_launchers(self):
+        # autostart-2.4T.sh derives its rank from the machine's own IPv4
+        # address so that all four boxes can run a byte-identical copy under an
+        # identical crontab line. That only holds while its table agrees with
+        # the launchers: an IP changed on one side alone leaves a machine
+        # either unable to identify itself or, worse, answering as another
+        # rank and loading the wrong half of the DP group.
+        autostart = (SCRIPTS_DIR / "autostart-2.4T.sh").read_text(encoding="utf-8")
+
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                launcher = (SCRIPTS_DIR / f"2.4T-{rank}.sh").read_text(encoding="utf-8")
+                local_ip = re.search(r"LOCAL_IP:-([\d.]+)\}", launcher)
+                self.assertIsNotNone(local_ip, f"2.4T-{rank}.sh has no LOCAL_IP default")
+                self.assertIn(
+                    f'NODE{rank}_IP="${{NODE{rank}_IP:-{local_ip.group(1)}}}"',
+                    autostart,
+                )
+
+        # The rendezvous probe has to watch the port node 0 actually binds.
+        serve = (SCRIPTS_DIR / "serve_qwen3.8_2.4t_4node.sh").read_text(encoding="utf-8")
+        rpc_port = re.search(r"DP_RPC_PORT:-(\d+)\}", serve)
+        self.assertIsNotNone(rpc_port, "the 4-node launcher has no DP_RPC_PORT default")
+        self.assertIn(
+            f'DP_RPC_PORT="${{DP_RPC_PORT:-{rpc_port.group(1)}}}"', autostart
+        )
+
+        create_container = (SCRIPTS_DIR / "setup" / "create-container.sh").read_text(
+            encoding="utf-8"
+        )
+        container_name = re.search(r"CONTAINER_NAME:-([\w.-]+)\}", create_container)
+        self.assertIsNotNone(container_name, "create-container.sh has no name default")
+        self.assertIn(
+            f'CONTAINER_NAME="${{CONTAINER_NAME:-{container_name.group(1)}}}"',
+            autostart,
+        )
+
+    def test_autostart_starts_the_service_from_an_interactive_shell(self):
+        # ~/.bashrc is what create-container.sh loads the proxy and the working
+        # directory from, and bash reads that file only for interactive shells.
+        # `bash -c` skips it silently and `bash -lc` reads the profile files
+        # instead; either would start the server in a stripped environment that
+        # only fails much later. --detach is the other half of the contract: the
+        # cron process exits at once, and the server has to outlive it.
+        autostart = (SCRIPTS_DIR / "autostart-2.4T.sh").read_text(encoding="utf-8")
+
+        launch = [
+            line
+            for line in autostart.splitlines()
+            if "docker exec --detach" in line
+        ]
+        self.assertEqual(len(launch), 1, "expected exactly one detached exec")
+        self.assertIn('--user "$CONTAINER_USER"', launch[0])
+
+        body = autostart.split("docker exec --detach", 1)[1]
+        self.assertIn("bash -ic \"cd '$SCRIPTS_DIR'", body)
+        self.assertNotIn(" -lc ", body)
+
+        # A detached exec discards its own stdout, so the redirect has to run
+        # inside the container or the log is silently empty.
+        self.assertIn(">>'$log_file' 2>&1", body)
 
 
 if __name__ == "__main__":
