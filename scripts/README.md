@@ -34,10 +34,11 @@ chased this week, cleared once that question is answered.
 ### Scheduling the four-node service
 
 `autostart-2.4T.sh` is what cron calls. All four machines get a byte-identical
-copy and an identical crontab line: the rank comes from the machine's own IPv4
-address, matched against the same `LOCAL_IP` values the launchers carry, so
-nothing about the entry is per-machine. `--rank N` overrides that when the
-address table is wrong or a box is being tested from elsewhere.
+copy: the rank comes from the machine's own IPv4 address, matched against the
+same `LOCAL_IP` values the launchers carry, so nothing inside the script is
+per-machine. `--rank N` overrides that when the address table is wrong or a box
+is being tested from elsewhere. Only the schedule differs between machines, and
+only so that node 0 goes first.
 
 It is a restart, not a health check. `2.4T-N.sh` calls `npu-cleaner.sh`, which
 SIGKILLs everything holding an NPU, so a tick that lands while the service is
@@ -47,11 +48,11 @@ on the cadence the service should be recycled on, not every five minutes. A
 first mid-load, and ranks 1-3 wait for node 0 to bind the DP handshake port
 before starting, because they connect to it rather than the other way round.
 
-`SCRIPTS_DIR` defaults to `/home/hajimi/qwen3.5/scripts`, which is where the
-launchers are invoked from on these machines. This repository deploys to
-`/home/hajimi/qwen3.8`; set `SCRIPTS_DIR` if the copy cron should run lives
-there instead. The script refuses to start rather than guessing when the
-launcher is not readable at that path.
+`SCRIPTS_DIR` defaults to `/home/hajimi/qwen3.8/scripts`, which is also the
+`SHELL_WORKDIR` that `setup/create-container.sh` makes the container's
+`~/.bashrc` cd into, so the launch shell is already sitting there. Set it if
+this checkout lives somewhere else. The script refuses to start rather than
+guessing when the launcher is not readable at that path.
 
 Prove the container plumbing before scheduling anything:
 
@@ -67,18 +68,32 @@ environment that fails much later. It touches no NPU and does not restart
 anything.
 
 Then install the entry in **root's** crontab (`sudo crontab -e`), because
-talking to docker needs it:
+talking to docker needs it. Node 0 at 01:00:
 
 ```cron
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 4 * * * /home/hajimi/qwen3.5/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.5/scripts/logs/autostart-cron.log 2>&1
-@reboot sleep 120 && /home/hajimi/qwen3.5/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.5/scripts/logs/autostart-cron.log 2>&1
+0 1 * * * /home/hajimi/qwen3.8/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.8/scripts/logs/autostart-cron.log 2>&1
 ```
 
-The `@reboot` sleep gives the docker daemon and the NPU driver time to come up
-first. The server's own output goes to a timestamped file per run under
-`logs/`, kept for `LOG_KEEP_DAYS` (7) days; the crontab redirect above only
-catches this script's own progress lines. Nothing is written under `/tmp`.
+Nodes 1 to 3 at 01:10, identical apart from the minute:
+
+```cron
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+10 1 * * * /home/hajimi/qwen3.8/scripts/autostart-2.4T.sh >> /home/hajimi/qwen3.8/scripts/logs/autostart-cron.log 2>&1
+```
+
+Ten minutes is far more head start than node 0 needs -- it binds the handshake
+port within a minute of starting, long before the weights are read -- and node 0
+then sits waiting for the other three, because DP initialisation only completes
+once every rank has joined. One or two minutes would do the same job and get the
+service up sooner. The in-script wait stays useful either way: it is what covers
+a node 0 that is late rather than early.
+
+Add `@reboot sleep 120 && ...` alongside if the service should also come back
+after a power cycle; the sleep gives the docker daemon and the NPU driver time
+to come up first. The server's own output goes to a timestamped file per run
+under `logs/`, kept for `LOG_KEEP_DAYS` (7) days; the crontab redirect above
+only catches this script's own progress lines. Nothing is written under `/tmp`.
 
 Switches worth knowing: `STAGGER_SECONDS` (20) is the flat head start ranks 1-3
 give node 0 before probing it, `WAIT_NODE0_SECONDS` (300) caps the probe,

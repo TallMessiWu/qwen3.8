@@ -23,8 +23,10 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 CONTAINER_NAME="${CONTAINER_NAME:-hajimi-vllm}"
 CONTAINER_USER="${CONTAINER_USER:-root}"
 # The directory as seen INSIDE the container.  /home is bind-mounted straight
-# from the host, so the same path works on both sides.
-SCRIPTS_DIR="${SCRIPTS_DIR:-/home/hajimi/qwen3.5/scripts}"
+# from the host, so the same path works on both sides.  This is also
+# create-container.sh's SHELL_WORKDIR, the directory the container's ~/.bashrc
+# cds into, so the launch shell is already here before the cd below runs.
+SCRIPTS_DIR="${SCRIPTS_DIR:-/home/hajimi/qwen3.8/scripts}"
 LOG_DIR="${LOG_DIR:-$SCRIPTS_DIR/logs}"
 LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-7}"
 
@@ -170,8 +172,7 @@ fi
 if ! docker exec --user "$CONTAINER_USER" "$CONTAINER_NAME" \
     test -r "$SCRIPTS_DIR/$launcher"; then
     die "$SCRIPTS_DIR/$launcher is missing or unreadable inside the container." \
-        "Set SCRIPTS_DIR if the checkout lives elsewhere (the repo this script" \
-        "ships from is /home/hajimi/qwen3.8)."
+        "Set SCRIPTS_DIR if this checkout lives somewhere else."
 fi
 
 # --- ~/.bashrc check ------------------------------------------------------

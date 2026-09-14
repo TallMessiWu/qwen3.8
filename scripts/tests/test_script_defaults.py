@@ -267,6 +267,16 @@ class ScriptDefaultsTest(unittest.TestCase):
             autostart,
         )
 
+        # The container's ~/.bashrc cds into SHELL_WORKDIR, so launching from
+        # anywhere else would run the service out of a different directory than
+        # every interactive session that debugs it -- and ./profiling, which the
+        # 4-node launcher resolves against the CWD, would land somewhere else too.
+        workdir = re.search(r"SHELL_WORKDIR=(\S+)", create_container)
+        self.assertIsNotNone(workdir, "create-container.sh has no SHELL_WORKDIR")
+        self.assertIn(
+            f'SCRIPTS_DIR="${{SCRIPTS_DIR:-{workdir.group(1)}}}"', autostart
+        )
+
     def test_autostart_starts_the_service_from_an_interactive_shell(self):
         # ~/.bashrc is what create-container.sh loads the proxy and the working
         # directory from, and bash reads that file only for interactive shells.
