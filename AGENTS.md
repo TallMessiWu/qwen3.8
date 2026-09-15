@@ -88,13 +88,13 @@ bash scripts/local/run_cpu_ut.sh                # CPU 单测 + 跟已知基线�
 venv 的 vllm 直接装 `vllm/` submodule 当前的 checkout，它跟着 vllm-ascend 的
 `.github/vllm-main-verified.commit` 走（当前 `84030bbe3d`）。真机是 pip 装的 0.28.0，
 和这个 commit 用起来差别不大，不必纠结；真要对某个确切版本，覆盖 `VLLM_REF` +
-`VLLM_WORKTREE` 从 submodule 派生一个只读 worktree 即可（`.dev/vllm-0.27.1` 就是这么来的）。
+`VLLM_WORKTREE` 从 submodule 临时派生一个只读 worktree（用完 `git -C vllm worktree remove` 删掉）。
 
 **⚠️ 2026-09-15 起 0.27.1 已经不能用了。** 近期 upstream/main 的 vllm-ascend 只支持
 **vllm 恰好 0.28.0**（代码里 101 处 `vllm_version_is("0.28.0")` 守卫）或 **main
 `84030bbe3d`**；0.27.1 会在 `patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups`
-缺失而 import 失败。`.dev/vllm-0.27.1` 保留着，是给还钉 `ba07e4a48f` 的
-`junlin-c8-mxfp` / `junlin-qfa` 用的。换版本重建会清掉 `.venv`，两套环境没法并存。
+缺失而 import 失败。`junlin-c8-mxfp` / `junlin-qfa` 这两条老分支还钉着 `ba07e4a48f`，
+要验它们得先把 `vllm/` 切过去再重建 venv——换版本重建会清掉 `.venv`，两套环境没法并存。
 （曾经 `vllm/` 停在 v0.28.1rc0、领先真机 1300+ commit，照着它查会得出对不上的结论；
 现在方向反过来了，同样要小心。）
 能拦什么、拦不住什么、已知的基线失败（当前 1 条），见 `scripts/local/README.md`。

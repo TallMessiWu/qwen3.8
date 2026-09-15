@@ -23,13 +23,14 @@ source .venv/bin/activate
 
 `vllm/` 跟着 vllm-ascend 的 `.github/vllm-main-verified.commit` 走（当前 main
 `84030bbe3d`）。真机是 pip 装的 0.28.0，两者用起来差别不大，不必纠结；真要对某个确切
-版本，覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 派生一个只读 worktree
-（`.dev/vllm-0.27.1` 就是这么来的）。换版本重建会清掉 `.venv`，两套环境没法并存。
+版本，覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 临时派生一个只读 worktree
+（用完 `git -C vllm worktree remove` 删掉）。换版本重建会清掉 `.venv`，两套环境没法并存。
 
 **2026-09-15 从 0.27.1 升上来。** 近期 upstream/main 的 vllm-ascend 只支持 vllm 恰好
 0.28.0（101 处 `vllm_version_is("0.28.0")` 守卫）或 main `84030bbe3d`；0.27.1 会在
 `patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups` 缺失而 import 失败。
-`.dev/vllm-0.27.1` 保留着，是给还钉 `ba07e4a48f` 的 `junlin-c8-mxfp` / `junlin-qfa` 用的。
+`junlin-c8-mxfp` / `junlin-qfa` 这两条老分支还钉着 `ba07e4a48f`，要验它们得先把 `vllm/`
+切过去再重建 venv。
 
 ## 能拦住什么
 
