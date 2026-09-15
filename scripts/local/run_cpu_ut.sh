@@ -49,7 +49,9 @@ fi
 if [[ $partial -eq 1 ]]; then
     echo
     echo "只跑了部分用例，跳过基线比对。"
-    exit 0
+    # 没有基线可比，那 pytest 自己的退出码就是唯一判据——不能一律 exit 0，
+    # 否则用例红了、或者路径打错根本没跑，调用方看到的都是 0。
+    exit "$rc"
 fi
 
 current=$(grep -E "^FAILED |^ERROR " "$log" | awk '{print $2}' | sort -u)

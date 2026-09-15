@@ -58,6 +58,8 @@ UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基�
 `run_cpu_ut.sh` 的退出码：0 是与基线一致，1 是比基线新增了失败**或者 pytest 压根没
 跑起来**——pytest 退出码不是 0/1（2 中断、3 内部错误、4 用法/conftest 错误、5 没收集到
 用例）时直接判 RED 并跳过基线比对，否则"一条 FAILED 都没有"会被读成基线里的用例都好了。
+带路径参数只跑一部分时没有基线可比，退出码就是 pytest 自己的——路径打错、用例红了都会
+非 0，不再一律 0。
 
 `tests/ut/<module>/a2|a3_2|310p/` 这些子目录是 NPU 专属的，本机跑不了，也不该跑——
 路由规则见 vllm-ascend 的 `.github/workflows/scripts/test_config.yaml`。
