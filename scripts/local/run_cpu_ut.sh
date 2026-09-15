@@ -34,6 +34,17 @@ fi
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 "$PYTHON" -m pytest -q -p no:cacheprovider "${ignores[@]}" "${targets[@]}" 2>&1 | tee "$log"
+rc=${PIPESTATUS[0]}
+
+# pytest 退出码 0（全过）和 1（有用例失败）之外的一切，都表示测试根本没跑起来：
+# 2 中断、3 内部错误、4 用法/conftest 错误、5 没收集到用例。这些情况下一条 FAILED
+# 都不会打印，下面的基线比对会把"零失败"读成"基线里的用例都好了"，报 GREEN 退出 0。
+# 必须在这里截断。
+if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+    echo
+    echo "RED   pytest 以退出码 $rc 结束，用例没跑起来（collection / conftest 错误之类），基线比对无意义。"
+    exit 1
+fi
 
 if [[ $partial -eq 1 ]]; then
     echo
