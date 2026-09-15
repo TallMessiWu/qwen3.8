@@ -2,12 +2,14 @@
 # 在【本机】（x86_64 + NVIDIA GPU，无 NPU、无 CANN）重建 Qwen3.8 的静态检查 /
 # 数值模拟环境。这不是服务器脚本——服务器侧请用 scripts/setup/install-vllm-ascend.sh。
 #
-# 环境构成，刻意对齐真机容器（py311 + vllm 0.27.1 + torch 2.10.0）：
+# 环境构成，对齐真机（py311 + vllm 0.28.x + torch 2.10.0）：
 #   - Python 3.11
-#   - vllm 0.27.1，从主仓 vllm submodule 的 v0.27.1 worktree 以 VLLM_TARGET_DEVICE=empty
-#     安装：不编译任何 CUDA kernel，不需要 nvcc，装的是与真机一致的那份 Python 源码
+#   - vllm 直接装 `vllm/` submodule 当前的 checkout（跟着 vllm-ascend 的
+#     .github/vllm-main-verified.commit 走），VLLM_TARGET_DEVICE=empty：不编译任何 CUDA
+#     kernel，不需要 nvcc。真机是 pip 装的 0.28.0，与这个 commit 用起来差别不大；真要对
+#     某个确切版本，覆盖 VLLM_REF + VLLM_WORKTREE 派生一个只读 worktree 即可
 #   - torch 2.10.0（PyPI 默认 wheel，自带 CUDA，可用本机 GPU 跑数值等价性验证）
-#   - vllm-ascend 以 editable 方式指向 junlin-c8-mxfp worktree，--no-deps 跳过 torch-npu /
+#   - vllm-ascend 以 editable 方式指向 junlin-c8-mxfp-16278 worktree，--no-deps 跳过 torch-npu /
 #     triton-ascend 这些本机装不了也用不上的依赖
 #
 # torch_npu 不安装：vllm-ascend 的 tests/ut/conftest.py 会在探测不到 npu-smi 时
@@ -16,9 +18,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VLLM_REF="${VLLM_REF:-v0.27.1}"
-VLLM_WORKTREE="${VLLM_WORKTREE:-$REPO_ROOT/.dev/vllm-0.27.1}"
-ASCEND_WORKTREE="${ASCEND_WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-c8-mxfp}"
+# VLLM_WORKTREE 默认就是 submodule 本体，所以 VLLM_REF 只在自定义 worktree 时才用到
+VLLM_REF="${VLLM_REF:-v0.28.0}"
+VLLM_WORKTREE="${VLLM_WORKTREE:-$REPO_ROOT/vllm}"
+ASCEND_WORKTREE="${ASCEND_WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-c8-mxfp-16278}"
 SOC_VERSION="${SOC_VERSION:-ascend910b1}"
 
 cd "$REPO_ROOT"
@@ -26,7 +29,7 @@ cd "$REPO_ROOT"
 command -v uv >/dev/null || { echo "ERROR: 需要 uv，见 https://docs.astral.sh/uv/" >&2; exit 1; }
 [[ -d "$ASCEND_WORKTREE" ]] || { echo "ERROR: 找不到 vllm-ascend worktree: $ASCEND_WORKTREE" >&2; exit 1; }
 
-echo "==> [1/5] vllm $VLLM_REF 只读 worktree"
+echo "==> [1/5] vllm 源码目录"
 if [[ -d "$VLLM_WORKTREE" ]]; then
     echo "    已存在，跳过：$VLLM_WORKTREE"
 else
@@ -36,7 +39,8 @@ else
 fi
 
 echo "==> [2/5] 创建 venv（Python 3.11）"
-uv venv --python 3.11
+# --clear：已有 .venv 时 uv 会直接报错退出，换版本重建必须覆盖
+uv venv --clear --python 3.11
 
 echo "==> [3/5] 同步 PyPI 依赖（torch + 测试/lint 工具）"
 # --inexact：不要移除后面用 uv pip install 装进来的 vllm / vllm-ascend

@@ -74,9 +74,9 @@ git worktree remove ../feat-xxx                        # 收尾清理
 
 ## 本机验证环境（推真机之前先过一遍）
 
-`scripts/local/setup-devenv.sh` 在本机建一套刻意对齐真机容器的 venv：Python 3.11 +
-vllm 0.27.1（`VLLM_TARGET_DEVICE=empty`，不编译 kernel）+ torch 2.10.0（带 CUDA，
-吃 5080）+ editable 的 `vllm-ascend/junlin-c8-mxfp`。`torch_npu` 不装，由 vllm-ascend 自己的
+`scripts/local/setup-devenv.sh` 在本机建一套对齐真机的 venv：Python 3.11 +
+vllm（直接装 `vllm/` submodule 当前的 checkout，`VLLM_TARGET_DEVICE=empty`，不编译 kernel）
++ torch 2.10.0（带 CUDA，吃 5080）+ editable 的 `vllm-ascend/junlin-c8-mxfp-16278`。`torch_npu` 不装，由 vllm-ascend 自己的
 `tests/ut/conftest.py` 在探测不到 `npu-smi` 时注入 MagicMock——跟 CI 的 CPU runner 同一口径。
 
 ```bash
@@ -85,24 +85,19 @@ python scripts/local/check_patch_targets.py     # patch 目标还在不在、参
 bash scripts/local/run_cpu_ut.sh                # CPU 单测 + 跟已知基线比对
 ```
 
-venv 里的 vllm 源码取自 `.dev/vllm-0.27.1`——从 `vllm/` submodule 派生、**钉死在 0.27.1**
-的只读 worktree，`VLLM_REF` / `VLLM_WORKTREE` 可覆盖成别的版本重建。
+venv 的 vllm 直接装 `vllm/` submodule 当前的 checkout，它跟着 vllm-ascend 的
+`.github/vllm-main-verified.commit` 走（当前 `84030bbe3d`）。真机是 pip 装的 0.28.0，
+和这个 commit 用起来差别不大，不必纠结；真要对某个确切版本，覆盖 `VLLM_REF` +
+`VLLM_WORKTREE` 从 submodule 派生一个只读 worktree 即可（`.dev/vllm-0.27.1` 就是这么来的）。
 
-**⚠️ 2026-09-15 起 0.27.1 不再等于真机版本。** 真机装的是 vllm 0.28.0（pip），而
-vllm-ascend 主线钉的是 vllm main `84030bbe3d`（见各分支的
-`.github/vllm-main-verified.commit`）；`vllm/` submodule 现在跟着这个 commit 走，
-`.dev/` 仍停在 0.27.1，两者已经不等价。**查签名前先想清楚要对哪一侧**：对真机行为查
-`vllm/`（即 vllm-ascend 声明支持的版本），`.dev/vllm-0.27.1` 只服务于本机那套还没升级的
-venv。`git -C vllm describe --tags` 随时可核。
-
-上游主线的 vllm-ascend 只支持 **vllm 恰好 0.28.0**（代码里 101 处
-`vllm_version_is("0.28.0")` 守卫）或 **main @ 84030bbe3d**；0.27.1 会在
-`patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups` 缺失而启动失败。所以基于近期
-upstream/main 的分支，本机这套 0.27.1 venv 跑不了单测——等价验证的做法见
-`scripts/local/README.md`。
+**⚠️ 2026-09-15 起 0.27.1 已经不能用了。** 近期 upstream/main 的 vllm-ascend 只支持
+**vllm 恰好 0.28.0**（代码里 101 处 `vllm_version_is("0.28.0")` 守卫）或 **main
+`84030bbe3d`**；0.27.1 会在 `patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups`
+缺失而 import 失败。`.dev/vllm-0.27.1` 保留着，是给还钉 `ba07e4a48f` 的
+`junlin-c8-mxfp` / `junlin-qfa` 用的。换版本重建会清掉 `.venv`，两套环境没法并存。
 （曾经 `vllm/` 停在 v0.28.1rc0、领先真机 1300+ commit，照着它查会得出对不上的结论；
 现在方向反过来了，同样要小心。）
-能拦什么、拦不住什么、已知的 4 条基线失败，见 `scripts/local/README.md`。
+能拦什么、拦不住什么、已知的基线失败（当前 1 条），见 `scripts/local/README.md`。
 
 ## 常用命令（全部在某个 vllm-ascend worktree 目录内执行）
 
@@ -120,7 +115,7 @@ pytest -sv tests/ut/ops/test_prepare_finalize.py::test_prepare_inputs
 pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
 ```
 
-`tests/ut` 里大量用例 import `torch_npu`，本机跑不了；本机改动请靠 lint + 静态阅读把关，真实验证交给服务器。
+`tests/ut` 大量用例 import `torch_npu`，但 `tests/ut/conftest.py` 探测不到 `npu-smi` 时会注入 MagicMock，所以本机能跑（走 `scripts/local/run_cpu_ut.sh`，当前 4374 passed / 1 failed）。e2e 和真实数值仍然只能上服务器。
 
 ## 提交规范
 

@@ -11,7 +11,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-WORKTREE="${WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-c8-mxfp}"
+WORKTREE="${WORKTREE:-$REPO_ROOT/vllm-ascend/junlin-c8-mxfp-16278}"
 BASELINE="${BASELINE:-$REPO_ROOT/scripts/local/ut_baseline.txt}"
 PYTHON="$REPO_ROOT/.venv/bin/python"
 

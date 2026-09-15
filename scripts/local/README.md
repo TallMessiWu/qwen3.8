@@ -16,14 +16,20 @@ source .venv/bin/activate
 | | 真机（容器） | 本机（.venv） |
 | --- | --- | --- |
 | Python | 3.11 | 3.11 |
-| vllm | 0.27.1 | 0.27.1（同一份源码，`VLLM_TARGET_DEVICE=empty` 装，不编译 kernel） |
+| vllm | 0.28.0（pip 装） | `vllm/` submodule 当前的 checkout（`VLLM_TARGET_DEVICE=empty` 装，不编译 kernel） |
 | torch | 2.10.0 + torch-npu | 2.10.0（PyPI 默认 wheel，带 CUDA） |
-| vllm-ascend | editable `junlin-c8-mxfp` | editable `junlin-c8-mxfp`（同一个 worktree） |
+| vllm-ascend | editable `junlin-c8-mxfp-16278` | editable `junlin-c8-mxfp-16278`（同一个 worktree） |
 | torch_npu | 真 NPU | `tests/ut/conftest.py` 自动注入的 MagicMock |
 
-vllm 源码取自 `.dev/vllm-0.27.1`——从 `vllm/` submodule 派生的只读 worktree。
-`vllm/` 本身的 checkout 不受影响（它现在停在 v0.28.1rc0，比真机领先 1300+ commit，
-直接拿它当参考会得出跟真机对不上的结论）。
+`vllm/` 跟着 vllm-ascend 的 `.github/vllm-main-verified.commit` 走（当前 main
+`84030bbe3d`）。真机是 pip 装的 0.28.0，两者用起来差别不大，不必纠结；真要对某个确切
+版本，覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 派生一个只读 worktree
+（`.dev/vllm-0.27.1` 就是这么来的）。换版本重建会清掉 `.venv`，两套环境没法并存。
+
+**2026-09-15 从 0.27.1 升上来。** 近期 upstream/main 的 vllm-ascend 只支持 vllm 恰好
+0.28.0（101 处 `vllm_version_is("0.28.0")` 守卫）或 main `84030bbe3d`；0.27.1 会在
+`patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups` 缺失而 import 失败。
+`.dev/vllm-0.27.1` 保留着，是给还钉 `ba07e4a48f` 的 `junlin-c8-mxfp` / `junlin-qfa` 用的。
 
 ## 能拦住什么
 
@@ -51,7 +57,16 @@ UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基�
 `tests/ut/<module>/a2|a3_2|310p/` 这些子目录是 NPU 专属的，本机跑不了，也不该跑——
 路由规则见 vllm-ascend 的 `.github/workflows/scripts/test_config.yaml`。
 
-### 建立环境时的实测基线（2026-09-03）
+### 当前实测（2026-09-15，vllm `84030bbe3d` + `junlin-c8-mxfp-16278`）
+
+`run_cpu_ut.sh`：**4374 passed / 1 failed / 37 skipped**，约 30 秒。基线已刷成这 1 条
+（`test_ascend_config.py::test_config_modules_do_not_load_vllm_config`）——原来 4 条里
+有 3 条在新 vllm 上自己好了。
+
+`check_patch_targets.py` 在这套环境下**还没重跑**，下面那组数字是 0.27.1 时代的，
+换了 vllm 之后 AMBER/SKIP 的分布肯定变了，别直接拿来当判据。
+
+### 旧基线（2026-09-03，vllm 0.27.1 + `junlin-c8-mxfp`）
 
 `check_patch_targets.py`：75 处 patch 里 GREEN 55 / AMBER 12 / SKIP 8 / RED 0。
 
@@ -64,9 +79,9 @@ UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基�
   patch 往废名字上赋值而静默失效"看起来跟"有意新增属性"一模一样。工具靠
   「patch 前 vllm 上有没有这个名字」把它拎出来，但是哪一种得人来判。
 
-`run_cpu_ut.sh`：2703 passed / 4 failed / 12 skipped，约 20 秒。4 条失败见
-[ut_baseline.txt](ut_baseline.txt)，其中只有一条已确定是本机假象（测试起了子进程，
-子进程不继承 conftest 的 mock），另外三条要跟真机 CI 比对才能定性。
+`run_cpu_ut.sh`：2703 passed / 4 failed / 12 skipped，约 20 秒。那 4 条里只有一条已
+确定是本机假象（测试起了子进程，子进程不继承 conftest 的 mock）——也正是现在仅剩的
+那条；另外三条已随 vllm 升级消失。
 
 ## 已知短板
 
