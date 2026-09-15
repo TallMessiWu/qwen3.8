@@ -243,6 +243,16 @@ Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
   everything after it is downstream noise, which a full graph diff buries.
   Reports ops whose statistics msprobe could not compute first, because an op
   that is invalid in one arm only is already the answer.
+- `scan_capture_timing.py` -- grep for the code shapes behind the "a value got
+  frozen at the wrong moment" bug family: lazy-init guards, done-flags, identity
+  set markers, bool snapshots of properties, and `wait_stream`. ACL graph capture
+  records without executing, so any of these whose first execution lands inside
+  capture leaves a buffer permanently unfilled or a predicate permanently stale;
+  both the long-prompt EOS bug and the MTP acceptance collapse were this. Text
+  matching only, so false positives are expected -- a REVIEW means nobody has
+  checked that line, not that it is wrong. Guard detection is per function body,
+  because a window of lines gets fooled by a neighbouring function's guard.
+  `--noisy` adds in-forward allocation and D2H sync. Pure stdlib, no NPU.
 
 ## setup/ -- build and install
 

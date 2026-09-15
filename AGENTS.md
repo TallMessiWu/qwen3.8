@@ -121,6 +121,20 @@ pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
 
 `tests/ut` 大量用例 import `torch_npu`，但 `tests/ut/conftest.py` 探测不到 `npu-smi` 时会注入 MagicMock，所以本机能跑（走 `scripts/local/run_cpu_ut.sh`，当前 4374 passed / 1 failed）。e2e 和真实数值仍然只能上服务器。
 
+## 仓库专属技能（`.agents/skills/`）
+
+除了通用技能，这三个是本仓踩出来的，开工前按场景挑：
+
+- **`npu-remote-diagnose`** —— 真机故障排查开局。反馈循环在服务器上、一轮几分钟，
+  所以纪律是「每轮排除最多假设」：单变量开关矩阵、哑开关检查、探针纪律（warning 级 /
+  地基探针 / 去重键）、设备侧指纹二分、排除台账与证据分级。通用的 `diagnosing-bugs`
+  假设本机能建 2 秒的紧循环，那个前提在这里不成立。
+- **`graph-capture-timing`** —— 「值在错误的时刻被固定」这一族：编译区里的 Python 求值被烘死、
+  ACL 捕获只记录不执行、捕获期与 replay 期地址不同。长 prompt 吐 EOS 和 MTP 接受率塌都是它。
+  改任何进图代码前先过一遍，配套脚本 `scripts/checks/scan_capture_timing.py`。
+- **`vendor-ascend-op`** —— 算子接入的六道门：vendor / binding / 契约体检 / eager / 进图 / 性能归因。
+  换 CANN 包、vendor 新算子、把算子接进图时用。
+
 ## 提交规范
 
 **每次提交都用 `/gitmoji-commit` 技能**（已复制到 `.agents/skills/gitmoji-commit/`）：中文 subject、`<emoji-code> <type>(<scope>): <subject>` 格式。无需展示命令或等待用户确认，生成后直接提交；完成验证后再使用普通 `git push` 推送。主仓和子仓的提交都走它。
