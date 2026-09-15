@@ -86,9 +86,13 @@ bash scripts/local/run_cpu_ut.sh                # CPU 单测 + 跟已知基线�
 ```
 
 venv 的 vllm 直接装 `vllm/` submodule 当前的 checkout，它跟着 vllm-ascend 的
-`.github/vllm-main-verified.commit` 走（当前 `84030bbe3d`）。真机是 pip 装的 0.28.0，
-和这个 commit 用起来差别不大，不必纠结；真要对某个确切版本，覆盖 `VLLM_REF` +
-`VLLM_WORKTREE` 从 submodule 临时派生一个只读 worktree（用完 `git -C vllm worktree remove` 删掉）。
+`.github/vllm-main-verified.commit` 走（当前 `84030bbe3d`）。真机是 pip 装的 0.28.0；
+**这两者不等价**：本机自报 `0.28.1rc1.dev676+g84030bbe3`，于是 101 处
+`vllm_version_is("0.28.0")` 守卫在本机全为 False、在真机全为 True，本机跑的是另一条
+lane。`VLLM_VERSION=0.28.0` 强行对齐会在 collection 就炸（0.28.0 分支要
+`vllm.model_executor.layers.attention.pcp`，main 已挪到 `vllm.v1.attention.ops.pcp`），
+要验 0.28.0 那条分支只能覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 临时派生一个
+只读 worktree 重建 venv（用完 `git -C vllm worktree remove` 删掉）。
 
 **⚠️ 2026-09-15 起 0.27.1 已经不能用了。** 近期 upstream/main 的 vllm-ascend 只支持
 **vllm 恰好 0.28.0**（代码里 101 处 `vllm_version_is("0.28.0")` 守卫）或 **main

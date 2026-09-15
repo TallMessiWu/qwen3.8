@@ -40,7 +40,7 @@ source .venv/bin/activate
 | patch 替换实现与 vllm 原函数签名漂移 | NPU 内存/图模式/多卡通信 |
 | `tests/ut` 里 CPU 那部分的逻辑回归 | 性能（FD 编译期开关那类问题） |
 | shape / 切分轴 / tiling 参数的算术错误 | CANN 版本相关的行为差异 |
-| import 期错误、语法错误、类型错误 | |
+| import 期错误、语法错误、类型错误 | 101 处 `vllm_version_is("0.28.0")` 守卫里的真机分支 |
 
 ## 用法
 
@@ -55,6 +55,10 @@ bash scripts/local/run_cpu_ut.sh tests/ut/ops        # 只跑一部分
 UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基线
 ```
 
+`run_cpu_ut.sh` 的退出码：0 是与基线一致，1 是比基线新增了失败**或者 pytest 压根没
+跑起来**——pytest 退出码不是 0/1（2 中断、3 内部错误、4 用法/conftest 错误、5 没收集到
+用例）时直接判 RED 并跳过基线比对，否则"一条 FAILED 都没有"会被读成基线里的用例都好了。
+
 `tests/ut/<module>/a2|a3_2|310p/` 这些子目录是 NPU 专属的，本机跑不了，也不该跑——
 路由规则见 vllm-ascend 的 `.github/workflows/scripts/test_config.yaml`。
 
@@ -64,28 +68,38 @@ UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基�
 （`test_ascend_config.py::test_config_modules_do_not_load_vllm_config`）——原来 4 条里
 有 3 条在新 vllm 上自己好了。
 
-`check_patch_targets.py` 在这套环境下**还没重跑**，下面那组数字是 0.27.1 时代的，
-换了 vllm 之后 AMBER/SKIP 的分布肯定变了，别直接拿来当判据。
+`check_patch_targets.py`：84 处 patch 里 **GREEN 60 / AMBER 13 / NEW 3 / SKIP 8 / RED 0**。
 
-### 旧基线（2026-09-03，vllm 0.27.1 + `junlin-c8-mxfp`）
+- **AMBER**（13 条）是参数列表对不上，多数是有意适配，但每条都该能说出为什么。
+  当前这批：`FusedMoEFactory` ×2、`DeepseekV2MLAAttention.__init__` 少
+  `non_causal_multi_token_decode`、`preprocess_mamba` 少 `align_ctx`、
+  `Qwen3NextAttention.forward` 多 `output`、`apply_sampling_constraints` 多 `top_k`、
+  `rejection_sample` 换入参、`build_attn_metadata`、`DFlashCudaGraphManager`、
+  `SpeculatorCudaGraphManager`、`InputBatch` ×2 多
+  `seq_lens_np`/`attn_state`/`is_dummy`、`DeepseekV32IndexerCache.get_attn_backend`
+  的 `self`→`_self`。
+- **NEW**（3 条）全在 `patch_mamba_utils.py:546-548`（`prepare_mamba_copy_by_layer` /
+  `do_mamba_copy_block_for_layer` / `finish_mamba_copy_by_layer`）。NEW 不等于安全：
+  monkeypatch 赋值一定会把属性创建出来，所以"目标已改名、patch 往废名字上赋值而静默
+  失效"看起来跟"有意新增属性"一模一样。工具靠「patch 前 vllm 上有没有这个名字」把它
+  拎出来，但是哪一种得人来判。
+- **SKIP**（8 条）全是 `patch_v2/patch_triton.py`，承载它的模块本机没加载：
+  `patch/worker/__init__.py` 有 `if HAS_TRITON:` 守卫，而 conftest 把 `triton.runtime`
+  换成了 MagicMock，本机 `HAS_TRITON` 恒为 False。这批只有真机能判。
 
-`check_patch_targets.py`：75 处 patch 里 GREEN 55 / AMBER 12 / SKIP 8 / RED 0。
-
-- **AMBER** 是参数列表对不上，多数是有意适配（`rejection_sample` 换了入参、
-  `InputBatch` 多了 `seq_lens_np`/`attn_state`/`is_dummy` 等），但每条都该能说出为什么。
-- **SKIP** 是承载 patch 的模块本机没加载：`patch/worker/__init__.py` 有
-  `if HAS_TRITON:` 守卫，而 conftest 把 `triton.runtime` 换成了 MagicMock，
-  本机 `HAS_TRITON` 恒为 False。这批只有真机能判。
-- **NEW** 不等于安全：monkeypatch 赋值一定会把属性创建出来，所以"目标已改名、
-  patch 往废名字上赋值而静默失效"看起来跟"有意新增属性"一模一样。工具靠
-  「patch 前 vllm 上有没有这个名字」把它拎出来，但是哪一种得人来判。
-
-`run_cpu_ut.sh`：2703 passed / 4 failed / 12 skipped，约 20 秒。那 4 条里只有一条已
-确定是本机假象（测试起了子进程，子进程不继承 conftest 的 mock）——也正是现在仅剩的
-那条；另外三条已随 vllm 升级消失。
+0.27.1 时代的对照（2026-09-03，`junlin-c8-mxfp`）：patch 体检 75 处 GREEN 55 /
+AMBER 12 / SKIP 8 / RED 0，单测 2703 passed / 4 failed / 12 skipped。
 
 ## 已知短板
 
+- **`vllm_version_is("0.28.0")` 在本机恒为 False**，也就是那 101 处守卫本机走的全是
+  另一条分支。真机 pip 装的是 0.28.0，守卫全 True；本机装的是 `vllm/` 的 main
+  checkout，自报 `0.28.1rc1.dev676+g84030bbe3`，`Version(...) == Version("0.28.0")`
+  不成立，守卫全 False。想用 `VLLM_VERSION=0.28.0` 强行对齐也不行——0.28.0 分支的
+  `attention_v1.py` 要 import `vllm.model_executor.layers.attention.pcp`，而 main 已
+  把它挪到 `vllm.v1.attention.ops.pcp`，pytest 直接以退出码 4 死在 collection
+  （`utils.py:_vllm_empty_device_matches_release` 的注释就是拿 PCP 的位置区分两条 lane
+  的）。要验 0.28.0 那条分支，只能把 `vllm/` 切到 v0.28.0 再重建 venv。
 - **子进程拿不到 mock**。conftest 是往当前进程的 `sys.modules` 里塞 mock，
   测试里 `subprocess.run([sys.executable, "-c", ...])` 起的子进程一律看不到，
   一 import `torch_npu` 就炸。

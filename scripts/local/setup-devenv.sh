@@ -6,8 +6,10 @@
 #   - Python 3.11
 #   - vllm 直接装 `vllm/` submodule 当前的 checkout（跟着 vllm-ascend 的
 #     .github/vllm-main-verified.commit 走），VLLM_TARGET_DEVICE=empty：不编译任何 CUDA
-#     kernel，不需要 nvcc。真机是 pip 装的 0.28.0，与这个 commit 用起来差别不大；真要对
-#     某个确切版本，覆盖 VLLM_REF + VLLM_WORKTREE 派生一个只读 worktree 即可
+#     kernel，不需要 nvcc。真机是 pip 装的 0.28.0，与这个 commit【不等价】：101 处
+#     vllm_version_is("0.28.0") 守卫本机全 False、真机全 True，本机跑的是另一条 lane
+#     （见 README「已知短板」）。要验 0.28.0 那条分支，覆盖 VLLM_REF + VLLM_WORKTREE
+#     派生一个只读 worktree 重建
 #   - torch 2.10.0（PyPI 默认 wheel，自带 CUDA，可用本机 GPU 跑数值等价性验证）
 #   - vllm-ascend 以 editable 方式指向 junlin-c8-mxfp-16278 worktree，--no-deps 跳过 torch-npu /
 #     triton-ascend 这些本机装不了也用不上的依赖
@@ -73,6 +75,13 @@ if torch.cuda.is_available():
     print(f"gpu         : {torch.cuda.get_device_name(0)}  sm_{cap[0]}{cap[1]}")
 print(f"vllm        : {md.version('vllm')}  ({importlib.util.find_spec('vllm').origin})")
 print(f"vllm-ascend : {md.version('vllm-ascend')}  ({importlib.util.find_spec('vllm_ascend').origin})")
+
+# 101 处 vllm_version_is("0.28.0") 守卫走哪条分支，决定了本机测的是不是真机那套代码。
+# 只比版本字符串，不 import vllm_ascend（那要 torch_npu）。
+from packaging.version import Version
+
+lane = "0.28.0（与真机同）" if Version(md.version("vllm").split("+")[0]) == Version("0.28.0") else "main（与真机不同）"
+print(f"version lane: {lane}")
 PY
 
 cat <<'TIP'
