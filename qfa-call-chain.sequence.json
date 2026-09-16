@@ -1,0 +1,300 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Qwen3.8 QFA 调用链路：Prefill 与 Decode",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1560,
+      672
+    ],
+    "views": [
+      {
+        "id": "before-qfa",
+        "label": "QFA 之前",
+        "focus": [
+          "runner",
+          "attn",
+          "impl",
+          "quant",
+          "kv"
+        ],
+        "note": "Q/K 动态量化、V 静态量化，K/V 与 K scale 先按 PA_NZ 写进分页缓存。"
+      },
+      {
+        "id": "dual-op",
+        "label": "QFA 双算子",
+        "focus": [
+          "impl",
+          "meta",
+          "qfa",
+          "kv"
+        ],
+        "note": "metadata 算子在 AICPU 出负载均衡 plan，主算子在 AICore 直接读分页缓存。"
+      },
+      {
+        "id": "phase-split",
+        "label": "两阶段分叉",
+        "focus": [
+          "runner",
+          "impl",
+          "meta",
+          "qfa"
+        ],
+        "note": "同一条链路，差异集中在图模式、mask_mode 与 layout_q_descale 三处。"
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "NPUModelRunner"
+    },
+    {
+      "id": "attn",
+      "type": "frontend",
+      "label": "全注意力层"
+    },
+    {
+      "id": "impl",
+      "type": "backend",
+      "label": "C8MXFP Impl"
+    },
+    {
+      "id": "quant",
+      "type": "cloud",
+      "label": "MX 量化算子"
+    },
+    {
+      "id": "kv",
+      "type": "database",
+      "label": "PA_NZ 分页缓存"
+    },
+    {
+      "id": "meta",
+      "type": "cloud",
+      "label": "QFA metadata"
+    },
+    {
+      "id": "qfa",
+      "type": "cloud",
+      "label": "QFA 主算子"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 348,
+      "label": "QFA 之前：元数据、量化与写页"
+    },
+    {
+      "from": 354,
+      "to": 540,
+      "label": "QFA 双算子：AICPU 出 plan，AICore 读页"
+    },
+    {
+      "from": 546,
+      "to": 606,
+      "label": "QFA 之后：回到模型"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m-meta",
+      "from": "runner",
+      "to": "impl",
+      "y": 172,
+      "label": "AscendMetadata：block_tables / slot_mapping / 持久长度缓冲",
+      "variant": "emphasis",
+      "note": "AscendC8MXFPMetadataBuilder 先判 attn_state（全新 prompt → PrefillNoCache，每请求 1 token → DecodeOnly，开 MTP 则 SpecDecoding），再按 512 token 的页宽建 block table；query_start_loc_gpu 与 seq_lens_gpu 是每步原地刷新的持久 int32 缓冲。"
+    },
+    {
+      "id": "m-graph",
+      "from": "runner",
+      "to": "attn",
+      "y": 204,
+      "label": "eager 或 FULL 图重放",
+      "variant": "emphasis",
+      "note": "prefill 走 eager；decode 由 npugraph_ex 原生捕获整段 QFA 后重放。PIECEWISE 下 QFA 在编译区之外按普通调用执行。"
+    },
+    {
+      "id": "m-call",
+      "from": "attn",
+      "to": "impl",
+      "y": 236,
+      "label": "impl.forward(q, k, v)",
+      "variant": "default",
+      "note": "qkv_proj → q_norm / k_norm → RoPE 之后，经 unified_attention_with_output 把 q/k/v 与预分配 output 交给 impl。"
+    },
+    {
+      "id": "m-quant",
+      "from": "impl",
+      "to": "quant",
+      "y": 268,
+      "label": "Q/K 动态量化，V 按权重 scale 静态量化",
+      "variant": "default",
+      "note": "npu_dynamic_mx_quant 出 FP8 E4M3 与 TND 布局的 E8M0 per-token-group scale；V 用检查点里的 per-channel E8M0。KV 共享层不量化也不写页。"
+    },
+    {
+      "id": "m-ret",
+      "from": "quant",
+      "to": "impl",
+      "y": 300,
+      "label": "FP8 E4M3 + E8M0 scale",
+      "variant": "return"
+    },
+    {
+      "id": "m-scatter",
+      "from": "impl",
+      "to": "kv",
+      "y": 332,
+      "label": "PA_NZ scatter：K/V 页 + K scale",
+      "variant": "emphasis",
+      "note": "prefill 写整段 prompt，decode 每请求 1 行；V 的静态 scale 每个 cache 实例只广播一次，且捕获期不得标记已填充。"
+    },
+    {
+      "id": "m-len",
+      "from": "impl",
+      "to": "meta",
+      "y": 364,
+      "label": "cu_seqlens_q / seqused_kv 图内推导",
+      "variant": "default",
+      "note": "clamp + cummax 都是被捕获的设备算子，每次重放对刷新后的持久缓冲重算一遍。"
+    },
+    {
+      "id": "m-kernel",
+      "from": "impl",
+      "to": "meta",
+      "y": 396,
+      "label": "prefill：CAUSAL + TND ｜ decode：NO_MASK + N2TGD",
+      "variant": "emphasis",
+      "note": "由 max_query_len 决定：等于 1 就丢掉 mask；G·Q_S ≤ 80 时 q scale 转 N2TGD，选中 decode 模板。MTP verify 步 Q_S = 1 + num_spec，保留 CAUSAL 但仍走 N2TGD。"
+    },
+    {
+      "id": "m-plan",
+      "from": "meta",
+      "to": "impl",
+      "y": 428,
+      "label": "AICPU 负载均衡 plan",
+      "variant": "return",
+      "note": "plan 与层无关，一步内每个 plan_key 只算一次，全部全注意力层共用。"
+    },
+    {
+      "id": "m-qfa",
+      "from": "impl",
+      "to": "qfa",
+      "y": 460,
+      "label": "quant_flash_attn(q_fp8, NZ 视图, 三组 scale, block_table)",
+      "variant": "emphasis",
+      "note": "整批 prefill 与 decode 共一次调用，cu_seqlens_q 覆盖全批。"
+    },
+    {
+      "id": "m-read",
+      "from": "qfa",
+      "to": "kv",
+      "y": 492,
+      "label": "按 block_table 读页与 scale",
+      "variant": "dashed"
+    },
+    {
+      "id": "m-out",
+      "from": "qfa",
+      "to": "impl",
+      "y": 524,
+      "label": "attn_out（TND）",
+      "variant": "return"
+    },
+    {
+      "id": "m-write",
+      "from": "impl",
+      "to": "attn",
+      "y": 556,
+      "label": "写回 output",
+      "variant": "return"
+    },
+    {
+      "id": "m-next",
+      "from": "attn",
+      "to": "runner",
+      "y": 588,
+      "label": "o_proj → 下一层",
+      "variant": "return",
+      "note": "attn_output × sigmoid(gate) 后过 o_proj 回到残差流；末层之后是 LM head 与采样。"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "attn",
+      "from": 198,
+      "to": 596,
+      "type": "frontend"
+    },
+    {
+      "participant": "impl",
+      "from": 230,
+      "to": 562,
+      "type": "backend"
+    },
+    {
+      "participant": "quant",
+      "from": 262,
+      "to": 308,
+      "type": "cloud"
+    },
+    {
+      "participant": "kv",
+      "from": 326,
+      "to": 338,
+      "type": "database"
+    },
+    {
+      "participant": "kv",
+      "from": 486,
+      "to": 498,
+      "type": "database"
+    },
+    {
+      "participant": "meta",
+      "from": 358,
+      "to": 436,
+      "type": "cloud"
+    },
+    {
+      "participant": "qfa",
+      "from": 454,
+      "to": 532,
+      "type": "cloud"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "一步只调一次",
+      "items": [
+        "decode 与 prefill 的请求共用同一次 QFA 调用，cu_seqlens_q 覆盖整批",
+        "PrefillNoCache 也从分页缓存里读：写页在注意力之前已经完成",
+        "metadata plan 与长度推导一步只做一次，全部全注意力层共用"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "两个阶段的三处分叉",
+      "items": [
+        "图模式：prefill eager 执行，decode 重放 FULL 图",
+        "mask_mode：max_query_len 为 1 用 NO_MASK，否则 CAUSAL",
+        "layout_q_descale：G·Q_S ≤ 80 转 N2TGD 选 decode 模板，否则留 TND 走 prefill 模板"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "捕获期的两条纪律",
+      "items": [
+        "长度推导必须留在捕获区内，Python 侧刷新的缓冲重放时不会再更新",
+        "V 静态 scale 的 copy 在捕获期只被记录不执行，此时标记已填充会让 V 永远反量化成零"
+      ]
+    }
+  ]
+}
