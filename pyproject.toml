@@ -55,6 +55,8 @@ lint = [
     "ruff",
     "types-pyyaml",
     "types-psutil",
+    # vllm-ascend 的 format.sh 就是 pre-commit；放进依赖组，重建 venv 后不用再手装
+    "pre-commit",
 ]
 
 [tool.ruff]
