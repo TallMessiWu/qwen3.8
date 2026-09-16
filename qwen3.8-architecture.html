@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="可切换、可下钻的 Qwen3.8-2.4T-A95B 与 Qwen3.8-27B 模型架构图：观察请求、token、tensor 与 matrix 在模块内部的连续变化。">
+  <meta name="description" content="可切换、可下钻的 Qwen3.8-2.4T-A95B、Qwen3.8-27B 与 Qwen3.8-Flash-Next 模型架构图：观察请求、token、tensor 与 matrix 在模块内部的连续变化。">
   <title>Qwen 模型架构交互图</title>
   <style>
     :root{
@@ -76,7 +76,21 @@
     .mixer-chip.attn{background:var(--purple2);color:#4a35a0;border-left-color:var(--purple)}
     .moe-chip{background:var(--orange2);color:#99401d;font-size:11px;border-left:4px solid var(--orange)}
     .ffn-chip{background:var(--green2);color:#175936;font-size:11px;border-left:4px solid var(--green)}
-    .mixer-chip:hover,.moe-chip:hover,.ffn-chip:hover{filter:saturate(1.25);outline:2px solid var(--blue)}.decoder-times{display:grid;place-content:center;border-left:4px solid var(--blue);background:var(--blue2);color:var(--blue);font:900 23px/1 var(--display);text-align:center}.decoder-times small{display:block;margin-top:4px;color:#315b9a;font:800 10px var(--mono)}
+    .layer-stack.hc{grid-template-rows:46px 30px 21px}
+    .gres-chip{min-width:0;overflow:hidden;border:0;cursor:pointer;display:grid;place-content:center;padding:0 3px;text-align:center;font-family:var(--mono);font-weight:850;line-height:1.2;font-size:9.5px;background:var(--blue2);color:var(--blue);border-left:4px solid var(--blue)}
+    .gres-chip:hover{filter:saturate(1.25);outline:2px solid var(--blue)}
+    .once-note{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin:11px 0 0;padding:9px 12px;border-left:4px solid var(--green);background:var(--green2);border-radius:0 9px 9px 0;min-width:0}
+    .once-note b{flex:0 0 auto;font:800 12.5px var(--display);color:#175936}
+    .once-note span{flex:1 1 240px;min-width:0;font:600 11.5px/1.5 var(--mono);color:#26583f}
+    .once-note button{flex:0 0 auto}
+    .stream-lane{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+    .stream-lane i{flex:1 1 60px;min-width:0;display:grid;place-content:center;height:34px;border-radius:7px;font:800 10.5px var(--mono);font-style:normal;background:var(--blue2);color:var(--blue);border:1.5px solid rgba(49,91,154,.28)}
+    .stream-lane i.hot{background:var(--gold2);color:#8a5b09;border-color:rgba(176,124,20,.4)}
+    .block-row{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+    .block-row i{flex:0 0 auto;display:grid;place-content:center;width:26px;height:26px;border-radius:5px;font:800 9.5px var(--mono);font-style:normal;background:#e4eae8;color:#5d6b66}
+    .block-row i.pick{background:var(--purple2);color:#4a35a0;box-shadow:0 0 0 1.5px var(--purple)}
+    .block-row i.tail{background:var(--gold2);color:#8a5b09;box-shadow:0 0 0 1.5px var(--gold)}
+    .mixer-chip:hover,.moe-chip:hover,.ffn-chip:hover,.gres-chip:hover{filter:saturate(1.25);outline:2px solid var(--blue)}.decoder-times{display:grid;place-content:center;border-left:4px solid var(--blue);background:var(--blue2);color:var(--blue);font:900 23px/1 var(--display);text-align:center}.decoder-times small{display:block;margin-top:4px;color:#315b9a;font:800 10px var(--mono)}
     /* 移动载荷：停在卡片下方的通道里，用尖角指回当前模块，绝不遮挡卡片内容 */
     .travelling-payload{position:absolute;z-index:6;left:0;top:0;width:304px;padding:8px 10px 9px;border:2px solid var(--blue);background:#fff;box-shadow:0 8px 20px rgba(7,95,247,.18);pointer-events:none;transform:translate3d(0,0,0);transition:transform .88s cubic-bezier(.4,0,.15,1),opacity .22s}
     .travelling-payload.is-travelling{border-style:dashed;box-shadow:0 6px 14px rgba(7,95,247,.13)}
@@ -145,6 +159,8 @@
     .op-par-lane>small{display:block;margin-bottom:7px;color:var(--muted);font-size:12.5px;line-height:1.5}
     /* 并行分支宽度只有整行一半，张量数值降一档避免被裁 */
     .op-par-lane .tensor-grid span{font-size:9.5px;padding:5px 1px}
+    /* 同上：dec-probe 里两块 8 列面板并排，窄容器下均分到 31px 装不下 5 位数值；降一档字号而不是改列数 */
+    .dec-probe .tensor-grid span{font-size:9.5px;padding:5px 1px}
     .op-par-lane .tensor-meta,.op-par-lane .tensor-axis{font-size:9px}
     .op-par-tag{display:inline-block;margin-bottom:8px;padding:3px 6px;background:var(--blue2);color:var(--blue);font:800 10.5px var(--mono);letter-spacing:.05em}
     /* decoder structural overview reflow */
@@ -154,7 +170,7 @@
     .dec-copy>b{display:block;font:800 17.5px var(--display);margin-top:2px}
     .dec-copy p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.6}
     .dec-copy p b{color:var(--ink);font-weight:800}
-    .dec-recipe{flex:0 0 auto;display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px;align-items:stretch;padding:8px;border:1px solid var(--line2);background:#f8faf9;min-width:min(520px,100%)}
+    .dec-recipe{flex:0 0 auto;display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px;align-items:stretch;padding:8px;border:1px solid var(--line2);background:#f8faf9;min-width:min(584px,100%)}
     .dec-probe{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;margin-top:22px}.dec-probe .data-node{flex:1 1 300px;min-width:250px}
 
     /* request */
@@ -205,7 +221,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><b id="brandModel">Qwen3.8</b><select class="model-select" id="modelSelect" aria-label="切换模型"><option value="q38">Qwen3.8 · 2.4T-A95B</option><option value="q35">Qwen3.8 · 27B Dense</option></select><span class="model-status" id="modelStatus">官方配置</span></div>
+    <div class="brand"><b id="brandModel">Qwen3.8</b><select class="model-select" id="modelSelect" aria-label="切换模型"><option value="q38">Qwen3.8 · 2.4T-A95B</option><option value="q35">Qwen3.8 · 27B Dense</option><option value="qflash">Qwen3.8 · Flash-Next</option></select><span class="model-status" id="modelStatus">官方配置</span></div>
     <div class="crumbs"><button type="button" id="homeCrumb" disabled>模型总图</button><i>/</i><b id="crumbCurrent">请求到输出</b></div>
     <div class="top-actions"><button type="button" class="ui-btn" id="parentBtn" hidden>返回 Decoder</button><button type="button" class="ui-btn" id="prevModuleBtn" hidden>← 上一模块</button><button type="button" class="ui-btn primary" id="nextModuleBtn" hidden>下一模块 →</button><i class="nav-sep" id="navSep" hidden></i><button type="button" class="ui-btn" id="pauseBtn" hidden>暂停变换</button><button type="button" class="ui-btn" id="replayBtn" hidden>重播当前变换</button><button type="button" class="ui-btn" id="overviewBtn" hidden>返回总图</button></div>
   </header>
@@ -224,7 +240,7 @@
       <section class="ins-section"><div class="ins-label">输入 → 输出</div><div class="io-list" id="insIO"></div></section>
       <section class="ins-section"><div class="ins-label">核心操作</div><div class="formula" id="insFormula"></div></section>
       <section class="ins-section"><div class="ins-label">数值可信度</div><div class="badges" id="insBadges"></div><p class="ins-copy" id="insEvidence"></p></section>
-      <section class="ins-section"><div class="ins-label">图例</div><div class="legend"><div><i style="--c:var(--green)"></i><span>文字、token、Dense FFN 与服务边界</span></div><div><i style="--c:var(--cyan)"></i><span>Gated DeltaNet / 线性注意力</span></div><div><i style="--c:var(--purple)"></i><span>Gated GQA / 全注意力</span></div><div><i style="--c:var(--orange)"></i><span id="orangeLegend">MoE 路由、专家和采样</span></div><div><i style="--c:var(--blue)"></i><span id="hiddenLegend">8192 维残差流和确定 shape</span></div></div></section>
+      <section class="ins-section"><div class="ins-label">图例</div><div class="legend"><div><i style="--c:var(--green)"></i><span>文字、token、Dense FFN 与服务边界</span></div><div><i style="--c:var(--cyan)"></i><span>Gated DeltaNet / 线性注意力</span></div><div><i style="--c:var(--purple)"></i><span id="purpleLegend">Gated GQA / 全注意力</span></div><div><i style="--c:var(--orange)"></i><span id="orangeLegend">MoE 路由、专家和采样</span></div><div><i style="--c:var(--blue)"></i><span id="hiddenLegend">8192 维残差流和确定 shape</span></div></div></section>
       <section class="ins-section"><div class="ins-label">一手依据</div><div class="ins-links" id="sourceLinks"></div></section>
       <section class="ins-section"><div class="warning" id="boundaryWarning"><strong>边界：</strong>页面未加载模型权重。架构、shape 和操作顺序来自配置/实现；所有内部数值均为明确标注的教学样例。</div></section>
     </aside>
@@ -253,7 +269,7 @@
       const samplePrompt='解释 Gated DeltaNet 如何更新状态。';
       const mainFlow=['request','tokenizer','embedding','decoder','norm','lmhead','sampler','output'];
       const decoderFlow=['gdn','attention','moe'];
-      const shortLabel={request:'请求',tokenizer:'Processor',vision:'Vision',embedding:'Embedding',decoder:'Decoder',norm:'Final Norm',gdn:'GDN',attention:'GQA',moe:'MoE',ffn:'Dense FFN',lmhead:'LM Head',sampler:'Sampler',output:'Output'};
+      const shortLabel={request:'请求',tokenizer:'Processor',vision:'Vision',embedding:'Embedding',decoder:'Decoder',norm:'Final Norm',gdn:'GDN',attention:'GQA',qsa:'QSA',gres:'门控残差',ngram:'N-gram 嵌入',moe:'MoE',ffn:'Dense FFN',lmhead:'LM Head',sampler:'Sampler',output:'Output'};
       const moduleSpecs=[
         {key:'request',label:'Request + Template',sub:'短请求进入；完整 JSON 可点开看',shape:'messages → control text',op:'apply_chat_template'},
         {key:'tokenizer',label:'Tokenizer',sub:'字符串被切分并映射为整数 ID',shape:'text → input_ids [1,T]',op:'tokenize + vocab lookup'},
@@ -361,9 +377,52 @@
         lmhead:{title:'Final Norm 与 LM Head',scope:'MODEL OUTPUT',copy:'第 64 层最后一个位置的 5,120 维 hidden 经 Final RMSNorm 后投影到 248,320 词表 logits；LM Head 不与 Embedding 绑权。',io:[['输入','x₆₄,last [B,5120]'],['权重','[248320,5120]'],['输出','logits [B,248320]']],formula:'logits=Wlm_head·RMSNorm(x₆₄,last)',badges:['fact','impl','demo'],evidence:'shape 与 tie_word_embeddings=false 来自 config；候选词、权重切片和 logits 数值是教学示例。'},
         sampler:{title:'Logits Processor 与采样',scope:'SERVING ENGINE',copy:'服务层把 logits 变成概率、应用请求过滤规则并抽取一个 token；处理顺序与随机数属于推理引擎。',io:[['输入','logits [248320]'],['输出','one token ID']],formula:'p=softmax(process(logits)/T); token~Categorical(p)',badges:['engine','demo'],evidence:'这里沿用一组教学采样参数；它不是 27B 模型结构。'},
         output:{title:'Detokenize 与流式输出',scope:'TOKEN / SERVICE BOUNDARY',copy:'采样 ID 增量解码为文字；未停止时，它作为下一次 Decode 输入，下一轮 forward 后 cache 才包含该 token。',io:[['输入','accepted token IDs'],['输出','UTF-8 / SSE events']],formula:'emit y₁ → Decode(input=y₁,cache=P) → cache=P+y₁ → sample y₂',badges:['impl','engine','demo'],evidence:'回环时序与 Qwen3.8 相同；具体 token pieces 与服务事件为教学示例。'}
-      };      const profiles={
-        q38:{brand:'Qwen3.8',shortName:'Qwen3.8-2.4T-A95B',status:'官方配置',pending:false,hidden:8192,layers:92,repeats:23,mainFlow,decoderFlow,moduleSpecs,payloadStates,meta,title:'一个请求怎样穿过 Qwen3.8-2.4T-A95B',subtitle:'点击任意模块进入内部；Decoder 可继续下钻 Gated DeltaNet、Gated GQA 和 Sparse MoE。',sources:[['官方模型卡','https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B'],['官方 config.json','https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/main/config.json'],['Transformers MoE 参考实现','https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py']]},
-        q35:{brand:'Qwen3.8',shortName:'Qwen3.8-27B',status:'官方配置',pending:false,hidden:5120,layers:64,repeats:16,mainFlow:q35MainFlow,decoderFlow:q35DecoderFlow,moduleSpecs:q35ModuleSpecs,payloadStates:q35PayloadStates,meta:q35Meta,title:'一个图文请求怎样穿过 Qwen3.8-27B',subtitle:'本次选择图文请求来展示完整视觉塔；纯文本可跳过 Vision Encoder。Decoder 可继续下钻 GDN、GQA 与 Dense FFN。',sources:[['官方模型卡','https://huggingface.co/Qwen/Qwen3.8-27B'],['官方 config.json','https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/config.json'],['Transformers Dense 参考实现','https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py']]}
+      };      const qfMainFlow=['request','tokenizer','vision','embedding','decoder','norm','lmhead','sampler','output'];
+      const qfDecoderFlow=['ngram','gres','gdn','qsa','moe'];
+      const qfModuleSpecs=[
+        {key:'request',label:'Multimodal Request',sub:'图文请求；Flash-Next 本体就是多模态',shape:'messages + image → control text',op:'validate + apply_chat_template'},
+        {key:'tokenizer',label:'Processor',sub:'文本变 IDs；图像变 patch tensor',shape:'text + image → ids + patches',op:'tokenize + resize + patchify'},
+        {key:'vision',label:'Vision Encoder',sub:'27 层 ViT 编码并投影到 2560',shape:'patches → visual embeddings',op:'27×ViT + spatial merge + projection'},
+        {key:'embedding',label:'Embedding + 残差加宽',sub:'查表、并入视觉，再复制成 4 条支流',shape:'[1,S,2560] → [1,S,10240]',op:'E[ids] → fuse → repeat ×4'},
+        {key:'decoder',label:'48-layer Decoder',sub:'四层配方重复 12 次；每层两道门控残差',shape:'4 layers × 12',op:'12 × [3(GDN→MoE)+1(QSA→MoE)]'},
+        {key:'norm',label:'分支合流',sub:'4 条支流读成一条；归一化就长在这里',shape:'[1,S,10240] → [1,S,2560]',op:'hyper_connection_mixer'},
+        {key:'lmhead',label:'LM Head',sub:'hidden 投影到全部词表位置',shape:'2560 → 248320',op:'Wlm · hidden'},
+        {key:'sampler',label:'Sampler',sub:'logits 变概率并选出 token',shape:'logits → p → ID',op:'processors + softmax + sample'},
+        {key:'output',label:'Output loop',sub:'token 拼成文本；未停止则回环',shape:'ID → UTF-8',op:'detokenize + stream'}
+      ];
+      const qfPayloadStates=[
+        {title:'图文请求',kind:'json',shape:'messages[] + image',text:'{ text: "这张图讲了什么", image: ◫ }'},
+        {title:'模板化多模态输入',kind:'text',shape:'control text + image ref',text:'<|im_start|>user · <vision> · 这张图讲了什么'},
+        {title:'处理器输出 bundle',kind:'ids',shape:'ids:[1,T] · patches:[Np,1536]',values:[248044,248053,248056,248054,391,72],cols:3},
+        {title:'visual embeddings + IDs',kind:'tensor',shape:'v:[Nv,2560] · ids:[1,T]',values:[-.21,.38,.06,-.24,.30,-.12,.47,.09],cols:4},
+        {title:'加宽残差流 H₀',kind:'tensor',shape:'[1,S,10240] = 4×2560',values:[-.33,.19,.14,-.26,-.33,.19,.14,-.26],cols:4},
+        {title:'decoder 残差流 H₄₈',kind:'tensor',shape:'[1,S,10240]',values:[.58,-.14,.33,.19,.71,-.09,.28,.24],cols:4},
+        {title:'合流后的 hidden',kind:'tensor',shape:'[1,S,2560]',values:[.74,-1.18,.39,1.02,-.51,.23,1.31,-.77],cols:4},
+        {title:'candidate logits',kind:'logits',shape:'[1,248320]',values:[13.12,12.64,12.11,11.66,11.19,10.74],cols:3},
+        {title:'概率与采样结果',kind:'prob',shape:'p:[1,248320] → ID',values:[.294,.178,.106,.063,.038,.023],cols:3,text:'sample → “微块”'},
+        {title:'输出文字',kind:'result',shape:'UTF-8 text',text:'微块稀疏注意力把长上下文压到 2048 个 token'}
+      ];
+      const qfMeta={
+        overview:{title:'Qwen3.8-Flash-Next',scope:'WHOLE MODEL',copy:'官方称它是 Qwen4 架构的实验预览版。48 层 = 12 × [3 Gated DeltaNet + 1 Qwen Sparse Attention]，每层接 512 专家的 Sparse MoE。相对前两个模型有三处结构性改动：QSA 微块稀疏注意力、四分支 Gated Residual、层 2 的 N-gram 嵌入。Qwen Cloud 上的 “Qwen3.8-Flash” 是基于它的服务版。',io:[['参数','125B 总 / 6B 激活'],['另计','51B n-gram + 4B MTP'],['hidden','2560（残差流 4×2560）'],['骨干','48 层 = 36 GDN + 12 QSA'],['每层','mixer → MoE，各带门控残差'],['上下文','262144 native · 可扩到 1M'],['Logits','[B,S,248320]']],formula:'Processor → Vision + Embedding → repeat×4 → 12×[3(GDN→MoE)+1(QSA→MoE)] → 合流 → LM Head',badges:['fact','impl','demo'],evidence:'参数量、层数、头数、专家数、QSA 预算与 Gated Residual 的分支/秩来自官方模型卡与 config.json；模块接线（加宽、读写门、n-gram 哈希）来自 transformers 的 qwen4_exp 参考实现；所有小数、token 与热力图是教学示例。'},
+        request:{title:'多模态请求与 Chat Template',scope:'SERVICE / PROCESSOR',copy:'Flash-Next 的 pipeline 标签就是 image-text-to-text，图文是它的默认输入形态。服务层保留图像引用，并把角色与视觉占位符序列化。',io:[['输入','messages[] + image'],['输出','control text + media reference'],['特殊 token','vision_start=248053']],formula:'apply_chat_template(messages, add_generation_prompt=true)',badges:['fact','engine','demo'],evidence:'vision_start / vision_end / image_token 的 ID 来自 config.json 顶层；请求 schema、示例文字与 thinking 开关属服务层，标为教学示例。'},
+        tokenizer:{title:'AutoProcessor：文本与图像预处理',scope:'TOKENIZER / VISION PREPROCESS',copy:'文本分支查 248,320 词表得到 input_ids；图像分支 resize、normalize 并切成时空 patch。两条分支同时进行。',io:[['文本','UTF-8 → input_ids [B,T]'],['图像','RGB → patches [Np,1536]'],['patch 向量','3×2×16×16 = 1536']],formula:'processor(text,image) → {input_ids, pixel_values, grid_thw,…}',badges:['fact','impl','demo'],evidence:'patch_size=16、temporal_patch_size=2、vocab_size=248320 来自 config；Np 与示例切分是教学示例。'},
+        vision:{title:'27 层 Vision Encoder',scope:'VISION TOWER',copy:'视觉塔与 Qwen3.8-27B 完全同构：1,152 维、27 层、16 head、4,304 维 MLP；唯一的差别是出口投影到 2,560——对齐 Flash-Next 更窄的语言 hidden。',io:[['输入','patches [Np,1536]'],['ViT hidden','[Np,1152]'],['深度 / heads','27 / 16'],['MLP','4304'],['输出','visual [Nv,2560]']],formula:'patch_embed → 27×(attention + MLP) → merge(2×2) → projector(1152→2560)',badges:['fact','impl','demo'],evidence:'vision_config 的 depth/hidden_size/num_heads/intermediate_size 与 27B 逐字段相同，out_hidden_size 由 5120 变成 2560；Nv 取决于动态分辨率。'},
+        embedding:{title:'Token Embedding、Early Fusion 与残差加宽',scope:'MODEL INPUT',copy:'文本 ID 查 [248320,2560] 的词嵌入矩阵，视觉向量替换占位槽，然后关键的一步：把这条 2,560 维序列沿特征轴原样复制 4 份，得到 10,240 维的残差流。整个骨干都跑在这条加宽的流上。',io:[['文本','IDs → [B,T,2560]'],['视觉','[B,Nv,2560]'],['融合','x₀ [B,S,2560]'],['加宽','H₀ [B,S,10240]']],formula:'x₀=replace(visual_slots,E[input_ids]); H₀=x₀.repeat(1,1,4)',badges:['fact','impl','demo'],evidence:'hidden_size=2560、vocab=248320、hc_count=4 是配置事实；加宽是参考实现里的一行 repeat（无权重、四份初始完全相同），拼接位置与数值为教学示例。'},
+        decoder:{title:'48 层 Decoder 骨干',scope:'MODEL BACKBONE',copy:'12 个四层宏块顺序执行：GDN、GDN、GDN、QSA；每层 mixer 后是 Sparse MoE。每个子块前后各有一道 Gated Residual（读门 + 写门），所以每层有两道。层 2 额外挂一次 N-gram 嵌入——它只发生一次，不随 ×12 重复。',io:[['输入','H₀ [B,S,10240]'],['层序列','36 GDN + 12 QSA'],['每层','2 × (读门 → 子块 → 写门)'],['一次性','层 2 的 N-gram PLE'],['输出','H₄₈ [B,S,10240]']],formula:'12 × [3 × (GDN → MoE) + 1 × (QSA → MoE)]',badges:['fact','impl','demo'],evidence:'48 层、layer_types 的 3:1 排布、ple_layer_ids=[2] 来自 config；每层两道 Gated Residual 与 PLE 的注入位置来自参考实现的 DecoderLayer.forward；进度指针是教学动画。'},
+        norm:{title:'分支合流 hyper_connection_mixer',scope:'MODEL OUTPUT',copy:'骨干结束后，4 条支流被最后一次读门合并成一条 2,560 维 hidden。这个模型没有独立的 final norm 权重——归一化长在合流模块内部（hc_norm），权重名就叫 hyper_connection_mixer.hc_norm。',io:[['输入','H₄₈ [B,S,10240]'],['分组归一','4 × RMSNorm(2560)'],['读门秩','320'],['输出','[B,S,2560]']],formula:'x = mean_b( sigmoid(Wup·silu(Wdown·Ĥ/4)) ⊙ Ĥ ), Ĥ=hc_norm(H)',badges:['fact','impl','demo'],evidence:'hc_lowrank=320、hc_count=4 是配置事实；“没有单独 final norm”由权重清单佐证（索引里不存在 model.language_model.norm.weight），合流公式来自参考实现的 GatedResidual(use_combine=False)。'},
+        lmhead:{title:'LM Head',scope:'MODEL OUTPUT',copy:'合流出来的 hidden 已经归一化过，所以这里只剩一次矩阵乘法：乘不与 Embedding 绑权的输出矩阵，为 248,320 个词表位置各产生一个 logit。',io:[['输入','x_last [B,2560]'],['权重','[248320,2560]'],['输出','logits [B,248320]']],formula:'logits = Wlm_head · x_last',badges:['fact','impl','demo'],evidence:'shape 与 tie_word_embeddings=false 来自 config；参考实现里 lm_head 直接吃 last_hidden_state，中间没有再插 norm。候选词与 logits 数值是教学示例。'},
+        sampler:{title:'Logits Processor 与采样',scope:'SERVING ENGINE',copy:'服务层把 logits 变成概率、应用请求过滤规则并抽取一个 token；处理顺序与随机数属于推理引擎。',io:[['输入','logits [248320]'],['输出','one token ID']],formula:'p=softmax(process(logits)/T); token~Categorical(p)',badges:['engine','demo'],evidence:'这里沿用一组教学采样参数；它不是 Flash-Next 的模型结构。'},
+        output:{title:'Detokenize、流式输出与 MTP',scope:'TOKEN / SERVICE BOUNDARY',copy:'采样 ID 增量解码为文字；未停止则作为下一次 Decode 输入。Flash-Next 自带 1 层 MTP（hybrid、full_attention），由推理引擎决定是否开启投机解码。',io:[['输入','accepted token IDs'],['MTP','1 层 · 4B 参数'],['输出','UTF-8 / SSE events']],formula:'emit y₁ → Decode(input=y₁,cache=P) → cache=P+y₁ → sample y₂',badges:['fact','engine','demo'],evidence:'mtp_num_hidden_layers=1、mtp.hybrid=true、mtp.layer_types=["full_attention"] 来自 config，4B 参数量来自模型卡；是否启用投机解码属引擎。'},
+        ngram:{title:'N-gram 嵌入（PLE）',scope:'ONCE · AT LAYER 2',copy:'整个 48 层里只有一处：层 2 回头去读原始 token ID，把 (t,t−1) 和 (t,t−1,t−2) 哈希进 16 张各约 2,000 万行的表，取出 16×160 拼成 2,560 维词法特征，再门控注入残差流。模型卡把它称作“用嵌入换算力”的参数扩展轴。',io:[['输入','input_ids [B,T]（不是 hidden）'],['n-gram 头','2 阶×8 + 3 阶×8 = 16'],['表','320,001,536 × 160 · 128 分片'],['参数','≈51.2B'],['输出','[B,S,10240] 注入残差']],formula:'e=concat_h E_h[(Σ⊕ id_{t−j}·m_j) mod P_h]; H += sigmoid(k·q)·Wv e + SiLU(conv(·))',badges:['fact','impl','demo'],evidence:'ngram_size=3、heads_per_ngram=8、ngram_vocab_size_base=2e7、split_ngram_parts=128 来自 config；16 个头的质数表长（20000003…20000171）与 160 维行宽由权重文件实测，乘出来正好 51.2B，与模型卡的 51B 对上；哈希与门控公式来自参考实现。'},
+        gres:{title:'Gated Residual（四分支残差）',scope:'TWICE PER LAYER · 96 SITES',copy:'残差不再是一条流，而是 4 条并行支流（4×2560=10240）。每个子块进门前用一个低秩 sigmoid 门把 4 条读成 1 条 2,560 维输入；出门时用 4 个数据相关的标量把同一份输出按不同强度写回 4 条支流。读门逐元素、写门按分支，这是官方 highlight 里的原话。',io:[['残差流','[B,S,10240] = 4×2560'],['分组归一','hc_norm，每 2560 一组'],['读门','10240→320→10240，sigmoid'],['写门','10240→4，2·sigmoid ∈ (0,2)'],['块输入/输出','[B,S,2560]']],formula:'x=mean_b(g⊙Ĥ); H←H + out ⊗ (2·sigmoid(W_inj·Ĥ/4))',badges:['fact','impl','demo'],evidence:'hc_count=4、hc_lowrank=320 是配置事实；权重形状 [320,10240] / [10240,320] / [4,10240] 由权重文件实测；silu→sigmoid 的门控次序与 mean 聚合来自参考实现的 GatedResidual.forward。'},
+        gdn:{title:'Gated DeltaNet',scope:'36 LINEAR-ATTENTION LAYERS',copy:'与另外两个 Qwen3.8 同一套递推，只是更窄：Q/K 各 16×128，V/Z 各 48×128，QKV 共 10,240 通道走 4-tap 深度因果卷积。48 个 value 头各维护一个 128×128 状态矩阵；输出门这里用 sigmoid 而不是 2.4T 的 swish。',io:[['输入','[B,S,2560]'],['Q/K','[B,S,16,128]'],['V/Z','[B,S,48,128]'],['状态','[B,48,128,128] · fp32'],['输出','[B,S,2560]']],formula:'β=sigmoid(b); g=−exp(A_log)·softplus(a+dt_bias); S←exp(g)S+k̃⊗β(v−k̃ᵀS); y=q̃ᵀS',badges:['fact','impl','demo'],evidence:'linear_num_key_heads=16 / value_heads=48 / head_dim=128、conv_kernel=4、mamba_ssm_dtype=float32、output_gate_type=sigmoid 均为配置事实；in_proj_qkv 的 [10240,2560] 由权重实测；状态矩阵切片与 β/decay 是教学示例。'},
+        qsa:{title:'Qwen Sparse Attention',scope:'12 FULL-ATTENTION LAYERS',copy:'替掉了前两代的 Gated GQA。先由一个极轻的 indexer（4 个 query 头 + 1 个共享 key 头，每头 128 维）给每 4 个 token 一块的历史打分，选出 512 块 = 2,048 个 token；主注意力只在这些位置上做 softmax。官方强调它是微块级选择，不是逐 token 选择。',io:[['输入','[B,S,2560]'],['indexer','q 4×128 · k 1×128'],['块大小 / 预算','4 token · 512 块 = 2048'],['Q / gate','[B,S,24,256] each'],['K / V','[B,S,2,256] each'],['输出','[B,S,2560]']],formula:'idx=topk₅₁₂(Σ_h relu(q_h·k̄_block)/√128); A=softmax(QKᵀ/√256 + causal∧idx); out=Wo(A·V ⊙ sigmoid(gate))',badges:['fact','impl','demo'],evidence:'indexer_n_heads=4、indexer_kv_heads=1、indexer_head_dim=128、indexer_budget=2048、compress_ratio=4、Q24/KV2、head_dim=256、RoPE 64 维全部来自 config 与模型卡；块内均值池化、块首位置加 RoPE、relu 后求和、尾块必留来自参考实现的 QSAIndexer.forward；分数与选中块是教学示例。'},
+        moe:{title:'Sparse MoE',scope:'AFTER EVERY DECODER MIXER',copy:'专家数与 top-k 和 2.4T 一样是 512 / 10，但每个专家窄得多——中间维只有 640（2.4T 是 2048）。共享专家同样是 640 维并常驻执行，由 sigmoid 标量门控。这是“总参 125B、激活只有 6B”的主要来源。',io:[['输入','x [N,2560]'],['Router','[N,512] → top10'],['Expert 中间维','640'],['Shared','640 · 常驻'],['输出','[N,2560]']],formula:'Σᵢ∈top10 pᵢ·Wdownᵢ[SiLU(Wgateᵢx)⊙Wupᵢx] + σ(gs)·Eshared(x)',badges:['fact','impl','demo'],evidence:'num_experts=512、num_experts_per_tok=10、moe_intermediate_size=640、shared_expert_intermediate_size=640 是配置事实；gate_up_proj 打包成 [512,1280,2560] 由权重实测；expert ID 与概率是教学示例，跨设备 dispatch 属引擎。'}
+      };
+      const profiles={
+        q38:{brand:'Qwen3.8',shortName:'Qwen3.8-2.4T-A95B',status:'官方配置',pending:false,hidden:8192,layers:92,repeats:23,mainFlow,decoderFlow,moduleSpecs,payloadStates,meta,feedChip:'<button class="moe-chip" data-open="moe">MoE · top10+shared</button>',attnKey:'attention',attnLabel:'GQA',orangeLegend:'MoE 路由、专家和采样',purpleLegend:'Gated GQA / 全注意力',hiddenLegend:'8192 维残差流和确定 shape',title:'一个请求怎样穿过 Qwen3.8-2.4T-A95B',subtitle:'点击任意模块进入内部；Decoder 可继续下钻 Gated DeltaNet、Gated GQA 和 Sparse MoE。',sources:[['官方模型卡','https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B'],['官方 config.json','https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/main/config.json'],['Transformers MoE 参考实现','https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py']]},
+        q35:{brand:'Qwen3.8',shortName:'Qwen3.8-27B',status:'官方配置',pending:false,hidden:5120,layers:64,repeats:16,mainFlow:q35MainFlow,decoderFlow:q35DecoderFlow,moduleSpecs:q35ModuleSpecs,payloadStates:q35PayloadStates,meta:q35Meta,feedChip:'<button class="ffn-chip" data-open="ffn">Dense FFN · 17408</button>',attnKey:'attention',attnLabel:'GQA',orangeLegend:'橙色仅用于采样；绿色是 Dense FFN',purpleLegend:'Gated GQA / 全注意力',hiddenLegend:'5120 维残差流和确定 shape',title:'一个图文请求怎样穿过 Qwen3.8-27B',subtitle:'本次选择图文请求来展示完整视觉塔；纯文本可跳过 Vision Encoder。Decoder 可继续下钻 GDN、GQA 与 Dense FFN。',sources:[['官方模型卡','https://huggingface.co/Qwen/Qwen3.8-27B'],['官方 config.json','https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/config.json'],['Transformers Dense 参考实现','https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py']]},
+        qflash:{brand:'Qwen3.8',shortName:'Qwen3.8-Flash-Next',status:'官方配置',pending:false,hidden:2560,layers:48,repeats:12,mainFlow:qfMainFlow,decoderFlow:qfDecoderFlow,moduleSpecs:qfModuleSpecs,payloadStates:qfPayloadStates,meta:qfMeta,feedChip:'<button class="moe-chip" data-open="moe">MoE · 512×640</button>',attnKey:'qsa',attnLabel:'QSA',railChip:'<button class="gres-chip" data-open="gres">⇅ 门控残差 ×2</button>',orangeLegend:'MoE 路由、专家和采样',purpleLegend:'Qwen Sparse Attention / 全注意力',hiddenLegend:'2560 维支流 ×4 = 10240 维残差流',title:'一个图文请求怎样穿过 Qwen3.8-Flash-Next',subtitle:'Qwen4 架构的实验预览版：QSA 微块稀疏注意力、四分支 Gated Residual、层 2 的 N-gram 嵌入。点击模块进入内部；Decoder 内可继续下钻这五个块。',sources:[['官方模型卡','https://huggingface.co/Qwen/Qwen3.8-Flash-Next'],['官方 config.json','https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/config.json'],['Transformers qwen4_exp 参考实现','https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py'],['官方技术报告','https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf']]}
       };
       const profile=()=>profiles[state.model];
       const activeSpecs=()=>profile().moduleSpecs;
@@ -372,8 +431,10 @@
 
       function updateInspector(key){const m=activeMeta()[key];document.getElementById('insScope').textContent=m.scope;document.getElementById('insTitle').textContent=m.title;document.getElementById('insCopy').textContent=m.copy;document.getElementById('insIO').innerHTML=io(m.io);document.getElementById('insFormula').textContent=m.formula;document.getElementById('insBadges').innerHTML=m.badges.map(badge).join('');document.getElementById('insEvidence').textContent=m.evidence}
       function recipeStacks(){
-        const dense=state.model==='q35',feed=dense?'<button class="ffn-chip" data-open="ffn">Dense FFN · 17408</button>':'<button class="moe-chip" data-open="moe">MoE · top10+shared</button>';
-        return `<div class="layer-stack"><button class="mixer-chip" data-open="gdn">L1 · GDN</button>${feed}</div><div class="layer-stack"><button class="mixer-chip" data-open="gdn">L2 · GDN</button>${feed}</div><div class="layer-stack"><button class="mixer-chip" data-open="gdn">L3 · GDN</button>${feed}</div><div class="layer-stack"><button class="mixer-chip attn" data-open="attention">L4 · GQA</button>${feed}</div>`
+        const p=profile(),feed=p.feedChip,rail=p.railChip||'',cls=`layer-stack${rail?' hc':''}`;
+        // 第四层是全注意力层，键名与短名随模型而变（GQA / QSA）；rail 只有需要画门控残差轨的模型才有
+        const mixer=(n,attn)=>`<button class="mixer-chip${attn?' attn':''}" data-open="${attn?p.attnKey:'gdn'}">L${n} · ${attn?p.attnLabel:'GDN'}</button>`;
+        return [1,2,3,4].map(n=>`<div class="${cls}">${mixer(n,n===4)}${feed}${rail}</div>`).join('')
       }
       function recipeHTML(className='macro-recipe'){return `<div class="${className}">${recipeStacks()}</div>`}
       function payloadCells(p,changed=false){
@@ -954,9 +1015,394 @@
             opBlock(`<div class="stream-lines" style="margin:0;background:#0f1b18">cache=P → emit y₁ → Decode(input=y₁, cache=P) → cache=P+y₁ → sample y₂</div>`))
         ];
         return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'输出三步：解码拼句 → parser 流式 → token 回环。视觉只参与上下文，不输出像素。')
-      }      const renders={request:requestHTML,tokenizer:tokenizerHTML,embedding:embeddingHTML,decoder:decoderHTML,norm:normHTML,gdn:gdnHTML,attention:attentionHTML,moe:moeHTML,lmhead:lmheadHTML,sampler:samplerHTML,output:outputHTML};
+      }      function qfRequestHTML(){
+        const source=opSource('输入数据','图文 messages','image + text → 服务层',
+          '请求带一张图和一句文本。Flash-Next 在 HuggingFace 上的 pipeline 标签就是 <code>image-text-to-text</code>，图文是它的默认输入形态。<b>这是输入本身，不是一个操作。</b>',
+          opRow(
+            `<div style="flex:0 0 auto"><div class="image-card" style="height:110px;width:150px">◫ <small style="font:800 9px var(--mono)">IMAGE</small></div></div>`,
+            `<div class="json-box" style="flex:0 0 auto;max-width:340px">{ "role":"user",<br>&nbsp;&nbsp;"content":[image, "这张图讲了什么"] }</div>`
+          ));
+        const steps=[
+          opStep(1,'main','模板化','chat template + 视觉占位','→ 控制文本 + 媒体引用',
+            '<b>这一层只有一个操作。</b>把文本套进 chat template，并插入 <code>&lt;|vision_start|&gt;…&lt;|vision_end|&gt;</code> 占位，标记视觉 token 稍后填入的位置。这三个特殊 token 的 ID 写在 config 顶层，是少见的可直接引用的事实数字。',
+            opRow(
+              opWidget(320,`<div class="template-lines"><div class="template-line">&lt;|im_start|&gt;user</div><div class="template-line">&lt;|vision_start|&gt; … &lt;|vision_end|&gt;</div><div class="template-line">这张图讲了什么 · &lt;|im_end|&gt;</div><div class="template-line">&lt;|im_start|&gt;assistant</div></div>`),
+              opScalars('配置事实 · 特殊 token ID',[['vision_start','248053'],['image_token','248056'],['vision_end','248054']])
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${source}${opPipe(steps)}</div>`,'虚线 IN 块是输入数据；真正的操作只有一个：套 chat template 并插入视觉占位。特殊 token ID 来自 config，其余文字为示例。')
+      }
+      function qfTokenizerHTML(){
+        const ids=[248044,248053,248056,248054,391,72,114];
+        const steps=[
+          opStep(1,'main','预处理','图像与文本并行处理','image + text → patches + ids',
+            '这一步里<b>两条分支同时进行、互不依赖</b>——不是先做图再做文本。',
+            opParallel('并行 · 两条分支互不依赖',[
+              ['分支 A · 图像','resize、归一化后切成时空 patch，每个展平成 1,536 维（<code>3×2×16×16</code>）。Np 取决于动态分辨率。',
+                opRow(
+                  `<div style="flex:0 0 auto"><div class="image-card" style="height:80px;width:100px">RGB</div></div>`,
+                  opOp('patchify'),
+                  opWidget(120,`<div class="patch-grid" style="margin:0">${Array.from({length:16},(_,i)=>`<i style="--i:${i}"></i>`).join('')}</div>`)
+                )+opRow(tensorPanel({name:'展平后的 patch',shape:'[Np,1536]',slice:'[patch 0,0:8]',values:[.14,-.31,.45,.09,-.20,.28,.38,-.07],cols:8}))],
+              ['分支 B · 文本','查 248,320 词表得到整数 ID；视觉占位也占据真实 token 位置。',
+                opRow(
+                  opWidget(120,`<div class="sentence" style="align-self:flex-start;margin:0;font-size:13px">这张图讲了什么</div>`),
+                  opOp('tokenize')
+                )+opRow(tensorPanel({name:'input_ids',shape:'[B,T] int64',slice:'[0,0:7]',values:ids,cols:7,format:'int',axis:'前四个是 config 里的真实特殊 token ID，后三个为教学示例'}))]
+            ])),
+          opStep(2,'main','打包','processor bundle','→ 交给模型',
+            '两条分支的产物汇合成一个 bundle；grid_thw 记录每张图的时间 / 高 / 宽 patch 网格。<code>input_ids</code> 之后还会被<b>再用一次</b>——层 2 的 N-gram 嵌入直接读它。',
+            opRow(
+              `<div class="data-node active-border" style="flex:0 0 auto"><b>processor bundle</b><code>{ input_ids, pixel_values, grid_thw }</code></div>`,
+              tensorPanel({name:'grid_thw',shape:'[Nimage,3]',slice:'[0,:]',values:[1,28,28],cols:3,format:'int',axis:'教学示例：temporal / height / width'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'第 1 步内的两条分支并行，不是先后两步。注意 input_ids 在骨干深处还会被 N-gram 嵌入再读一次。')
+      }
+      function qfVisionHTML(){
+        const steps=[
+          opStep(1,'main','嵌入','patch embedding','[Np,1536] → [Np,1152]',
+            '每个展平 patch 线性投影进 1,152 维视觉塔隐藏空间。',
+            opRow(
+              tensorPanel({name:'patches',shape:'[Np,1536]',slice:'[0:2,0:4]',values:[.14,-.31,.45,.09,-.20,.28,.38,-.07],cols:4}),
+              opOp('patch_embed'),
+              tensorPanel({name:'vision hidden h₀',shape:'[Np,1152]',slice:'[0:2,0:4]',values:[.24,-.16,.35,.07,-.29,.20,.11,.40],cols:4,kind:'after'})
+            )),
+          opStep(2,'main','编码','27 层 ViT · 16 heads','[Np,1152] → [Np,1152]',
+            '重复 27 次：norm→视觉注意力→残差，norm→MLP(1152→4304→1152)→残差。全程 shape 不变。这一整座塔与 Qwen3.8-27B 的 vision_config 逐字段相同。',
+            opRow(
+              opWidget(230,`<div class="vit-stack"><div>Norm → Vision Attention</div><div>Residual</div><div>Norm → MLP 1152→4304→1152</div><div>Residual · ×27</div></div>`),
+              opArrow(),
+              tensorPanel({name:'vision hidden h₂₇',shape:'[Np,1152]',slice:'[0:2,0:4]',values:[.44,-.10,.21,.29,-.23,.37,.14,-.15],cols:4,kind:'after'})
+            )),
+          opStep(3,'main','对齐','2×2 spatial merge + projector','→ [Nv,2560]',
+            '相邻 2×2 patch 合并以降低视觉 token 数，再投影到 <code>2560</code>——语言模型 hidden 的宽度。<b>这里是 Flash-Next 与 27B 唯一的视觉差异</b>：同一座塔，出口从 5120 改成 2560。',
+            opRow(
+              tensorPanel({name:'visual embeddings',shape:'[Nv,2560]',slice:'[0:2,0:4]',values:[-.21,.38,.06,-.24,.30,-.12,.47,.09],cols:4,kind:'after',axis:'Nv 取决于动态分辨率；2560 = vision_config.out_hidden_size'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'视觉塔三步：patch embedding → 27 层 ViT → 2×2 合并并投影到 2560。深度/宽度/头数与 27B 相同，只有出口宽度不同。')
+      }
+      function qfEmbeddingHTML(){
+        const steps=[
+          opStep(1,'main','查表','文本 E[input_ids]','[B,T] → [B,T,2560]',
+            '文本 ID 从词嵌入矩阵 <code>[248320,2560]</code> 查行。没有矩阵乘法，只是按索引取行。',
+            opRow(
+              tensorPanel({name:'text IDs',shape:'[B,T] int64',slice:'[0,0:6]',values:[248044,248053,248056,248054,391,72],cols:6,format:'int'}),
+              opOp('E lookup'),
+              tensorPanel({name:'text embeddings',shape:'[B,T,2560]',slice:'[0,token 4,0:4]',values:[-.33,.19,.14,-.26],cols:4,kind:'after'})
+            )),
+          opStep(2,'main','融合','early fusion · 替换视觉槽','→ [B,S,2560]',
+            '视觉塔输出同为 2,560 维；把它们替换进序列中的视觉占位位置，形成一条<b>联合</b> hidden 序列 x₀。视觉与文本不是相加成同一个 token，而是占据不同位置。',
+            opRow(
+              opWidget(150,`<span class="label">visual [Nv,2560]</span>${vector(24,11)}`),
+              opOp('replace slots'),
+              tensorPanel({name:'joint hidden x₀',shape:'[B,S,2560]',slice:'row0=visual · row1=text',values:[-.21,.38,.06,-.24,-.33,.19,.14,-.26],cols:4,kind:'after'})
+            )),
+          opStep(3,'main','加宽','沿特征轴复制 4 份','[B,S,2560] → [B,S,10240]',
+            '这是 Flash-Next 与前两个模型分道扬镳的地方：残差不再是一条流。x₀ 被<b>原样复制 4 份</b>拼成 10,240 维，之后 48 层都跑在这条加宽的流上。加宽没有任何权重，四条支流此刻完全相同；它们要靠每层写门的四个标量才会分化。',
+            opRow(
+              tensorPanel({name:'x₀（融合后）',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[-.33,.19,.14,-.26],cols:4}),
+              opOp('repeat(1,1,4)'),
+              opWidget(260,`<span class="label">H₀ · 4 条支流 · 此刻完全相同</span><div class="stream-lane" style="margin-top:5px"><i>b0</i><i>b1</i><i>b2</i><i>b3</i></div>`),
+              opArrow(),
+              tensorPanel({name:'H₀（加宽后）',shape:'[B,S,10240]',slice:'[0,last,0:8] = b0 与 b1 的前 4 维',values:[-.33,.19,.14,-.26,-.33,.19,.14,-.26],cols:4,kind:'after',axis:'上行 = 支流 b0，下行 = 支流 b1；数值逐位相同'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'三步：查表 → early fusion → 复制加宽。加宽是 config 的 hc_count=4 加上参考实现里的一行 repeat，不含可学习参数。')
+      }
+      function qfDecoderHTML(){
+        const before=[-.33,.19,.14,-.26,.41,-.08,.22,.17],after=[.58,-.14,.33,.19,-.37,.24,.18,-.06];
+        return focusWrap(`<div class="block-scene"><div class="dec-band"><div class="dec-copy"><span class="label">4 层 × 12 = 48</span><b>3×GDN + 1×QSA，每层都带 MoE</b><p>四层宏块重复 <b>12</b> 次。每层分两半：<b>上半</b>是序列混合器（三层 GDN、一层 QSA），<b>下半</b>是该层自己的 Sparse MoE。两个子块<b>各有一道 Gated Residual</b>（蓝色轨），所以每层进出残差流四次。点任意色块下钻。</p></div><div class="dec-recipe">${recipeHTML('decoder-focus-recipe')}<div class="decoder-repeat-badge">×12<small>MACROBLOCKS</small></div></div></div><div class="once-note"><b>只发生一次</b><span>层 2 额外挂一个 N-gram 嵌入（PLE），回头去读原始 <code>input_ids</code>。它<b>不在 ×12 的配方里</b>——整个 48 层只有这一处，所以没有画进上面的重复块。</span><button class="ui-btn" data-open="ngram">打开 N-gram 嵌入</button></div><div class="macro-progress" data-start="B01" data-end="B12" style="--blocks:12"><i></i><b title="教学进度指针"></b></div><div class="dec-probe"><div class="data-node"><b>加宽残差流 H₀</b>${vector(20,11)}${tensorPanel({name:'H₀ before decoder',shape:'[B,S,10240]',slice:'[0,last,0:8]',values:before,cols:8})}</div><div class="op-op" style="font-size:12px">→<small>同一条 10,240 维残差流穿过 4 层 ×12，shape 不变</small></div><div class="data-node active-border"><b>H₄₈ after decoder</b>${vector(20,31)}${tensorPanel({name:'H₄₈ after decoder',shape:'[B,S,10240]',slice:'[0,last,0:8]',values:after,cols:8,kind:'after'})}</div></div><div class="click-hint"><button class="ui-btn" data-open="gres">打开 Gated Residual</button> <button class="ui-btn" data-open="gdn">打开 GDN</button> <button class="ui-btn" data-open="qsa">打开 QSA</button> <button class="ui-btn" data-open="moe">打开 MoE</button></div></div>`,'4 层配方画一次并标注 ×12；蓝色轨表示每层两道门控残差。层 2 的 N-gram 嵌入是一次性的，单独列出而不塞进重复块。')
+      }
+      function qfGresHTML(){
+        const H=[-.42,.31,.08,-.19,.36,-.24,.15,.27];
+        const Hn=[-.58,.43,.11,-.26,.49,-.33,.20,.37];
+        const out=[.22,-.09,.31,.14];
+        const source=opSource('输入数据','加宽残差流 H','[B,S,10240] = 4×2560',
+          '进入任何子块之前，残差流是 4 条并排的 2,560 维支流。<b>这是数据本身，不是一个操作。</b>',
+          opRow(
+            opWidget(260,`<div class="stream-lane"><i>b0</i><i>b1</i><i>b2</i><i>b3</i></div>`),
+            tensorPanel({name:'H',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:H,cols:4,axis:'上行 = 支流 b0，下行 = 支流 b1'})
+          ));
+        const steps=[
+          opStep(1,'main','分组归一','hc_norm · 每支流独立','[B,S,10240] → 同 shape',
+            '先做 RMSNorm，但<b>分组做</b>：group_size = 2560，四条支流各算各的均方根，互不干扰。读门和写门都基于这份归一化结果，所以它只算一次。',
+            opRow(
+              tensorPanel({name:'H（before）',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:H,cols:4}),
+              opOp('4 × RMSNorm(2560)'),
+              tensorPanel({name:'Ĥ（after）',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:Hn,cols:4,kind:'after'})
+            )),
+          opStep(2,'main','读门','低秩 sigmoid 门 + 分支平均','[B,S,10240] → [B,S,2560]',
+            '把 Ĥ 压到 <code>320</code> 维瓶颈、SiLU、再升回 10,240 并取 sigmoid，得到一张<b>逐元素</b>的门 g（形状同样是 4×2560）。用 g 乘 Ĥ 后<b>对 4 条支流取平均</b>，塌成一份 2,560 维向量——这才是子块真正看到的输入。',
+            opRow(
+              opWidget(150,`<span class="label">10240 → 320 → 10240</span><div class="branch-box" style="margin-top:5px"><div class="branch">down<br>320</div><div class="branch">SiLU</div><div class="branch">up<br>10240</div><div class="branch">sigmoid</div></div>`),
+              opOp('g ⊙ Ĥ'),
+              opWidget(260,`<span class="label">逐支流门强度（教学值）</span><div class="stream-lane" style="margin-top:5px"><i class="hot">.81</i><i>.34</i><i>.62</i><i>.19</i></div>`),
+              opOp('mean over b'),
+              tensorPanel({name:'子块输入 x',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[-.11,.09,.04,-.06],cols:4,kind:'after'})
+            )),
+          opStep(3,'main','写门 + 写回','4 个标量按支流注入','out [B,S,2560] → H [B,S,10240]',
+            '此时子块（GDN / QSA / MoE）已经算完，交回一份 2,560 维输出。写门从<b>同一份 Ĥ</b> 线性投出 <code>4</code> 个数，经 <code>2·sigmoid(·/4)</code> 落到 (0,2) 区间。同一份输出乘上各自的标量，分别加进 4 条支流——写门按分支给标量，读门按元素给门，粒度是不一样的。',
+            opRow(
+              tensorPanel({name:'子块输出 out',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:out,cols:4}),
+              opSign('⊗'),
+              opWidget(260,`<span class="label">写门标量 · Linear(10240→4)</span><div class="stream-lane" style="margin-top:5px"><i class="hot">1.42</i><i>0.31</i><i>0.88</i><i>1.07</i></div>`),
+              opOp('H + out⊗w'),
+              tensorPanel({name:'写回后的 H',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:[-.11,.18,.52,.01,.43,-.21,.42,.31],cols:4,kind:'after',axis:'b0 的写门 1.42 远大于 b1 的 0.31，同一份输出落进两条支流的幅度就此分开'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${source}${opPipe(steps)}<div class="norm-formula" style="margin-top:11px">x = mean_b( sigmoid(W_up·SiLU(W_down·Ĥ/4)) ⊙ Ĥ )　·　H ← H + out ⊗ 2·sigmoid(W_inj·Ĥ/4)</div></div>`,'三步：分组归一 → 读门塌成 2560 → 写门标量写回 4 条支流。每层出现两次（mixer 前后、MoE 前后），48 层共 96 处。门强度数值是教学示例。')
+      }
+      function qfNgramHTML(){
+        const source=opSource('输入数据','原始 input_ids','[B,T] int64',
+          '这一处不读 hidden，而是<b>回头去读最初的 token ID</b>。骨干里唯一一个直接消费 input_ids 的模块。<b>这是输入本身，不是一个操作。</b>',
+          opRow(tensorPanel({name:'input_ids',shape:'[B,T] int64',slice:'[0,t−2 : t]',values:[391,72,114],cols:3,format:'int',axis:'教学示例 ID；t 为当前位置'})));
+        const steps=[
+          opStep(1,'ffn','取历史','按位移取前两个 token',null,
+            '当前位置需要 <code>id_t</code>、<code>id_{t−1}</code>、<code>id_{t−2}</code>。移位时<b>不跨 EOS</b>：越过句子边界的位置一律填 EOS，避免把上一段的词拼进本段的 n-gram。解码时前两个 ID 存在 cache 的一个额外槽里，和 conv_state 同一套机制。',
+            opRow(
+              opWidget(300,`<div class="template-lines"><div class="template-line">shift 0 →&nbsp; id_t&nbsp;&nbsp;&nbsp;&nbsp;= 114</div><div class="template-line">shift 1 →&nbsp; id_t−1 = 72</div><div class="template-line">shift 2 →&nbsp; id_t−2 = 391</div></div>`),
+              opScalars('边界规则',[['跨 EOS','填 eos=248044']])
+            )),
+          opStep(2,'ffn','哈希','16 个头各取一个质数模','→ 16 个 n-gram id',
+            '二元组用 <code>(id_t, id_{t−1})</code>，三元组用 <code>(id_t, id_{t−1}, id_{t−2})</code>，各配 <code>8</code> 个头，共 <b>16</b> 个头。每个位置先乘一个大奇数乘子再逐位异或，得到一个 64 位混合值，然后对<b>该头专属的质数</b>取模。16 个质数互不相同（20000003、20000023 … 20000171），所以两个不同 n-gram 就算在某个头上撞了，在其它 15 个头上大概率不撞。',
+            opRow(
+              opWidget(300,`<div class="json-box" style="max-width:300px">mix = id_t·m₀ <span class="key">⊕</span> id_{t−1}·m₁ <span class="key">⊕</span> id_{t−2}·m₂<br>ngram_id_h = mix <span class="key">mod</span> P_h + offset_h</div>`),
+              opOp('mod P_h'),
+              tensorPanel({name:'16 个头的 n-gram id',shape:'[B,T,16] int64',slice:'[0,t,0:8]',values:[8814413,1372905,19440118,6025731,12883044,3179562,17206890,9541327],cols:4,format:'int',axis:'前 8 个是二元组头；质数表长来自权重文件，id 值为教学示例'})
+            )),
+          opStep(3,'ffn','查表','3.2 亿行 × 160 维','→ [B,T,2560]',
+            '表一共 <code>320,001,536</code> 行、每行 <code>160</code> 维，切成 <b>128 个分片</b>存放——乘出来约 <b>51.2B</b> 参数，正好对上模型卡写的 51B。16 个头各取一行 160 维，拼接成 2,560 维词法特征。这里<b>没有矩阵乘法</b>，只有 16 次查表，所以它很适合放在慢速内存里按需取。',
+            opRow(
+              opWidget(230,`<span class="label">ngram_embedding · 128 shards</span><div style="margin-top:5px">${matrix(10,26,17)}</div>`),
+              opOp('16 × gather'),
+              tensorPanel({name:'n-gram 特征 e',shape:'[B,T,2560] = 16×160',slice:'[0,t, head0:0:4 | head1:0:4]',values:[.27,-.14,.06,.33,-.22,.41,.12,-.08],cols:4,kind:'after'})
+            )),
+          opStep(4,'ffn','打分门控','与残差流对齐后调制','→ [B,S,4,2560]',
+            'e 投影出<b>每条支流一份</b> key（<code>2560→10240</code> 后分成 4 份并归一化），残差流 H 归一化后当 query。两者点积除以 <code>√2560</code>，再做一次保号开方压缩量级，取 sigmoid 当门，去缩放 e 的 value 投影。<b>词法特征要不要注入、注入多少，由当前残差流自己说了算</b>，而且 4 条支流可以给出不同答案。',
+            opRow(
+              tensorPanel({name:'key（每支流一份）',shape:'[B,S,4,2560]',slice:'[0,t, b0:0:4]',values:[.19,-.31,.08,.24],cols:4}),
+              opSign('·'),
+              tensorPanel({name:'query = norm(H)',shape:'[B,S,4,2560]',slice:'[0,t, b0:0:4]',values:[-.58,.43,.11,-.26],cols:4}),
+              opOp('sigmoid(√|s|·sgn s)'),
+              opWidget(260,`<span class="label">逐支流注入门（教学值）</span><div class="stream-lane" style="margin-top:5px"><i class="hot">.77</i><i>.21</i><i>.53</i><i>.38</i></div>`)
+            )),
+          opStep(5,'ffn','短卷积 + 注入','膨胀因果卷积后加进残差流','→ H [B,S,10240]',
+            '门控后的特征再走一次 depthwise 因果卷积：kernel <code>4</code>、<b>dilation 3</b>（等于 ngram_size），也就是每隔 3 个位置取一拍，覆盖约 9 个 token 的局部词法上下文。卷积结果经 SiLU 后与门控特征相加，整体直接加进 10,240 维残差流——不经过 Gated Residual 的读写门。',
+            opRow(
+              tensorPanel({name:'门控特征',shape:'[B,S,10240]',slice:'[0,t, b0:0:4]',values:[.15,-.11,.04,.18],cols:4}),
+              opOp('+ SiLU(conv k=4, d=3)'),
+              tensorPanel({name:'PLE 输出',shape:'[B,S,10240]',slice:'[0,t, b0:0:4]',values:[.23,-.06,.09,.26],cols:4,kind:'after'}),
+              opOp('H + ·'),
+              tensorPanel({name:'注入后的 H',shape:'[B,S,10240]',slice:'[0,t, b0:0:4]',values:[-.19,.25,.17,-.08],cols:4,kind:'after'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${source}${opPipe(steps)}</div>`,'五步：取历史 → 哈希 → 查表 → 打分门控 → 短卷积并注入。整个 48 层只在层 2 发生一次。表长、行宽、分片数与质数由官方权重文件实测；具体 ID 与门强度是教学示例。')
+      }
+      function qfGdnHTML(){
+        const s0=[.08,.17,-.12,.04,-.06,.11,.09,-.05,.02,-.10,.14,.13,-.07,.03,.06,-.02];
+        const s1=[.19,.03,.08,-.11,-.01,.09,.13,-.04,.06,-.09,.17,.07,-.02,.05,.04,-.08];
+        const ds=s1.map((v,i)=>round(v-s0[i]));
+        const steps=[
+          opStep(1,'gdn','投影','线性 fan-out','x [B,S,2560] → 4 路',
+            'Gated Residual 读门交来的 2,560 维向量被 4 个线性层拆开：一个打包投影同时给出 Q、K、V（<code>2048+2048+6144 = 10240</code>），另外三个分别给 Z（6144）以及两组<b>逐 value 头</b>的标量 a、b（各 48 个）。Q/K 是 <code>16 头×128</code>，V/Z 是 <code>48 头×128</code>。',
+            opRow(
+              tensorPanel({name:'GDN 输入 x',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[-.11,.09,.04,-.06],cols:4}),
+              opOp('4× Linear'),
+              opWidget(214,`<div class="branch-box"><div class="branch">Q<br>16×128</div><div class="branch">K<br>16×128</div><div class="branch">V<br>48×128</div><div class="branch">Z<br>48×128</div><div class="branch">a<br>48</div><div class="branch">b<br>48</div></div>`),
+              opArrow(),
+              tensorPanel({name:'Q/K/V 投影切片（行）',shape:'Q,K:[B,S,16,128] · V:[B,S,48,128]',slice:'row0=Q · row1=K · row2=V',values:[.24,-.13,.07,.29,-.16,.21,-.06,.14,.39,-.11,.27,.05],cols:4})
+            )),
+          opStep(2,'gdn','短卷积','深度因果卷积 · 4-tap',null,
+            'Q、K、V 共 <code>10,240</code> 个通道一起做 depthwise 因果卷积：每个通道只看自己最近 4 个时刻。推理时 <code>conv_state</code> 缓存这 4 列并逐步右移。',
+            opRow(
+              tensorPanel({name:'conv_state（追加前）',shape:'[B,10240,4]',slice:'[0,channel 0,:]',values:[.09,-.06,.27,.38],cols:4,axis:'列 = t−3, t−2, t−1, t'}),
+              opOp('Σ w·x + SiLU'),
+              opScalars('教学标量',[['加权和','+.22'],['SiLU','+.12']])
+            )),
+          opStep(3,'gdn','归一化 + 门控','L2Norm · β · 衰减',null,
+            'q、k 逐头做 L2 归一化并把 q 缩放 <code>1/√128</code>。48 个标量 b 经 sigmoid 得到写入强度 <code>β</code>；48 个标量 a 与 <code>A_log</code>、<code>dt_bias</code> 一起给出衰减 <code>g = −exp(A_log)·softplus(a+dt_bias)</code>，<code>exp(g)</code> 就是遗忘系数。16 个 K 头会按 3:1 广播给 48 个 V 头。',
+            opScalars('教学标量',[['β','.68'],['exp(g)','.93'],['V/K 广播比','48/16 = 3']])),
+          opStep(4,'gdn','状态更新','delta 规则写入','S:[B,48,128,128]',
+            '每个 value 头维护一个 128×128 递归记忆矩阵（fp32）：先按 <code>exp(g)</code> 衰减旧状态，再写入当前 value 相对预测的误差 <code>δ=β(v−k̃ᵀS′)</code>，得到 <code>Sₜ=S′+k̃⊗δ</code>。48 个头的状态合起来就是这层的全部历史，不随序列变长。',
+            opRow(
+              tensorPanel({name:'Sₜ₋₁（更新前）',shape:'[B,48,128,128]',slice:'[0,head 0,0:4,0:4]',values:s0,cols:4}),
+              opOp('exp(g)·S+k̃⊗δ'),
+              tensorPanel({name:'Sₜ（写入后）',shape:'[B,48,128,128]',slice:'[0,head 0,0:4,0:4]',values:s1,cols:4,kind:'after'}),
+              opSign('Δ'),
+              tensorPanel({name:'ΔS = Sₜ − Sₜ₋₁',shape:'displayed [4,4]',slice:'[0:4,0:4]',values:ds,cols:4,kind:'delta'})
+            )),
+          opStep(5,'gdn','读取','记忆读出 y = q̃ᵀS','→ [B,S,6144]',
+            '用归一化后的查询 q̃ 从更新完的状态读出输出，48 个 value 头各 128 维，拼接成 6,144 维。',
+            opRow(
+              tensorPanel({name:'memory_read y',shape:'[B,S,48,128]',slice:'[0,last,head 0,0:4]',values:[.16,-.05,.28,.10],cols:4}),
+              opOp('flatten heads'),
+              tensorPanel({name:'y（拼接）',shape:'[B,S,6144]',slice:'[0,last,0:4]',values:[.09,-.03,.17,.06],cols:4,kind:'after'})
+            )),
+          opStep(6,'gdn','门控输出','RMSNormGated → Wo','→ [B,S,2560]',
+            '读出的 y 先过按 head_dim=128 归一的门控 RMSNorm，再被 Z 调制。<b>这里的门用 sigmoid</b>——2.4T-A95B 那条线用的是 swish，配置项 <code>output_gate_type</code> 就是管这个的。最后 Wo 把 6,144 压回 2,560，交还给 Gated Residual 的写门。',
+            opRow(
+              opScalars('教学标量',[['sigmoid(z₀)','.58'],['output_gate_type','sigmoid']]),
+              tensorPanel({name:'gated_read',shape:'[B,S,6144]',slice:'[0,last,0:4]',values:[.05,-.02,.10,.03],cols:4,kind:'after'}),
+              opOp('Wo','→'),
+              tensorPanel({name:'GDN 输出（交给写门）',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[.22,-.09,.31,.14],cols:4,kind:'after'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'六步：投影 → 短卷积 → 归一化/门控 → 状态写入 → 读取 → 门控输出。注意末步<b>不直接加残差</b>——写回由 Gated Residual 的写门负责。')
+      }
+      function qfQsaHTML(){
+        const picked=new Set([1,4,5,9,12,16]);
+        const blocks=Array.from({length:18},(_,i)=>`<i class="${picked.has(i)?'pick':''}">b${i}</i>`).join('');
+        const scores=[.31,.92,.12,.05,.88,.81,.22,.09,.17,.74,.03,.11,.69,.08,.19,.02,.63,.14];
+        const steps=[
+          opStep(1,'gqa','索引器投影','轻量 MQA 打分头','[B,S,2560] → 640',
+            '在主注意力之前，先由一个极小的索引器决定“看哪些历史”。一个线性层输出 <code>640 = 4×128 + 1×128</code>：4 个 query 头加 <b>1 个共享 key 头</b>。query 归一化后加 RoPE；key 按 token 存进一份独立的索引缓存——每 token 只有 128 维，比主 KV 便宜得多。',
+            opRow(
+              tensorPanel({name:'QSA 输入 x',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[-.11,.09,.04,-.06],cols:4}),
+              opOp('index_qk_proj'),
+              opWidget(150,`<div class="qkv-stack"><div>index q · 4×128</div><div>index k · 1×128</div></div>`),
+              opArrow(),
+              tensorPanel({name:'索引 query（RoPE 后）',shape:'[B,S,4,128]',slice:'[0,last,head 0,0:4]',values:[.41,-.18,.22,.07],cols:4,kind:'after'})
+            )),
+          opStep(2,'gqa','微块压缩','每 4 个 token 池化成一块','[B,L,128] → [B,L/4,128]',
+            '可见历史按<b>相邻 4 个 token 一块</b>切分，块内的索引 key 取<b>均值</b>得到一个代表向量，再归一化，并在<b>块首 token 的位置</b>上加 RoPE。这就是官方说的“micro-block level”——选择的最小单位是块，不是单个 token。',
+            opRow(
+              tensorPanel({name:'块内 4 个 token 的 key',shape:'[B,L,128]',slice:'[0, b3 的 4 个 token, 0:4]',values:[.22,-.14,.31,.08,.18,-.09,.27,.12,.25,-.17,.29,.05,.20,-.11,.33,.10],cols:4}),
+              opOp('mean → norm → RoPE'),
+              tensorPanel({name:'块代表 k̄',shape:'[B,L/4,128]',slice:'[0, b3, 0:4]',values:[.21,-.13,.30,.09],cols:4,kind:'after',axis:'RoPE 用的是块首 token 的位置'})
+            )),
+          opStep(3,'gqa','选块','relu 打分 + top-512','→ 512 块 = 2048 token',
+            '索引 query 与所有块代表点积，<b>先 relu 再对 4 个索引头求和</b>（负分直接归零，只有真正相关的头才贡献），除以 <code>√128</code>。取分数最高的 <code>512</code> 块，展开回 <code>512×4 = 2048</code> 个 token 位置。历史不足一整块的<b>尾巴总是保留</b>，所以最近的 token 永远看得到。',
+            opRow(
+              opWidget(330,`<span class="label">块分数（教学示例，18 块里选 6 块）</span><div class="block-row" style="margin-top:6px">${blocks}<i class="tail">tail</i></div>`),
+              opOp('topk 512'),
+              tensorPanel({name:'块分数',shape:'[B,S,L/4]',slice:'[0,last,0:18]',values:scores,cols:6,kind:'after',axis:'紫色 = 被选中的块；金色 = 不足一块的尾巴，无条件保留'})
+            )),
+          opStep(4,'gqa','主投影','QKV + gate','[B,S,2560] → Q/K/V/gate',
+            '主注意力这边：<code>q_proj</code> 一次输出 <code>12288 = 24×256×2</code>，对半劈成 24 个 Q 头和 24 个 gate；K、V 各只有 <b>2</b> 组（<code>2×256</code>），24 个 Q 头按 12:1 共享。Q、K 逐头 RMSNorm 后施加 partial RoPE——只旋转每头 <b>前 64 / 256</b> 维。',
+            opRow(
+              opWidget(150,`<div class="qkv-stack"><div>Q + gate · 24×256</div><div>K · 2×256</div><div>V · 2×256</div></div>`),
+              `<div style="flex:0 0 auto"><div class="rope-disc"><i></i></div></div>`,
+              tensorPanel({name:'Q pair（RoPE 前）',shape:'[B,S,24,256]',slice:'[0,last,head 0,dims 0:2]',values:[.57,-.28],cols:2}),
+              opOp('rotate 0:64'),
+              tensorPanel({name:'Q pair（RoPE 后）',shape:'[B,S,24,256]',slice:'[0,last,head 0,dims 0:2]',values:[.63,.06],cols:2,kind:'after'})
+            )),
+          opStep(5,'gqa','稀疏打分','causal ∧ 选中块上 softmax','→ [B,S,24,256]',
+            '因果掩码与第 3 步选出来的掩码<b>取交集</b>，softmax 只在这些位置上归一化，其余位置权重恒为 0。上下文再长，每个 query 实际参与的也就 2,048 个 token——这是 Flash-Next 长上下文延迟的关键。',
+            opRow(
+              opWidget(300,`<span class="label">选中位置上的注意力权重（教学示例）</span><div class="score-bars" style="margin-top:6px">${[9,31,6,18,4,22,10].map(p=>`<i style="--h:${p*2.6}%"></i>`).join('')}</div>`),
+              opOp('softmax · A·V'),
+              tensorPanel({name:'attention 输出',shape:'[B,S,24,256]',slice:'[0,last,head 0,0:4]',values:[.18,-.07,.24,.11],cols:4,kind:'after'})
+            )),
+          opStep(6,'gqa','门控输出','sigmoid(gate) → Wo','→ [B,S,2560]',
+            '24 头拼成 6,144 维后逐元素乘 <code>sigmoid(gate)</code>——gate 来自第 4 步 q_proj 的另一半，与 Q 同源。最后 <code>o_proj</code> 压回 2,560，交给 Gated Residual 的写门。',
+            opRow(
+              opScalars('教学标量',[['sigmoid(gate₀)','.64']]),
+              tensorPanel({name:'门控后（拼接）',shape:'[B,S,6144]',slice:'[0,last,0:4]',values:[.12,-.04,.15,.07],cols:4}),
+              opOp('Wo','→'),
+              tensorPanel({name:'QSA 输出（交给写门）',shape:'[B,S,2560]',slice:'[0,last,0:4]',values:[.26,-.12,.19,.08],cols:4,kind:'after'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'六步：索引器投影 → 微块压缩 → 选 512 块 → 主 QKV+gate → 稀疏 softmax → 门控输出。前三步是 QSA 相对 GQA 新增的部分；块分数与注意力权重是教学示例。')
+      }
+      function qfMoeHTML(){
+        const hs=vals(40,5).map(v=>Math.round(Math.abs(v)*88)+8);
+        const ids=[37,112,208,19,401,77,355,6,289,444];
+        const selected=new Set([2,7,11,16,21,25,29,33,36,38]);
+        const probs=[.21,.17,.14,.11,.09,.08,.07,.05,.05,.03];
+        const expertSlice=[.12,-.08,.21,.04,-.15,.19,.07,-.11,.24,.03,-.06,.16,.18,-.02,.09,.13,-.19,.05,.11,-.07];
+        const steps=[
+          opStep(1,'moe','路由','Router 打分','x [N,2560] → [N,512]',
+            '每个 token 单独过一个 <code>[512,2560]</code> 的线性层，对 512 个专家各打一个分，softmax 成概率。路由是逐 token 的，同一句话里不同 token 会去不同专家。',
+            opRow(
+              tensorPanel({name:'MoE 输入 token',shape:'[N,2560]',slice:'[token 0,0:4]',values:[.19,-.26,.14,.07],cols:4}),
+              opOp('W_router'),
+              opWidget(320,`<div class="router-field">${hs.map((h,i)=>`<i class="${selected.has(i)?'on':''}" style="--h:${h}%"></i>`).join('')}</div>`)
+            )),
+          opStep(2,'moe','选择','Top-10 + 重归一化','→ 10 experts',
+            '只保留分数最高的 <code>10</code> 个专家，其余 502 个不参与计算，再把这 10 个权重重新归一化到和为 1。',
+            opRow(
+              tensorPanel({name:'重归一化 top-10 权重',shape:'indices:[N,10] · weights:[N,10]',slice:'weights[token 0,:]',values:probs,cols:10,kind:'after',axis:'教学 expert IDs = [37,112,208,19,401,77,355,6,289,444] · Σp = 1.00'})
+            )),
+          opStep(3,'moe','专家','并行 SwiGLU','2560 → 640 → 2560',
+            '被选中的 10 个专家各是一段 SwiGLU：<code>Wdown[SiLU(Wgate·x) ⊙ Wup·x]</code>。<b>中间维只有 640</b>——2.4T-A95B 的专家是 2,048，Flash-Next 用更窄更多的专家换激活量。权重里 gate 与 up 打包成一张 <code>[512,1280,2560]</code>。',
+            opBlock(`<div class="experts">${ids.map(e=>`<div class="expert"><b>E*${e}</b><code>2560→640→2560</code></div>`).join('')}</div>`)+
+            opRow(tensorTable('被选专家输出（每行一个 expert）',expertSlice,10,2,{shape:'[10,2560] · slice [:,0:2]',rowLabels:ids.map(e=>'E*'+e),colLabels:['d0','d1']}))),
+          opStep(4,'moe','共享专家','Shared expert · 常驻','→ [N,2560]',
+            '除路由专家外还有一个始终执行的 shared expert，同样是 640 中间维的 SwiGLU，由 <code>σ(gs)</code> 门控其贡献——<code>gs</code> 来自一个 <code>[1,2560]</code> 的线性层。它保证每个 token 都有一条稳定公共通路。',
+            opRow(
+              `<div style="flex:0 0 auto"><div class="shared-expert">SHARED EXPERT · 640 · always active</div></div>`,
+              opOp('σ(gs)·'),
+              tensorPanel({name:'shared expert 输出',shape:'[N,2560]',slice:'[token 0,0:4]',values:[.18,-.04,.13,.06],cols:4}),
+              opScalars('教学',[['shared_gate','.62']])
+            )),
+          opStep(5,'moe','合并','加权求和','→ [N,2560]',
+            '按路由概率对 10 个专家输出加权求和，加上门控后的 shared expert。<b>这里不加残差</b>——和 mixer 一样，写回残差流是 Gated Residual 写门的活。',
+            opRow(
+              tensorPanel({name:'routed 求和 + gated shared',shape:'[N,2560]',slice:'[token 0,0:4]',values:[.16,-.07,.23,.09],cols:4,kind:'after'}),
+              opOp('→ 写门'),
+              tensorPanel({name:'MoE 输出（交给写门）',shape:'[N,2560]',slice:'[token 0,0:4]',values:[.16,-.07,.23,.09],cols:4,kind:'after'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'五步：路由打分 → top-10 选择 → 并行 SwiGLU → 常驻 shared expert → 加权合并。512/top10/640 是配置事实；expert ID、概率与激活值是教学示例。')
+      }
+      function qfNormHTML(){
+        const H=[.58,-.14,.33,.19,.71,-.09,.28,.24];
+        const Hn=[.74,-.18,.42,.24,.90,-.11,.35,.30];
+        const steps=[
+          opStep(1,'main','分组归一','hc_norm · 每支流独立','[B,S,10240] → 同 shape',
+            '骨干跑完后，先对 4 条支流各做一次 RMSNorm（group_size = 2560）。<b>这个模型没有独立的 final norm 权重</b>——权重清单里根本不存在 <code>model.norm.weight</code>，最终归一化就长在合流模块里，名字叫 <code>hyper_connection_mixer.hc_norm</code>。',
+            opRow(
+              tensorPanel({name:'H₄₈（before）',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:H,cols:4}),
+              opOp('4 × RMSNorm(2560)'),
+              tensorPanel({name:'Ĥ（after）',shape:'[B,S,10240]',slice:'[0,last, b0:0:4 | b1:0:4]',values:Hn,cols:4,kind:'after'})
+            )),
+          opStep(2,'main','读门合流','低秩 sigmoid 门 + 分支平均','[B,S,10240] → [B,S,2560]',
+            '和每层的读门是同一套结构（10240→320→10240、SiLU 后 sigmoid、乘完对 4 条支流取平均），唯一的区别是<b>它没有写门</b>：合流之后不再写回，数据从此变成一条 2,560 维的流，直接交给 LM Head。',
+            opRow(
+              opWidget(260,`<span class="label">四条支流已经分化（教学值）</span><div class="stream-lane"><i class="hot">.88</i><i>.29</i><i>.57</i><i>.41</i></div>`),
+              opOp('g ⊙ Ĥ → mean'),
+              tensorPanel({name:'合流后的 hidden',shape:'[B,S,2560]',slice:'[0,last,0:8]',values:[.74,-1.18,.39,1.02,-.51,.23,1.31,-.77],cols:8,kind:'after'})
+            ))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}<div class="norm-formula" style="margin-top:11px">x = mean_b( sigmoid(W_up·SiLU(W_down·Ĥ/4)) ⊙ Ĥ )，Ĥ = hc_norm(H₄₈)　·　无写门</div></div>`,'两步：分组归一 → 读门合流。这一站同时承担了别的模型里“final norm”的职责，所以下一站 LM Head 不再归一化。')
+      }
+      function qfLmheadHTML(){
+        const rows=[['微块',13.12,96],['稀疏',12.64,86],['注意力',12.11,76],['选择',11.66,64],['历史',11.19,51],['预算',10.74,39]];
+        const steps=[
+          opStep(1,'main','投影','Wlm · x → logits','[B,2560] → [B,248320]',
+            '<b>这一层只有一个操作。</b>上一站合流时已经归一化过，参考实现里 <code>lm_head</code> 直接吃 <code>last_hidden_state</code>，中间没有再插一次 norm——所以这里不像前两个模型那样还有一步 Final RMSNorm，只剩一次矩阵乘法。权重 <code>[248320,2560]</code> <b>不与 Embedding 绑权</b>。',
+            opRow(
+              tensorPanel({name:'合流后 hidden x_last',shape:'[B,2560]',slice:'[0,0:8]',values:[.74,-1.18,.39,1.02,-.51,.23,1.31,-.77],cols:8}),
+              opOp('× Wlmᵀ'),
+              opWidget(300,`<span class="label">LM Head · [248320,2560]</span><div style="margin-top:5px">${matrix(12,24,19)}</div>`),
+              opArrow(),
+              tensorPanel({name:'candidate logits',shape:'[B,248320]',slice:'[0, 六个教学候选 ID]',values:rows.map(r=>r[1]),cols:6,kind:'after'})
+            )+opSub('输出结果排序展示：最高的 6 个 logit',
+              `<div class="logits">${rows.map((r,i)=>`<div class="logit ${i===0?'selected':''}"><b>${r[0]}</b><span style="height:10px;background:#e4eae8"><i style="--w:${r[2]}%"></i></span><code>${r[1].toFixed(2)}</code></div>`).join('')}</div>`,'教学候选'))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'只有一个操作：乘不绑权的 LM Head。灰色区块是同一操作的结果排序展示，不是第二步。')
+      }
+      function qfOutputHTML(){
+        const toks=['微块',' 稀疏',' 注意力',' 把',' 长上下文',' 压到'];
+        const steps=[
+          opStep(1,'main','拼接','incremental_decode','token IDs → UTF-8',
+            '采样 token pieces 增量解码拼回文字。图文输入最终仍由语言模型逐 token 输出，视觉向量只参与上下文、不直接输出像素。',
+            opBlock(`<div class="output-tokens" style="justify-content:flex-start">${toks.map(t=>`<span class="out-token">${esc(t)}</span>`).join('')}</div><div class="sentence-out" style="margin:18px 0 0">微块稀疏注意力把长上下文压到 2048 个 token</div>`)),
+          opStep(2,'main','解析','服务 parser → 流式事件',null,
+            'parser 把原始 token 流切成增量事件推送给客户端。',
+            opBlock(`<div class="stream-lines" style="margin:0"><span class="reason">MODEL RAW TOKENS:</span> 微块稀疏注意力把长上下文压到 2048 个 token<br><span class="answer">SERVICE EVENT:</span> data: {"delta":{"content":"压到 2048 个 token"}}</div>`)),
+          opStep(3,'main','回环','emitted token → 下一次 Decode',null,
+            '未停止则采样 token 作为下一次 Decode 输入；回环是一拍关系（发出 y₁ 时 cache 仍覆盖 P）。Flash-Next 自带 <b>1 层 MTP</b>（config 里 <code>mtp.hybrid=true</code>、<code>layer_types=["full_attention"]</code>，模型卡记为 4B 参数），可由引擎用于投机解码；它不在普通 decode 主路径上，所以没有画成一站。这一轮要重新回环的状态有三份：QSA 的 KV 缓存、GDN 的 48 个递归状态，以及 N-gram 用的前两个 token ID。',
+            opBlock(`<div class="stream-lines" style="margin:0;background:#0f1b18">cache=P → emit y₁ → Decode(input=y₁, cache=P) → cache=P+y₁ → sample y₂<br>回环状态：KV cache（12 层 QSA）· recurrent state（36 层 GDN）· ngram context（2 个 ID）</div>`))
+        ];
+        return focusWrap(`<div class="block-scene">${opPipe(steps)}</div>`,'输出三步：解码拼句 → parser 流式 → token 回环。MTP 是配置事实但需引擎显式启用，因此不塞进主路径。')
+      }
+      const renders={request:requestHTML,tokenizer:tokenizerHTML,embedding:embeddingHTML,decoder:decoderHTML,norm:normHTML,gdn:gdnHTML,attention:attentionHTML,moe:moeHTML,lmhead:lmheadHTML,sampler:samplerHTML,output:outputHTML};
       const q35Renders={request:q35RequestHTML,tokenizer:q35TokenizerHTML,vision:q35VisionHTML,embedding:q35EmbeddingHTML,decoder:q35DecoderHTML,norm:q35NormHTML,gdn:q35GdnHTML,attention:q35AttentionHTML,ffn:q35FfnHTML,lmhead:q35LmheadHTML,sampler:samplerHTML,output:q35OutputHTML};
-      const activeRenders=()=>state.model==='q35'?q35Renders:renders;
+      const qfRenders={request:qfRequestHTML,tokenizer:qfTokenizerHTML,vision:qfVisionHTML,embedding:qfEmbeddingHTML,decoder:qfDecoderHTML,norm:qfNormHTML,ngram:qfNgramHTML,gres:qfGresHTML,gdn:qfGdnHTML,qsa:qfQsaHTML,moe:qfMoeHTML,lmhead:qfLmheadHTML,sampler:samplerHTML,output:qfOutputHTML};
+      const activeRenders=()=>({q38:renders,q35:q35Renders,qflash:qfRenders})[state.model]||renders;
 
       function stopOverviewTrace(){if(state.overviewTimer){clearTimeout(state.overviewTimer);state.overviewTimer=null}}
       function payloadPosition(index){
@@ -1044,8 +1490,9 @@
       function updateModelChrome(){
         const p=profile();brandModel.textContent=p.brand;modelSelect.value=state.model;modelStatus.textContent=p.status;document.title=`${p.shortName} · 可下钻模型架构图`;
         document.getElementById('sourceLinks').innerHTML=p.sources.map(([label,url])=>`<a href="${url}" target="_blank" rel="noreferrer">${esc(label)}</a>`).join('');
-        document.getElementById('hiddenLegend').textContent=`${p.hidden} 维残差流和确定 shape`;
-        document.getElementById('orangeLegend').textContent=state.model==='q38'?'MoE 路由、专家和采样':'橙色仅用于采样；绿色是 Dense FFN';
+        document.getElementById('hiddenLegend').textContent=p.hiddenLegend;
+        document.getElementById('orangeLegend').textContent=p.orangeLegend;
+        document.getElementById('purpleLegend').textContent=p.purpleLegend;
         document.getElementById('boundaryWarning').innerHTML=`<strong>边界：</strong>页面未加载 ${esc(p.shortName)} 权重。架构、shape 和操作顺序来自配置/实现；热力图、attention、logits、token ID 与所有小数都是明确标注的教学示例。`;
       }
       function switchModel(id){if(!profiles[id])return;stopOverviewTrace();state.model=id;state.traceModule=0;state.tracePhase='before';state.overviewPaused=false;updateModelChrome();open('overview')}
