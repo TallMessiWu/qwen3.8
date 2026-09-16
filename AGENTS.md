@@ -23,7 +23,7 @@ This file provides guidance to coding agents (Claude Code, Codex CLI, …) when 
 qwen3.8/                   # 主仓（git，分支 main）
 ├── AGENTS.md              # 本文件
 ├── .agents/skills/        # 技能目录
-├── skills-lock.json       # 外部技能来源与哈希（mattpocock/skills），由技能自身维护，勿手改
+├── skills-lock.json       # 外部技能来源与哈希（mattpocock/skills、tt-a1i/archify），由 skills CLI 维护，勿手改
 ├── pyproject.toml         # 本机 uv 环境的依赖清单（venv 在 .venv/，不进主仓）
 ├── scripts/               # 交给用户在服务器上跑的验证/复现脚本
 │   ├── bench/             # 算子精度与性能基准，长期复用
