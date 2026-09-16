@@ -110,6 +110,7 @@ docker run --name "$CONTAINER_NAME" \
     --detach \
     --net=host \
     --pid=host \
+    --ipc=host \
     --privileged=true \
     --shm-size=2g \
     --device=/dev/davinci_manager \
@@ -126,6 +127,7 @@ docker run --name "$CONTAINER_NAME" \
     --device=/dev/davinci7 \
     --volume=/usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume=/usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume=/etc/ascend_install.info:/etc/ascend_install.info \
     --volume=/root/host:/root/host \
     --volume=/usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
     --volume=/usr/local/sbin:/usr/local/sbin \
