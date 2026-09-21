@@ -25,7 +25,7 @@ DEFAULT_VLLM_ASCEND_REPO = (
     "/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp"
 )
 EVAL_WRAPPERS = {
-    "gsm8.sh": "gsm8k_gen_0_shot_cot_chat_prompt",
+    "gsm8k.sh": "gsm8k_gen_0_shot_cot_chat_prompt",
     "gpqa.sh": "gpqa_gen_0_shot_cot_chat_prompt",
     "mmmu.sh": "mmmu_gen",
 }
@@ -201,6 +201,11 @@ class ScriptDefaultsTest(unittest.TestCase):
             for var in EVAL_ENV_VARS:
                 with self.subTest(script=name, var=var):
                     self.assertIn(var, text)
+
+    def test_gsm8k_wrapper_is_not_shadowed_by_its_old_name(self):
+        # The benchmark is GSM8K and the wrapper shipped for a while as gsm8.sh.
+        # A leftover copy would keep running, without whatever was fixed since.
+        self.assertFalse((SCRIPTS_DIR / "gsm8.sh").exists())
 
     def test_eval_wrappers_differ_only_in_dataset(self):
         # Three near-identical wrappers drift the way 27B.sh and 397B.sh did.

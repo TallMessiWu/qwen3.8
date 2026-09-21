@@ -126,7 +126,7 @@ once, because `docker run` alone would skip the vLLM-Ascend install.
 Run against an already-serving endpoint, so they need a server but no NPU of
 their own.
 
-- `gsm8.sh` -- GSM8K, zero-shot chain-of-thought chat prompt.
+- `gsm8k.sh` -- GSM8K, zero-shot chain-of-thought chat prompt.
 - `gpqa.sh` -- GPQA, zero-shot chain-of-thought chat prompt.
 - `mmmu.sh` -- MMMU, multimodal, so the server has to accept images.
 - `run_ais_bench.sh` -- the shared entry point all three of them exec.
@@ -138,11 +138,11 @@ Aim them at a service with environment variables, not by copying `ais_bench`'s
 model configs:
 
 ```bash
-VLLM_PORT=7969 ./gsm8.sh                     # another service on this box
+VLLM_PORT=7969 ./gsm8k.sh                     # another service on this box
 VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gpqa.sh    # a service on another box
-VLLM_URL=http://gw.example/prefix/ ./gsm8.sh # a gateway with a path
-MODEL_NAME=qwen3.8 ./gsm8.sh                 # else /v1/models gets probed
-AIS_MODEL_CFG=vllm_api_stream_chat ./gsm8.sh
+VLLM_URL=http://gw.example/prefix/ ./gsm8k.sh # a gateway with a path
+MODEL_NAME=qwen3.8 ./gsm8k.sh                 # else /v1/models gets probed
+AIS_MODEL_CFG=vllm_api_stream_chat ./gsm8k.sh
 ```
 
 Hand-editing the endpoint into `configs/models/vllm_api/*.py` is what this
@@ -174,7 +174,7 @@ matches exactly once and aborts otherwise: a silent miss would leave the eval
 pointed at the template's default port, which reads as a completed run against
 the wrong box. `scripts/tests/test_ais_bench_model_cfg.py` pins that.
 
-Extra arguments are forwarded verbatim, so `./gsm8.sh --work-dir ./outputs/run1`
+Extra arguments are forwarded verbatim, so `./gsm8k.sh --work-dir ./outputs/run1`
 works. `--dump-eval-details` is always on, which is what leaves the per-question
 requests and answers under `outputs/` for a wrong answer to be read back.
 

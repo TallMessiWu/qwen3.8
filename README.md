@@ -273,7 +273,7 @@ bash scripts/setup/create-container.sh \
     │   ├── serve_qwen3.8_2.4t_single_node_4layer.sh # 单机裁层冒烟
     │   ├── npu-cleaner.sh           # 清理残留在指定卡上的进程
     │   ├── curl.sh                  # 多模态请求冒烟
-    │   ├── gsm8.sh                  # GSM8K 精度评测，需已起服务
+    │   ├── gsm8k.sh                 # GSM8K 精度评测，需已起服务
     │   ├── gpqa.sh                  # GPQA 精度评测，需已起服务
     │   ├── mmmu.sh                  # MMMU 多模态精度评测，需已起服务
     │   ├── run_ais_bench.sh        # 三个评测脚本共用的 ais_bench 入口

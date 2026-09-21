@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ais_bench 精度评测的公共入口，gsm8.sh / gpqa.sh / mmmu.sh 都走这里。
+# ais_bench 精度评测的公共入口，gsm8k.sh / gpqa.sh / mmmu.sh 都走这里。
 # 直接调用时第一个参数是数据集名：./run_ais_bench.sh <dataset> [附加参数...]
 #
 # 支持的环境变量：

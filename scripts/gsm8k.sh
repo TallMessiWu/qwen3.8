@@ -14,11 +14,11 @@ set -euo pipefail
 #
 # 脚本名之后的参数原样透传给 ais_bench，例如 --work-dir、--batch-size、--debug。
 #
-#   ./gsm8.sh
-#   VLLM_PORT=7969 ./gsm8.sh                        # 同机的另一个服务
-#   VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gsm8.sh       # 别的机器上的服务
-#   VLLM_URL=http://gw.example/prefix/ ./gsm8.sh    # 带路径的网关
-#   MODEL_NAME=qwen3.8 ./gsm8.sh --batch-size 16
+#   ./gsm8k.sh
+#   VLLM_PORT=7969 ./gsm8k.sh                        # 同机的另一个服务
+#   VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gsm8k.sh       # 别的机器上的服务
+#   VLLM_URL=http://gw.example/prefix/ ./gsm8k.sh    # 带路径的网关
+#   MODEL_NAME=qwen3.8 ./gsm8k.sh --batch-size 16
 #
 # 老版本 ais_bench 没有地址覆盖参数，这时脚本会自动在 .ais_bench_configs/ 下按端点
 # 生成一份改好地址的配置再跑，那个目录是脚本产物，不用手动维护。
