@@ -179,8 +179,9 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 - `junlin-c8-mxfp` —— 跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP + PD 分离），基于该 PR 头部。容器和本机 venv 默认 editable 安装的就是它。它的 QFA 来自外部 `cann_ops_transformer` 包，csrc 里没有算子源码，也没有 `VLLM_ASCEND_ENABLE_QFA` 开关。
 - `junlin-qfa` —— QFA 算子接入主线，基于 upstream/main，官方 master QFA 已 vendor 进 csrc。`scripts/setup/` 下三个 `*qfa*` 构建脚本仍默认指向它，因为只有它能从 csrc 编出 QFA。
+- `junlin-c8-mxfp-16614` —— 从上游 PR 16614 头部（本地快照 `pr-16614`）派生。PR 16614 就是 `junlin-c8-mxfp-16278` 那 10 个提交被 rebase 到更新的上游，补丁内容一致。在它之上多两个提交，修的是 **hybrid C8 的 KV 容量只有 BF16 的四分之一**（2026-09-21，仅本机验证，真机待验）：mamba 的配置钩子跑在 `quant_config` 赋值之前，看不到 C8，按 BF16 把 page 定成「2048 token」那么大；随后 `refresh_block_size` 又把 block 写死成 512，于是每个 attention page 有 87% 是填充。现在 hybrid 下按 FP8 字节重算——block 取「一个 SSM state 能装下的 FP8 token 数」（2.4T@TP8 是 4096 = 8 个 512 的 QFA kernel 块），K 段与 ssm 段逐块重合，和 BF16 路径同一个不变量；不能整除时直接报错，凑整会让两组的 block id 串扰。配套把 prefix-cache 的 CoW 块拷贝改成按 kernel 行展开。`junlin-c8-mxfp`、`junlin-c8-mxfp-16278`、`junlin-qfa` 都还带着写死 512 的旧逻辑，这两个提交能无冲突 cherry-pick 过去。
 
-两条分支各自带着同样的两个真机故障修复，都是「值在错误的时刻被固定」这一类：
+前两条分支各自带着同样的两个真机故障修复，都是「值在错误的时刻被固定」这一类：
 
 1. **MoE 三处 TP 规约按当前通信方式重算**。`ALLGATHER` 是唯一不在融合 kernel 里做 TP 规约的通信方式，而通信方式随每步 token 数变化；原来那个判据在编译区里求值一次、被烘成捕获期 dummy run 的值，长 prompt 下 all_reduce 整个没执行，模型直接吐 EOS。三个消费点必须同时改，只改一处会让 shared 被规约两次、从吐 EOS 变成整段乱码。
 2. **C8_MXFP 的 V scale 缓存不能在捕获期标记为已填充**。ACL 图捕获只记录不执行，而记录「填过了」的那行 Python 是真执行的，于是 V 的 scale 缓存永远全零、反量化后 attention 恰好吐零。target 不受影响，draft 第一次走到这段就是捕获本身，表现为一开 draft 图 MTP 接受率就塌。
