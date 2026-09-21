@@ -133,6 +133,9 @@ their own.
 - `gen_ais_bench_model_cfg.py` -- rewrites the endpoint into a copy of
   `ais_bench`'s own model template, for builds too old to take it on the
   command line. `run_ais_bench.sh` calls it; it also runs standalone.
+- `ais_bench_preflight.py` -- sends the request `ais_bench` is about to send
+  and prints the server's answer when it is a rejection. `run_ais_bench.sh`
+  calls it before handing over; it also runs standalone.
 
 Aim them at a service with environment variables, not by copying `ais_bench`'s
 model configs:
@@ -143,7 +146,53 @@ VLLM_IP=10.0.0.5 VLLM_PORT=8000 ./gpqa.sh    # a service on another box
 VLLM_URL=http://gw.example/prefix/ ./gsm8k.sh # a gateway with a path
 MODEL_NAME=qwen3.8 ./gsm8k.sh                 # else /v1/models gets probed
 AIS_MODEL_CFG=vllm_api_stream_chat ./gsm8k.sh
+PREFLIGHT=0 ./gsm8k.sh                        # skip the preflight
 ```
+
+Go through the wrappers rather than typing the `ais_bench` command they end up
+running. A bare `ais_bench --models vllm_api_general_chat.py ...` aims at
+whatever the shipped template says -- `localhost:8080` until someone edits
+`site-packages` -- and the container runs with `--net=host`, so any service on
+the box can be what answers there.
+
+The preflight is on by default because `ais_bench` cannot say why a request
+failed: it keeps the HTTP reason phrase (`output.error_info = response.reason`)
+and drops the body, which is where vLLM puts the explanation. A context
+overflow, a checkpoint without a chat template and an unsupported sampling
+parameter all arrive as the two words `Bad Request`. Warmup then fails, the
+run carries on into the evaluation stage regardless, prints an empty summary
+table and exits 0. So `ais_bench_preflight.py` sends the same request first and
+answers four things in one go:
+
+- whether the URL is proxied. `ais_bench` posts through aiohttp with
+  `trust_env=True`, and the container's `.bashrc` sources a proxy script; with
+  the target host missing from `no_proxy`, a request to `localhost` goes to the
+  proxy. The preflight makes the same decision from the same two urllib
+  functions and prints it, credentials redacted.
+- who answers `v1/models`, with each card's `root` and `max_model_len`.
+- what `v1/chat/completions` says. The body is built the way `ais_bench` builds
+  it, with `max_tokens` and `generation_kwargs` read out of the model config
+  that is about to be loaded rather than assumed, then overridden by any
+  `--max-out-len` / `--generation-kwargs` among the forwarded arguments the way
+  newer `ais_bench` applies them: a raised `max_out_len` is the usual way to
+  overflow a context. It is always sent with `stream=True` and dropped after
+  the first chunk, because every rejection of this kind happens before
+  generation starts and the preflight then costs one prefill however large
+  `max_out_len` is. The price is a second shape to recognise: sampling
+  parameters are validated inside the generator, by which time a streaming
+  response has already sent its 200, so vLLM reports the error as the first
+  SSE event. `ais_bench`'s non-streaming request gets a 400 for the same
+  thing, and the preflight treats both as `RED`.
+- dataset checks, currently one: every GSM8K reference has to contain `#### `.
+  `gsm8k_dataset_postprocess` does `text.split('#### ')[1]` on all of them
+  before it reads a single prediction, so one reference without the marker
+  ends the run with an `IndexError` after the whole inference has finished.
+
+`RED` stops the run before `ais_bench` starts. The model config is read with
+`ast`, never imported, and a field the request needs that is not a literal is
+`RED` too -- a guessed body would be a second opinion about a different
+request. `scripts/tests/test_ais_bench_preflight.py` pins all of it against a
+throwaway local server.
 
 Hand-editing the endpoint into `configs/models/vllm_api/*.py` is what this
 avoids, and putting `os.environ.get(...)` in one of those files does not work:

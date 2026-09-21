@@ -278,6 +278,7 @@ bash scripts/setup/create-container.sh \
     │   ├── mmmu.sh                  # MMMU 多模态精度评测，需已起服务
     │   ├── run_ais_bench.sh        # 三个评测脚本共用的 ais_bench 入口
     │   ├── gen_ais_bench_model_cfg.py # 老版 ais_bench 用：按端点改写模型配置
+    │   ├── ais_bench_preflight.py   # 开跑前预检：打印服务端拒绝请求的原因
     │   ├── bench/                   # 算子精度与性能基准，长期复用
     │   ├── checks/                  # 权重与设备体检，长期复用
     │   ├── setup/                   # 构建与安装入口

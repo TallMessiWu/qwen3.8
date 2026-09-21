@@ -11,6 +11,7 @@ set -euo pipefail
 #   VLLM_URL        完整 URL，给了它就忽略 VLLM_IP / VLLM_PORT
 #   MODEL_NAME      模型名，不给则由服务的 /v1/models 自行探测
 #   AIS_MODEL_CFG   ais_bench 自带的模型配置模板，默认 vllm_api_general_chat
+#   PREFLIGHT       设为 0 跳过开跑前的预检，默认开
 #
 # 脚本名之后的参数原样透传给 ais_bench，例如 --work-dir、--batch-size、--debug。
 #

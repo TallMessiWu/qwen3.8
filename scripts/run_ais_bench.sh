@@ -11,8 +11,15 @@ set -euo pipefail
 #   VLLM_URL        完整 URL，给了它就忽略 VLLM_IP / VLLM_PORT
 #   MODEL_NAME      模型名，不给则由服务的 /v1/models 自行探测
 #   AIS_MODEL_CFG   ais_bench 自带的模型配置模板，默认 vllm_api_general_chat
+#   PREFLIGHT       设为 0 跳过开跑前的预检，默认开
 #
 # 数据集名之后的参数原样透传给 ais_bench，例如 --work-dir、--batch-size、--debug。
+#
+# 预检（ais_bench_preflight.py）为什么默认开：ais_bench 对失败的请求只留 HTTP 状态
+# 短语，响应体直接丢掉，而 vLLM 把拒绝的原因写在响应体里。服务端一旦拒了请求，这边
+# 只看得到 "Bad Request" 两个词，warmup 全败后它还会接着跑评测阶段、汇总出一张空表、
+# 以退出码 0 收场。预检照 ais_bench 的拼法先发同一个请求，把响应体打出来，RED 就
+# 不往下跑。直接敲 ais_bench 命令绕过本脚本，就同时绕过了地址覆盖和这一步。
 #
 # 为什么不把地址写进 ais_bench 自带的 configs/models/vllm_api/*.py：
 # 那些文件 import 了 ais_bench 自己的模块，mmengine 的 Config._is_lazy_import 因此
@@ -58,43 +65,48 @@ else
     endpoint="${VLLM_IP:-localhost}:${VLLM_PORT:-6969}"
 fi
 
+# 用 ais_bench 自己的解释器跑两个辅助脚本，否则可能 import 不到它。判据就是能不能
+# import 到，因为 shebang 可能是 /usr/bin/env python3 这种，第一个词并不是解释器本身。
+ais_python="$(head -1 "$(command -v ais_bench)" | sed 's|^#!||' | awk '{print $1}')"
+if [[ ! -x "$ais_python" ]] || ! "$ais_python" -c "import ais_bench" >/dev/null 2>&1; then
+    ais_python=python3
+fi
+
+endpoint_args=()
+if [[ -n "${VLLM_URL:-}" ]]; then
+    endpoint_args+=(--url "$VLLM_URL")
+else
+    endpoint_args+=(--host-ip "${VLLM_IP:-localhost}" --host-port "${VLLM_PORT:-6969}")
+fi
+if [[ -n "${MODEL_NAME:-}" ]]; then
+    endpoint_args+=(--model-name "$MODEL_NAME")
+fi
+
 if ais_bench --help 2>&1 | grep -q -- '--host-ip'; then
     mode="cli-override"
-    args+=(--models "$template.py")
-    if [[ -n "${VLLM_URL:-}" ]]; then
-        args+=(--url "$VLLM_URL")
-    else
-        args+=(--host-ip "${VLLM_IP:-localhost}" --host-port "${VLLM_PORT:-6969}")
-    fi
-    if [[ -n "${MODEL_NAME:-}" ]]; then
-        args+=(--model-name "$MODEL_NAME")
-    fi
+    args+=(--models "$template.py" "${endpoint_args[@]}")
+    preflight_cfg=(--template "$template")
 else
     mode="generated-config"
-    # 用 ais_bench 自己的解释器，否则可能 import 不到它。判据就是能不能 import 到，
-    # 因为 shebang 可能是 /usr/bin/env python3 这种，第一个词并不是解释器本身。
-    ais_python="$(head -1 "$(command -v ais_bench)" | sed 's|^#!||' | awk '{print $1}')"
-    if [[ ! -x "$ais_python" ]] || ! "$ais_python" -c "import ais_bench" >/dev/null 2>&1; then
-        ais_python=python3
-    fi
-
     cfg_dir="$script_dir/.ais_bench_configs"
     cfg_name="qwen38_$(printf '%s' "$endpoint" | tr -c 'A-Za-z0-9' '_')"
 
-    gen_args=(--out-dir "$cfg_dir" --name "$cfg_name" --template "$template")
-    if [[ -n "${VLLM_URL:-}" ]]; then
-        gen_args+=(--url "$VLLM_URL")
-    else
-        gen_args+=(--host-ip "${VLLM_IP:-localhost}" --host-port "${VLLM_PORT:-6969}")
-    fi
-    if [[ -n "${MODEL_NAME:-}" ]]; then
-        gen_args+=(--model-name "$MODEL_NAME")
-    fi
-
-    generated="$("$ais_python" "$script_dir/gen_ais_bench_model_cfg.py" "${gen_args[@]}")"
+    generated="$("$ais_python" "$script_dir/gen_ais_bench_model_cfg.py" \
+        --out-dir "$cfg_dir" --name "$cfg_name" --template "$template" "${endpoint_args[@]}")"
     echo "[ais_bench] 本机 ais_bench 不支持 --host-ip，已生成 $generated" >&2
     args+=(--models "$cfg_name" --config-dir "$cfg_dir")
+    preflight_cfg=(--config "$generated")
 fi
 
 echo "[ais_bench] dataset=$dataset endpoint=$endpoint mode=$mode" >&2
+
+if [[ "${PREFLIGHT:-1}" != "0" ]]; then
+    # "$@" 也交给它：新版 ais_bench 的 --max-out-len / --generation-kwargs 会改请求体。
+    if ! "$ais_python" "$script_dir/ais_bench_preflight.py" \
+            "${endpoint_args[@]}" "${preflight_cfg[@]}" --dataset "$dataset" -- "$@"; then
+        echo "[ais_bench] 预检 RED，没有启动评测。确认是误报再用 PREFLIGHT=0 跳过。" >&2
+        exit 1
+    fi
+fi
+
 exec ais_bench "${args[@]}" "$@"

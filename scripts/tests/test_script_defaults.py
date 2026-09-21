@@ -35,6 +35,7 @@ EVAL_ENV_VARS = (
     "VLLM_URL",
     "MODEL_NAME",
     "AIS_MODEL_CFG",
+    "PREFLIGHT",
 )
 
 
