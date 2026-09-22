@@ -67,7 +67,8 @@ import sys
 
 # Kernel-side layout constants (quant_flash_attn_metadata.h).
 METADATA_STRIDE_FALLBACK = 16  # FA_METADATA_SIZE == FD_METADATA_SIZE == 16
-AIC_FALLBACK, AIV_FALLBACK = 36, 72  # A5, as the operator's own example hardcodes
+AIC_FALLBACK, AIV_FALLBACK = 32, 64  # A5 measured via the wrapper's _get_core_nums;
+# the operator's own C++ example hardcodes 36/72, which is NOT what the runtime reports.
 ALIGN_BYTES = 4096
 
 QUANT_MODE_MXFP8 = 1
@@ -125,15 +126,34 @@ def kernel_need(internals, section_num: int) -> int:
     return stride + section_num * (aic + aiv) * stride
 
 
-def split_threshold_tokens(internals, head_dim: int, l2_bytes: int = 96 * 1024 * 1024) -> int:
-    """Sequence length past which CalcGridInfoSection starts splitting.
+L2_BYTES = 96 * 1024 * 1024  # param.l2Byte for quant_mode=1 (MXFP8) in the new delivery
 
-    Its bail-out is ``maxSingleHeadTokenCost <= l2Byte / aicCoreMaxNum`` with
-    ``singleHeadCost = S * head_dim * 1 * 2 + S * (head_dim + head_dim) * 1``
-    for FP8 (one byte per element), i.e. 4 * head_dim * S.
+
+def predict_first_bad_seq_len(internals, alloc: int, batch: int, heads: int, head_dim: int) -> int | None:
+    """Shortest prefill sequence whose plan no longer fits, or None if it always does.
+
+    CalcGridInfoSection packs heads into sections until one section's tokens
+    exceed l2Byte, so with ``singleHeadCost = 4 * head_dim * S`` (FP8, one byte
+    per element, Q+O plus K+V) across ``batch * heads`` heads::
+
+        sectionNum = ceil(batch * heads * 4 * head_dim * S / l2Byte)
+
+    and the buffer holds ``(alloc - stride) / ((aic + aiv) * stride)`` sections.
+    Note this is the count that OVERRUNS, not the count where splitting merely
+    begins -- splitting starts far earlier and is harmless while the sections
+    still fit. Getting that distinction wrong understates the safe range by an
+    order of magnitude.
     """
-    per_token = 4 * head_dim
-    return (l2_bytes // internals["aic"]) // per_token
+    stride, aic, aiv = internals["stride"], internals["aic"], internals["aiv"]
+    per_section = (aic + aiv) * stride
+    max_sections = (alloc - stride) // per_section
+    if max_sections < 1:
+        return 1
+    cost_per_token = batch * heads * 4 * head_dim
+    if cost_per_token <= 0:
+        return None
+    # smallest S with ceil(cost_per_token * S / L2) > max_sections
+    return (max_sections * L2_BYTES) // cost_per_token + 1
 
 
 def phase_budget(internals, batch: int, nq: int, nkv: int, head_dim: int) -> bool:
@@ -156,14 +176,16 @@ def phase_budget(internals, batch: int, nq: int, nkv: int, head_dim: int) -> boo
           f"  {'fits' if need_decode <= alloc else 'SHORT'}")
     print(f"    needed, prefill (sectionNum<={batch}*{nq}={batch * nq}) : {need_prefill}"
           f"  {'fits' if need_prefill <= alloc else 'SHORT'}")
-    threshold = split_threshold_tokens(internals, head_dim)
     print("  NOTE: the needs above are WORST CASE -- they assume sectionNum reaches")
     print("    batch * head_count. A delivery with param.l2Byte == 0 pins sectionNum")
     print("    at 1 whatever the heads are, so it never gets there. That is why the")
     print("    older package survives an arithmetic shortfall; only SCAN settles it.")
-    print("  sections only split once a single head's tokens exceed l2Byte/aic,")
-    print(f"    i.e. seq_len > ~{threshold} at head_dim={head_dim}. Below that sectionNum")
-    print(f"    stays 1 (need {kernel_need(internals, 1)}) and nothing overruns.")
+    stride, aic, aiv = internals["stride"], internals["aic"], internals["aiv"]
+    max_sections = (alloc - stride) // ((aic + aiv) * stride)
+    predicted = predict_first_bad_seq_len(internals, alloc, batch, nq, head_dim)
+    print(f"  this buffer holds {max_sections} sections; sectionNum grows as")
+    print(f"    ceil(batch * heads * 4 * head_dim * S / {L2_BYTES}), so prefill is")
+    print(f"    predicted to overrun from seq_len > {predicted}.")
     ok = need_prefill <= alloc
     if ok:
         verdict = "GREEN -- prefill fits"
@@ -283,10 +305,16 @@ def main() -> int:
         if first_bad is None:
             print("  [SCAN] every length survived on this delivery")
         else:
-            threshold = split_threshold_tokens(internals, args.head_dim)
-            print(f"  [SCAN] first failure at seq_len={first_bad}; sections are predicted to")
-            print(f"         start splitting past ~{threshold}, so this is "
-                  f"{'consistent' if first_bad > threshold else 'EARLIER THAN PREDICTED'}")
+            alloc = model_alloc(internals, args.batch, args.num_heads_kv)
+            if internals["alloc_fn"] is not None:
+                alloc = internals["alloc_fn"](args.batch, args.num_heads_kv)
+            predicted = predict_first_bad_seq_len(internals, alloc, args.batch,
+                                                  args.num_heads_q, args.head_dim)
+            prev = [s for s in seq_lens if s < first_bad]
+            bracket_ok = predicted is not None and (not prev or prev[-1] < predicted <= first_bad)
+            print(f"  [SCAN] first failure at seq_len={first_bad}; predicted overrun from")
+            print(f"         seq_len > {predicted}, and the last surviving probe was "
+                  f"{prev[-1] if prev else 'none'} -- {'consistent' if bracket_ok else 'NOT bracketed, the model is off'}")
 
     control_ok = None
     if "CONTROL" in phases and first_bad is not None:
