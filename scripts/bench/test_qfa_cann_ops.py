@@ -36,7 +36,9 @@ operator still honours the four assumptions attention_v1.py is built on:
                  (_qfa_v_descale_placeholder: quant_mode=1 refuses a null
                  v_descale, but nothing reads it under PA_NZ) must still be
                  accepted AND give bit-exact results against a full-size
-                 v_descale.
+                 v_descale. SKIPped on a delivery whose metadata op dropped
+                 v_descale entirely -- then the placeholder is simply dead
+                 code in attention_v1.py.
   GRAPH-DECODE   npugraph_ex capture with the metadata op inside the compiled
                  region, inputs swapped in place, replay vs eager bit-exact
   GRAPH-PREFILL  same for CAUSAL + TND q_descale -- the case no existing
@@ -52,10 +54,20 @@ Limits worth knowing before trusting a GREEN:
   - No CPU golden: a wrong-but-stable operator passes. Pair with
     test_qfa_op.py when the numerics themselves are in question.
 
+Interface drift: the argument set is not hardcoded. Every call is filtered
+through OpIface against the wrapper's own signature, so one script serves both
+the delivery attention_v1.py was written for and a newer one that dropped an
+argument (``v_descale`` on the metadata op is the known case). Whatever is
+withheld gets printed. --iface legacy sends the full set anyway, --iface new
+forces the metadata v_descale out even if the signature still lists it, and
+--drop is the escape hatch for anything else.
+
 Usage (inside the serving container, on one NPU):
     python3 scripts/bench/test_qfa_cann_ops.py
     python3 scripts/bench/test_qfa_cann_ops.py --model 27b
     python3 scripts/bench/test_qfa_cann_ops.py --cases SIG,PLAN-SIZE,PLAN-RO
+    python3 scripts/bench/test_qfa_cann_ops.py --iface new        # new contract
+    python3 scripts/bench/test_qfa_cann_ops.py --drop v_descale   # from both ops
     python3 scripts/bench/test_qfa_cann_ops.py --worktree /home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp-16614
 
 Prints [GREEN]/[RED]/[SKIP] per case, exits non-zero on any RED.
@@ -91,6 +103,12 @@ METADATA_KWARGS = [
     "max_seqlen_q", "max_seqlen_kv", "mask_mode", "win_left", "win_right",
     "layout_q", "layout_q_descale", "layout_kv", "layout_out",
 ]
+# The main op's seven leading tensors/ints. attention_v1.py passes these
+# positionally, run_main() passes them by keyword (so that a delivery dropping
+# one only loses that argument), which makes their NAMES part of the contract
+# this script checks -- v_descale above all, since it is where the V scale
+# cache enters the operator.
+MAIN_LEADING = ["q", "k", "v", "q_descale", "k_descale", "v_descale", "quant_mode"]
 MAIN_KWARGS = [
     "block_table", "p_scale", "cu_seqlens_q", "cu_seqlens_kv", "seqused_q",
     "seqused_kv", "sinks", "attn_mask", "metadata", "softmax_scale",
@@ -319,55 +337,137 @@ class Batch:
 
 
 # --------------------------------------------------------------------------
+# Interface adaptation
+# --------------------------------------------------------------------------
+class OpIface:
+    """What the delivered wrappers accept, and what this script therefore sends.
+
+    The newer ops-transformer delivery drops ``v_descale`` from the metadata
+    op. That parameter only ever existed because quant_mode=1 refused a null
+    one; nothing reads it under PA_NZ, which is the whole reason
+    attention_v1.py feeds it a two-byte placeholder
+    (_qfa_v_descale_placeholder). Rather than hardcode either delivery, every
+    call goes through here: a keyword the wrapper does not declare is not
+    sent, and whatever got dropped is printed once per op, so an interface
+    change can never quietly masquerade as a passing run.
+
+    --iface legacy sends the full set regardless (what attention_v1.py does
+    today), --iface new additionally forces the metadata v_descale out even if
+    the signature still lists it, and --drop takes any other keyword out of
+    both calls.
+    """
+
+    def __init__(self, main_op, metadata_op, mode: str = "auto", drop=()):
+        self.mode = mode
+        self.drop = set(drop)
+        self.params = {"metadata": self._params(metadata_op),
+                       "main": self._params(main_op)}
+        self._reported: set[str] = set()
+
+    @staticmethod
+    def _params(fn) -> set[str] | None:
+        """Declared parameter names, or None when anything goes."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return None
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return None  # **kwargs: send everything and let the op judge
+        return set(sig.parameters)
+
+    def accepts(self, which: str, name: str) -> bool:
+        params = self.params[which]
+        return params is None or name in params
+
+    def send(self, which: str, kwargs: dict) -> dict:
+        if self.mode == "legacy":
+            return dict(kwargs)
+        out, dropped = {}, []
+        for key, value in kwargs.items():
+            forced = key in self.drop or (
+                self.mode == "new" and which == "metadata" and key == "v_descale")
+            if forced or not self.accepts(which, key):
+                dropped.append(key)
+                continue
+            out[key] = value
+        if dropped and which not in self._reported:
+            self._reported.add(which)
+            print(f"  [iface] {which} op: not sending {dropped} (mode={self.mode})")
+        return out
+
+
+# Set by main(). A module global rather than a ctx entry so that the call
+# wrappers below keep the signature every case already calls them with.
+_IFACE: OpIface | None = None
+
+
+def _send(which: str, kwargs: dict) -> dict:
+    return kwargs if _IFACE is None else _IFACE.send(which, kwargs)
+
+
+# --------------------------------------------------------------------------
 # Call wrappers (argument sets copied from _get_qfa_metadata / _run_qfa)
 # --------------------------------------------------------------------------
 def build_metadata(metadata_op, batch: Batch, *, cu_seqlens_q, seqused_kv,
                    max_seqlen_q, mask_mode, layout_q_descale, v_descale=None):
-    return metadata_op(
-        batch.nq, batch.nkv, batch.d, QUANT_MODE_MXFP8,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=None,
-        seqused_q=None,
-        seqused_kv=seqused_kv,
-        v_descale=batch.v_descale_placeholder() if v_descale is None else v_descale,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=-1,
-        mask_mode=mask_mode,
-        win_left=-1,
-        win_right=-1,
-        layout_q=LAYOUT_TND,
-        layout_q_descale=layout_q_descale,
-        layout_kv=LAYOUT_PA_NZ,
-        layout_out=LAYOUT_TND,
-    )
+    args = {
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_kv": None,
+        "seqused_q": None,
+        "seqused_kv": seqused_kv,
+        "v_descale": batch.v_descale_placeholder() if v_descale is None else v_descale,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_kv": -1,
+        "mask_mode": mask_mode,
+        "win_left": -1,
+        "win_right": -1,
+        "layout_q": LAYOUT_TND,
+        "layout_q_descale": layout_q_descale,
+        "layout_kv": LAYOUT_PA_NZ,
+        "layout_out": LAYOUT_TND,
+    }
+    # The four leading ints stay positional: every delivery so far starts with
+    # (num_heads_q, num_heads_kv, head_dim, quant_mode).
+    return metadata_op(batch.nq, batch.nkv, batch.d, QUANT_MODE_MXFP8,
+                       **_send("metadata", args))
 
 
 def run_main(main_op, batch: Batch, *, q_fp8, q_descale, metadata, cu_seqlens_q,
              seqused_kv, max_seqlen_q, mask_mode, layout_q_descale):
     k, v, k_scale, v_scale = batch.caches_for_op()
-    result = main_op(
-        q_fp8, k, v, as_e8m0(q_descale), k_scale, v_scale, QUANT_MODE_MXFP8,
-        block_table=batch.block_table,
-        p_scale=None,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=None,
-        seqused_q=None,
-        seqused_kv=seqused_kv,
-        sinks=None,
-        attn_mask=(None if mask_mode == MASK_MODE_NO_MASK else batch.mask),
-        metadata=metadata,
-        softmax_scale=batch.softmax_scale,
-        mask_mode=mask_mode,
-        win_left=-1,
-        win_right=-1,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=-1,
-        layout_q=LAYOUT_TND,
-        layout_q_descale=layout_q_descale,
-        layout_kv=LAYOUT_PA_NZ,
-        layout_out=LAYOUT_TND,
-        return_softmax_lse=False,
-    )
+    # Keywords throughout, the leading tensors included, so that a delivery
+    # which drops one argument loses only that argument instead of shifting
+    # every later positional by one.
+    args = {
+        "q": q_fp8,
+        "k": k,
+        "v": v,
+        "q_descale": as_e8m0(q_descale),
+        "k_descale": k_scale,
+        "v_descale": v_scale,
+        "quant_mode": QUANT_MODE_MXFP8,
+        "block_table": batch.block_table,
+        "p_scale": None,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_kv": None,
+        "seqused_q": None,
+        "seqused_kv": seqused_kv,
+        "sinks": None,
+        "attn_mask": None if mask_mode == MASK_MODE_NO_MASK else batch.mask,
+        "metadata": metadata,
+        "softmax_scale": batch.softmax_scale,
+        "mask_mode": mask_mode,
+        "win_left": -1,
+        "win_right": -1,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_kv": -1,
+        "layout_q": LAYOUT_TND,
+        "layout_q_descale": layout_q_descale,
+        "layout_kv": LAYOUT_PA_NZ,
+        "layout_out": LAYOUT_TND,
+        "return_softmax_lse": False,
+    }
+    result = main_op(**_send("main", args))
     out = result[0] if isinstance(result, tuple) else result
     return out
 
@@ -406,11 +506,22 @@ def sane_output(name: str, out: torch.Tensor, num_tokens: int, nq: int, d: int) 
 # Cases
 # --------------------------------------------------------------------------
 def case_sig(ctx) -> bool:
-    """Hard gate: is every keyword attention_v1.py passes still there?"""
+    """Gate: is every keyword attention_v1.py passes still there?
+
+    One absence is tolerated and reported rather than failed: ``v_descale`` on
+    the METADATA op. It carries no information under PA_NZ (see
+    _qfa_v_descale_placeholder), so a delivery that drops it is a
+    simplification this script adapts to -- attention_v1.py then has dead code
+    to remove, not a bug to fix.
+
+    ``v_descale`` on the MAIN op is the opposite: it is where the V scale cache
+    enters the operator. If that one is gone, V dequantization has moved
+    somewhere else entirely and no result below can be trusted.
+    """
     main_op, metadata_op = ctx["ops"]
     ok = True
     for label, fn, expected in (("metadata", metadata_op, METADATA_KWARGS),
-                                ("main", main_op, MAIN_KWARGS)):
+                                ("main", main_op, MAIN_LEADING + MAIN_KWARGS)):
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError) as exc:
@@ -422,11 +533,25 @@ def case_sig(ctx) -> bool:
         missing = [k for k in expected if k not in params]
         print(f"  [{label}] {len(params)} params, **kwargs={var_kw}")
         print(f"  [{label}] signature: {sig}")
-        if missing and not var_kw:
-            print(f"  [{label}] MISSING keywords attention_v1.py passes: {missing}")
-            ok = False
-        elif missing:
+        if not missing:
+            continue
+        if var_kw:
             print(f"  [{label}] not named explicitly (absorbed by **kwargs): {missing}")
+            continue
+        tolerated = [k for k in missing if label == "metadata" and k == "v_descale"]
+        breaking = [k for k in missing if k not in tolerated]
+        if tolerated:
+            print(f"  [{label}] INTERFACE CHANGE, adapted: {tolerated} is gone. "
+                  f"attention_v1.py can drop _qfa_v_descale_placeholder and stop "
+                  f"passing it; the VDESC case below becomes moot.")
+        if breaking:
+            print(f"  [{label}] MISSING keywords attention_v1.py passes: {breaking}")
+            if label == "main" and "v_descale" in breaking:
+                print("  [main] v_descale is the V scale cache's entry point -- "
+                      "ask the operator team where V dequantization takes its "
+                      "scale now. Nothing below is meaningful until that is "
+                      "answered.")
+            ok = False
     return ok
 
 
@@ -535,10 +660,21 @@ def case_plan_ro(ctx) -> bool:
     return plan_stable and out_stable
 
 
-def case_vdesc(ctx) -> bool:
-    """Is the 6-D 1-element v_descale placeholder still accepted and inert?"""
+def case_vdesc(ctx):
+    """Is the 6-D 1-element v_descale placeholder still accepted and inert?
+
+    Returns None (SKIP) on a delivery whose metadata op has no v_descale at
+    all -- there is nothing left to be inert.
+    """
     main_op, metadata_op = ctx["ops"]
     batch = ctx["batch"]
+    iface = ctx["iface"]
+    if not iface.accepts("metadata", "v_descale") or iface.mode == "new":
+        print("  the metadata op does not take v_descale in this delivery "
+              f"(mode={iface.mode}) -- nothing to check.")
+        print("  => _qfa_v_descale_placeholder in attention_v1.py is dead code "
+              "against this package.")
+        return None
     step = plan_for(batch, [1] * 4, [300, 1025, 512, 4096])
     md_args = _md_args(step)
     try:
@@ -687,6 +823,15 @@ def main() -> int:
     parser.add_argument("--max-batch", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=8192,
                         help="largest query token total any case may build")
+    parser.add_argument("--iface", default="auto", choices=("auto", "legacy", "new"),
+                        help="which argument set to send: auto follows each "
+                             "wrapper's signature (default), legacy sends what "
+                             "attention_v1.py sends today, new additionally "
+                             "forces the metadata op's v_descale out")
+    parser.add_argument("--drop", default="",
+                        help="comma-separated keywords to withhold from BOTH ops "
+                             "(escape hatch for a change --iface does not cover, "
+                             "e.g. --drop v_descale)")
     parser.add_argument("--seed", type=int, default=20260922)
     args = parser.parse_args()
 
@@ -714,6 +859,21 @@ def main() -> int:
         print("      This is the package the junlin-c8-mxfp* branches call. "
               "Without it every case below is meaningless.")
         return 1
+    global _IFACE
+    _IFACE = OpIface(*ops, mode=args.iface,
+                     drop=[k.strip() for k in args.drop.split(",") if k.strip()])
+    print(f"iface mode={args.iface}"
+          + (f" drop={sorted(_IFACE.drop)}" if _IFACE.drop else ""))
+    for which in ("metadata", "main"):
+        declared = _IFACE.params[which]
+        if declared is None:
+            print(f"  {which} op: signature opaque -- sending everything")
+        else:
+            absent = [k for k in (METADATA_KWARGS if which == "metadata"
+                                  else MAIN_LEADING + MAIN_KWARGS)
+                      if k not in declared]
+            print(f"  {which} op: {len(declared)} declared params"
+                  + (f", not declared: {absent}" if absent else ""))
     mxfp, source = load_mxfp_helpers(args.worktree)
     print(f"layout helpers from: {source}")
 
@@ -724,7 +884,7 @@ def main() -> int:
           f"max_blocks_per_req={max_blocks} k_scale{tuple(batch.k_scale_cache.shape)} "
           f"v_scale{tuple(batch.v_scale_cache.shape)}")
 
-    ctx = dict(ops=ops, batch=batch, mxfp=mxfp,
+    ctx = dict(ops=ops, batch=batch, mxfp=mxfp, iface=_IFACE,
                max_kv=max_blocks * shape["block_size"], max_tokens=args.max_tokens)
 
     results = {}
