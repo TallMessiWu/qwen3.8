@@ -126,13 +126,56 @@ sectionNum = ceil(batch * num_heads_q * 4 * head_dim * S / l2Byte)
 
 ## 建议修法
 
-在 `quant_flash_attn_metadata()` 里按 layout 选头数再算分配，与 AICPU 侧的
-`baseInfo.kvHeadNum = isDecode ? numHeadsKv : numHeadsQ` 对齐：
+要改的是 wrapper 的分配侧，文件
+`attention/quant_flash_attn/torch_extension/quant_flash_attn.py`（行号对
+`f7fe4ec0d`）。让 `_calculate_max_schedule_size` 按 layout 选头数，与 AICPU 侧的
+`baseInfo.kvHeadNum = isDecode ? numHeadsKv : numHeadsQ` 对齐。
+
+**两处调用都要改，不能只改一处**：
+
+| 行 | 位置 | 作用 |
+| --- | --- | --- |
+| L242-244 | `quant_flash_attn_metadata_meta`（`@torch.library.register_fake`） | torch.compile 下 fake tensor 的 shape |
+| L394-395 | `quant_flash_attn_metadata` 本体 | 真机上实际 `torch.empty` 出来的 buffer |
+
+只改 L394，图模式下 fake tensor 与真实 tensor 的 shape 会对不上；只改 L242，真机
+照样越界。
 
 ```python
-heads = num_heads_kv if layout_q_descale == "N2TGD" else num_heads_q
-max_schedule_size = _calculate_max_schedule_size(batch_size, heads)
+def _calculate_max_schedule_size(batch_size, num_heads_kv, num_heads_q=None, layout_q_descale=None):
+    ...
+    # AICPU 侧 baseInfo.kvHeadNum = isDecode ? numHeadsKv : numHeadsQ，
+    # CalcGridInfoSection 的内层循环按它计数，所以 sectionNum 的上界随 layout 变。
+    heads = num_heads_kv
+    if num_heads_q is not None and layout_q_descale != "N2TGD":
+        heads = num_heads_q
+    fa_size = aic_num * METADATA_STRIDE * batch_size * heads
+    fd_size = aiv_num * METADATA_STRIDE * batch_size * heads
 ```
+
+判据写成 `!= "N2TGD"` 而不是 `== "TND"`，因为 **L242 的 meta kernel 里
+`layout_q_descale` 可能是 `None`** —— 它没有做真实分配侧 L387 那样的
+`layout_q_descale = "BSND" if layout_q_descale is None else layout_q_descale`
+归一化。`None != "N2TGD"` 取 `num_heads_q`，偏大偏安全，两侧结果也一致。
+
+### 附带：`_get_core_nums()` 的无 NPU 默认值与真机不符
+
+```python
+def _get_core_nums():
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        return 36, 72          # ← A5 真机是 32, 64
+    props = npu.get_device_properties()
+    return props.cube_core_num, props.vector_core_num
+```
+
+A5 上 `get_device_properties()` 返回 **32 / 64**，而无 NPU 分支的默认值是 36 / 72。
+两者对齐后常常相同（batch=4、num_heads_kv=1 时都落到 8192），但不总是——batch=10
+时一个 20480、一个 16384。meta kernel 与真实分配若分处有无 NPU 的两种环境，shape
+就会对不上。建议把默认值与真机对齐，或在拿不到设备属性时按上界取值。
+
+（算子自带的 C++ 示例 `test_aclnn_quant_flash_attn_metadata.cpp` 里也写死
+`(36 + 72)`，同样偏离真机值。）
 
 另建议让 AICPU 侧那段容量自检不要被静默跳过。目前是：
 
