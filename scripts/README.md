@@ -302,6 +302,21 @@ Long-lived, cheap, and read-only. Most need neither an NPU nor a server.
   checked that line, not that it is wrong. Guard detection is per function body,
   because a window of lines gets fooled by a neighbouring function's guard.
   `--noisy` adds in-forward allocation and D2H sync. Pure stdlib, no NPU.
+- `qfa_op_contract.py` -- does the delivered QFA operator still take what
+  `attention_v1.py` passes it? Introspects the two `cann_ops_transformer`
+  wrappers against the keyword sets the call sites use. `--save` a baseline on a
+  package that serves correctly, `--diff` it after every CANN swap; a renamed
+  keyword raises loudly, a changed default does not. Imports only, no NPU.
+- `qfa_metadata_capacity.py` -- does `quant_flash_attn_metadata` allocate enough
+  for the plan it then writes? The wrapper sizes the buffer with `num_heads_kv`
+  while the AICPU kernel picks `numHeadsQ` under a TND `layout_q_descale`
+  (prefill), so GQA leaves it G times short and the overrun aborts the AICPU --
+  which poisons the device and makes the traceback land on whatever op ran next.
+  BUDGET is arithmetic against the installed wrapper and needs no NPU; SCAN
+  calls the operator for real at rising sequence lengths, one subprocess each;
+  CONTROL reruns the length that died with `layout_q_descale="N2TGD"` and
+  nothing else changed. Exits 0 on a delivery that holds up -- run it on the old
+  package first to bank that baseline.
 
 ## setup/ -- build and install
 
