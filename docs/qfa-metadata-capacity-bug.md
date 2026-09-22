@@ -23,7 +23,7 @@ AICPU kernel 名都是 `QuantFlashAttnMetadata`，这是唯一的第一现场。
 
 分配方与写入方对"用哪个头数"的理解不一致。
 
-**Python wrapper**（`cann_ops_transformer/ops/attention/quant_flash_attn/quant_flash_attn.py`）：
+**Python wrapper**（安装后位于 `$CANN_HOME/python/site-packages/cann_ops_transformer/`，模块 `cann_ops_transformer.ops.attention.quant_flash_attn.quant_flash_attn`）：
 
 ```python
 max_schedule_size = _calculate_max_schedule_size(batch_size, num_heads_kv)
@@ -126,7 +126,7 @@ sectionNum = ceil(batch * num_heads_q * 4 * head_dim * S / l2Byte)
 
 ## 建议修法
 
-`_calculate_max_schedule_size` 按 layout 选头数，与 AICPU 侧的
+在 `quant_flash_attn_metadata()` 里按 layout 选头数再算分配，与 AICPU 侧的
 `baseInfo.kvHeadNum = isDecode ? numHeadsKv : numHeadsQ` 对齐：
 
 ```python
