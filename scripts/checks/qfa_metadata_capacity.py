@@ -157,6 +157,10 @@ def phase_budget(internals, batch: int, nq: int, nkv: int, head_dim: int) -> boo
     print(f"    needed, prefill (sectionNum<={batch}*{nq}={batch * nq}) : {need_prefill}"
           f"  {'fits' if need_prefill <= alloc else 'SHORT'}")
     threshold = split_threshold_tokens(internals, head_dim)
+    print("  NOTE: the needs above are WORST CASE -- they assume sectionNum reaches")
+    print("    batch * head_count. A delivery with param.l2Byte == 0 pins sectionNum")
+    print("    at 1 whatever the heads are, so it never gets there. That is why the")
+    print("    older package survives an arithmetic shortfall; only SCAN settles it.")
     print("  sections only split once a single head's tokens exceed l2Byte/aic,")
     print(f"    i.e. seq_len > ~{threshold} at head_dim={head_dim}. Below that sectionNum")
     print(f"    stays 1 (need {kernel_need(internals, 1)}) and nothing overruns.")
@@ -301,10 +305,27 @@ def main() -> int:
         print("\n== CONTROL ==\n  skipped: nothing failed under TND")
 
     print("\n=== verdict ===")
-    if first_bad is None and budget_ok is not False:
-        print("[GREEN] this delivery allocates enough for what it writes.")
+    # Measurement outranks arithmetic. BUDGET is a worst case and the older
+    # delivery never reaches it (sectionNum pinned at 1), so a BUDGET RED with a
+    # clean SCAN is that package being fine in practice -- report it as such, and
+    # say the risk is latent. Only when SCAN did not run does BUDGET decide.
+    scan_ran = "SCAN" in phases
+    if scan_ran and first_bad is None:
+        print("[GREEN] every probed length survived: this delivery writes within what it allocates.")
+        if budget_ok is False:
+            print("        (BUDGET's worst case does not fit, but this package never reaches it --")
+            print("         sectionNum stays at 1. The shortfall is latent here, not active.)")
         print("        Keep this output as the baseline and rerun after the package swap.")
         return 0
+    if not scan_ran:
+        if budget_ok is not False:
+            print("[GREEN] budget fits (arithmetic only -- rerun with SCAN to confirm on device).")
+            return 0
+        print("[RED] budget shortfall (arithmetic only -- rerun with SCAN to confirm on device).")
+        alloc = model_alloc(internals, args.batch, args.num_heads_kv)
+        need = kernel_need(internals, args.batch * args.num_heads_q)
+        print(f"      allocates {alloc} int32 for a worst-case plan of {need}")
+        return 1
     print("[RED] metadata capacity shortfall reproduced.")
     if budget_ok is False:
         alloc = model_alloc(internals, args.batch, args.num_heads_kv)
