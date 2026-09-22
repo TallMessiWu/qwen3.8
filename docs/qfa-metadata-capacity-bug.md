@@ -34,27 +34,58 @@ output = torch.empty((2, max_schedule_size), dtype=torch.int32, device="npu")
 
 > dim0 按 sectionNum 最坏值(**batch\*num_heads_kv**)动态计算
 
-**AICPU kernel**（`quant_flash_attn_metadata_aicpu.cpp`）：
+**AICPU kernel**（`attention/quant_flash_attn_metadata/op_kernel_aicpu/quant_flash_attn_metadata_aicpu.cpp:200`）：
 
 ```cpp
 bool isDecode = (layoutQDescale_ == "N2TGD");
 baseInfo.kvHeadNum = isDecode ? numHeadsKv_ : numHeadsQ_;   // ← TND 取 numHeadsQ
 ```
 
-而 `CalcGridInfoSection`（`load_balance/section_stream_k/section_stream_k_impl.h`）
+而 `CalcGridInfoSection`
+（`attention/common/op_kernel/load_balance/section_stream_k/section_stream_k_impl.h:333`）
 的内层循环正是按 `baseInfo.GetKvHeadNum()` 计数：
 
 ```cpp
 for (uint32_t bIdx = 0; bIdx < baseInfo.GetBatchSize(); bIdx++) {
-    for (uint32_t n2Idx = 0; n2Idx < baseInfo.GetKvHeadNum(); ++n2Idx) {
-        if (超出 l2Byte) { gridInfo.sectionNum++; }
+    ...
+    for (uint32_t n2Idx = 0; n2Idx < baseInfo.GetKvHeadNum(); ++n2Idx) {   // L342
+        if (tokenSize != 0 && !IsWithinTolerance(tokenLimit, INT64_ZERO, tokenSize + singleHeadCost)) {
+            gridInfo.sectionBnIdx.emplace_back(ToOutputLayoutBnIdx(bn2Idx, baseInfo));
+            gridInfo.sectionNum++;
+        }
+        ...
     }
+}
+gridInfo.sectionBnIdx.emplace_back(baseInfo.GetBatchSize() * GetHeadNum(baseInfo));   // L353
+gridInfo.sectionNum++;
+```
+
+（L353 的 `GetHeadNum(baseInfo)` 在 `m_param.outputLayout != BN1_S1` 时就是
+`baseInfo.GetKvHeadNum()`，见 `section_stream_k_impl.h:503`；AICPU 设的正是
+`param.outputLayout = OutputLayout::BN2_S1G`，所以两者同值。）
+
+于是 `layout_q_descale="TND"`（prefill）下 sectionNum 的上界是
+`batch * num_heads_q`，而 buffer 按 `batch * num_heads_kv` 分配，**GQA 下差
+G = num_heads_q / num_heads_kv 倍**。
+
+写入没有任何边界检查（`quant_flash_attn_metadata.h:63`）：
+
+```cpp
+FaMetaData(uint32_t aicNum, uint32_t aivNum, uint32_t sectionNum, void *metadataPtr)
+    : headMedata(static_cast<FA_METADATA_T *>(metadataPtr)),
+      faMetadata(headMedata + METADATA_STRIDE),
+      fdMetadata(faMetadata + sectionNum * aicNum * METADATA_STRIDE) {}
+
+void Clear() {
+    for (size_t i = 0; i < METADATA_STRIDE; ++i)                      headMedata[i] = 0U;
+    for (size_t i = 0; i < sectionNum * aicNum * METADATA_STRIDE; ++i) faMetadata[i] = 0U;
+    for (size_t i = 0; i < sectionNum * aivNum * METADATA_STRIDE; ++i) fdMetadata[i] = 0U;
 }
 ```
 
-于是 `layout_q_descale="TND"`（prefill）下 sectionNum 的上界是
-`batch * num_heads_q`，而 buffer 按 `batch * num_heads_kv` 分配。**GQA 下两者差
-G = num_heads_q / num_heads_kv 倍**，`FaMetaData::Clear()` 直接写出界。
+写入总量正是 `METADATA_STRIDE + sectionNum * (aicNum + aivNum) * METADATA_STRIDE`，
+即 AICPU 自己那句容量校验里的 `needSize`。sectionNum 一旦超出 buffer 能容纳的
+section 数，`Clear()` 当场写出界。
 
 decode（`N2TGD`）两边都用 `num_heads_kv`，所以不复现。
 
@@ -66,11 +97,12 @@ section 切分被 `param.l2Byte` 门控：
 if (m_param.l2Byte == 0U) { gridInfo.sectionNum = 1; return; }   // 旧版恒走这里
 ```
 
-旧版 `param.l2Byte = 0`、`fdOn = 0`，**sectionNum 恒为 1**，需求是一个与头数无关的
-常量；旧 wrapper 又是固定分配 `(4096,)` 一维 int32，怎么都够。新版 MXFP8 下
-`l2Byte = 96MB`、`fdOn = true`，切分真正生效，缺口才暴露出来。
-
-实测印证（见下）：旧包 metadata 恒为 `(4096,)`，新包为 `(2, 8192)`。
+旧版 `param.l2Byte = 0`、`fdOn = 0`（新版见
+`quant_flash_attn_metadata_aicpu.cpp:227-234`，`quant_mode==1` 才走
+`l2Byte = 96MB / fdOn = true`），**sectionNum 恒为 1**，需求是一个与头数无关的常量
+`16 + (aic + aiv) * 16`。实测旧包返回的 metadata 在 512…32768 六个长度下恒为
+一维 `(4096,)`，足够覆盖；新包为二维 `(2, 8192)`，由
+`_calculate_max_schedule_size` 按 batch 算出。切分一旦真正生效，缺口就暴露。
 
 ## 复现
 
