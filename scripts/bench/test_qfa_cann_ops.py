@@ -223,7 +223,12 @@ class Batch:
         # or capture -- exactly like the engine (fill_mxfp_v_scale_cache).
         v_scale_bytes = torch.randint(120, 132, (nkv * d,), dtype=torch.uint8)
         mxfp.fill_mxfp_v_scale_cache(v_scale_bytes.npu(), self.v_scale_cache)
-        self.v_recip = torch.pow(2.0, 127.0 - v_scale_bytes.float()).npu()
+        # npu_quantize requires the scale's dtype to match x's, and x here is
+        # bf16 -- passing fp32 fails with EZ1001 "dtype of input x:DT_BFLOAT16
+        # is not compatible with scale:DT_FLOAT". The engine builds this the
+        # same way: (1 / exp2(e)).to(model dtype), i.e. bf16
+        # (mxfp_c8.py process_weights_after_loading).
+        self.v_recip = (1.0 / torch.exp2(v_scale_bytes.float() - 127.0)).bfloat16().npu()
 
         self.block_table = torch.zeros(self.max_batch, self.max_blocks_per_req,
                                        dtype=torch.int32).npu()
