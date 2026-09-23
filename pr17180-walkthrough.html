@@ -553,6 +553,7 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
     <ol>
       <li><a class="lv0" href="#ch0"><span class="num">00</span>这个 PR 在做什么</a></li>
       <li><a class="lv1" href="#ch0-scope">一句话与边界</a></li>
+      <li><a class="lv1" href="#ch0-quant">三个张量，三种量化</a></li>
       <li><a class="lv1" href="#ch0-switch">QFA 还是 FIA：谁决定的</a></li>
       <li><a class="lv1" href="#ch0-lineage">和前序工作的关系</a></li>
 
@@ -653,7 +654,49 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
       </table>
     </div>
 
-    <h3 id="ch0-switch"><span class="h3num">0.2</span>QFA 还是 FIA：谁决定的</h3>
+    <h3 id="ch0-quant"><span class="h3num">0.2</span>三个张量，三种量化</h3>
+    <p>
+      方案名字里 <code>DYNAMIC</code>、<code>STATIC</code>、<code>PER_CHANNEL</code> 混在一起，很容易读岔。
+      抛开名字，直接看 <code>forward</code> 里到底调了什么（<code>c8_mxfp_v1.py:793-818</code>）：
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>张量</th><th>量化算子</th><th>scale 从哪来</th><th>MX 分组沿哪个轴</th><th>进 cache 吗</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Q</strong></td><td class="mono">npu_dynamic_mx_quant</td><td class="ok">每步现算</td>
+              <td>每 token × 每 32 个 channel</td>
+              <td class="no">不进</td></tr>
+          <tr><td><strong>K</strong></td><td class="mono">npu_dynamic_mx_quant</td><td class="ok">每步现算</td>
+              <td>每 token × 每 32 个 channel</td>
+              <td class="ok">每步写 K scale cache</td></tr>
+          <tr class="ours"><td><strong>V</strong></td><td class="mono">npu_quantize(axis=−1)</td><td class="pending">checkpoint 里的静态值</td>
+              <td>每 channel 一个，<strong>沿 token 轴广播</strong></td>
+              <td class="ok">启动时填一次</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      所以一句话：<strong>Q 和 K 都是 dynamic，只有 V 是 static。</strong>
+      Q 虽然也动态量化，但它的 scale 直接当 <code>q_descale</code> 喂给算子，从不落盘——
+      这就是为什么方案名里有时带 Q、有时不带。
+    </p>
+    <div class="pit">
+      <span class="label">一个不对称，后面会反复用到</span>
+      <p>
+        <strong>K 和 V 的 MX 分组沿的不是同一个轴。</strong>
+        K 的 scale 是 <code>[T, N, D/64, 2]</code>——每个 token、每 32 个 channel 一个字节，分组沿<strong>通道轴</strong>；
+        V 的 cache 是 <code>[Bn, N, D/16, Bs/64, 16, 2]</code>，真通道在 <code>D/16 × 16</code>，
+        而 <code>Bs/64 × 2</code> 是<strong>token 分组</strong>。
+        换句话说 V 本来是「每 32 个 token 共享一个 scale」的格式，但因为它的 scale 是 per-channel 静态的，
+        token 那几个轴上<strong>填的全是同一个字节</strong>——V 用的是一个退化了的 MX 格式。
+      </p>
+      <p>
+        这解释了两件事：为什么 V 的 scale cache 和 K 的一样大（<a href="#ch2-shape">B1.3</a>），
+        以及为什么填充它是一次广播而不是逐 token scatter（<a href="#ch4-vscale">B3.3</a>）。
+      </p>
+    </div>
+
+    <h3 id="ch0-switch"><span class="h3num">0.3</span>QFA 还是 FIA：谁决定的</h3>
     <p>
       <strong>这个 PR 没有替换 FIA。</strong>它在 <code>get_quant_method</code> 的分支链<strong>末尾加了一个 <code>elif</code></strong>，
       别的分支一行没动。走到 <code>else</code> 就是未量化的 attention 层，用默认的
@@ -671,10 +714,22 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
       <strong>决定走哪条的是 checkpoint，不是启动参数。</strong><code>enable_mxfp_c8_quant</code>
       只看 <code>quant_model_description.json</code> 里的两样东西（<code>modelslim_config.py:994</code>）：
     </p>
-    <ul>
-      <li><code>kv_cache_type == "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"</code>，或</li>
-      <li>任意一层的 <code>*.self_attn.quant_type == "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"</code></li>
-    </ul>
+    <div class="tw">
+      <table>
+        <thead><tr><th>json 里的键</th><th>值</th><th>这个名字是从哪个角度起的</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">kv_cache_type</td><td class="mono">K_DYNAMIC_V_STATIC<br>_MXFP8_PER_CHANNEL</td>
+              <td>站在 <strong>cache</strong> 角度：cache 里只有 K 和 V，K 动态、V 静态 per-channel</td></tr>
+          <tr><td class="mono">*.self_attn.quant_type<br>（逐层，新版用）</td><td class="mono">QK_MXFP8_DYNAMIC<br>_V_MXFP8_PER_CHANNEL</td>
+              <td>站在 <strong>层内量化</strong> 角度：Q 和 K 都做了动态 MXFP8 所以都点名，V 是 per-channel</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>这两个名字指的是同一套方案</strong>，只是一个从 cache 看、一个从算子输入看
+      （后者省掉了 <code>STATIC</code> 这个词，是读起来乱的主要原因）。
+      对照 <a href="#ch0-quant">0.2</a> 那张表就一目了然。两者命中任意一个，整个模型就走 QFA。
+    </p>
     <p>
       整个 diff 里<strong>没有新增任何 <code>VLLM_ASCEND_*</code> 开关</strong>。所以「想跑原来的 FIA」分四种情况：
     </p>
@@ -713,7 +768,7 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
       </p>
     </div>
 
-    <h3 id="ch0-lineage"><span class="h3num">0.3</span>和前序工作的关系</h3>
+    <h3 id="ch0-lineage"><span class="h3num">0.4</span>和前序工作的关系</h3>
     <p>
       这不是凭空的新东西，是一条链的末端。评审时如果有人问「为什么现在才提」，答案在这：
     </p>
