@@ -553,9 +553,16 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
     <ol>
       <li><a class="lv0" href="#ch0"><span class="num">00</span>这个 PR 在做什么</a></li>
       <li><a class="lv1" href="#ch0-scope">一句话与边界</a></li>
+      <li><a class="lv1" href="#ch0-switch">QFA 还是 FIA：谁决定的</a></li>
       <li><a class="lv1" href="#ch0-lineage">和前序工作的关系</a></li>
 
       <li><a class="lv0" href="#ch1"><span class="num">01</span>全景：一步推理的七个环节</a></li>
+
+      <li><a class="lv0" href="#ch1b"><span class="num">02</span>代码结构</a></li>
+      <li><a class="lv1" href="#st-tree">三个新类挂在哪</a></li>
+      <li><a class="lv1" href="#st-dep">模块依赖：一层纯函数</a></li>
+      <li><a class="lv1" href="#st-sym">符号表</a></li>
+      <li><a class="lv1" href="#st-time">两条时间线</a></li>
 
       <li><a class="lv0" href="#ch2"><span class="num">B1</span>显存：两元组变四元组</a></li>
       <li><a class="lv1" href="#ch2-pack">把 scale 字节打进 head_size</a></li>
@@ -646,7 +653,67 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
       </table>
     </div>
 
-    <h3 id="ch0-lineage"><span class="h3num">0.2</span>和前序工作的关系</h3>
+    <h3 id="ch0-switch"><span class="h3num">0.2</span>QFA 还是 FIA：谁决定的</h3>
+    <p>
+      <strong>这个 PR 没有替换 FIA。</strong>它在 <code>get_quant_method</code> 的分支链<strong>末尾加了一个 <code>elif</code></strong>，
+      别的分支一行没动。走到 <code>else</code> 就是未量化的 attention 层，用默认的
+      <code>AscendAttentionBackendImpl</code>（<code>attention_v1.py:522</code>），里面跑的正是
+      <code>npu_fused_infer_attention_score(_v2)</code>。
+    </p>
+    <pre><code><span class="cm"># modelslim_config.py:692-718   isinstance(layer, AttentionLayerBase)</span>
+<span class="kw">if</span>   is_fa_quant_layer(prefix):        → FAKQuant 方案                      <span class="cm"># FIA</span>
+<span class="kw">elif</span> is_indexer_quant_layer(prefix):   → indexer 方案
+<span class="kw">elif</span> is_c8_quant_layer(prefix):        → AscendC8KVCacheAttentionMethod     <span class="cm"># FIA + int8 cache</span>
+<span class="hl">elif</span> <span class="hl">enable_mxfp_c8_quant and _is_c8_mxfp_kv_layer(layer):</span>
+                                       <span class="hl">→ AscendC8MXFPKVCacheAttentionMethod</span> <span class="cm"># ★本 PR：QFA</span>
+<span class="kw">else</span>: <span class="kw">return</span> <span class="kw">None</span>                      → 未量化 → AscendAttentionBackendImpl <span class="cm"># FIA</span></code></pre>
+    <p>
+      <strong>决定走哪条的是 checkpoint，不是启动参数。</strong><code>enable_mxfp_c8_quant</code>
+      只看 <code>quant_model_description.json</code> 里的两样东西（<code>modelslim_config.py:994</code>）：
+    </p>
+    <ul>
+      <li><code>kv_cache_type == "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"</code>，或</li>
+      <li>任意一层的 <code>*.self_attn.quant_type == "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"</code></li>
+    </ul>
+    <p>
+      整个 diff 里<strong>没有新增任何 <code>VLLM_ASCEND_*</code> 开关</strong>。所以「想跑原来的 FIA」分四种情况：
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>想要什么</th><th>怎么做</th><th>代价 / 障碍</th></tr></thead>
+        <tbody>
+          <tr><td>别的模型、BF16 权重</td><td class="ok">什么都不用做</td>
+              <td>本来就走 FIA。本 PR 对它们零影响——512 覆盖和 model runner 那 7 个分支全被 <code>is_c8_mxfp_kv_quant</code> 挡住</td></tr>
+          <tr><td>同一份 MXFP8 权重跑 FIA</td><td class="no">不存在这个组合</td>
+              <td><code>head_dim=256</code> 会被 FIA 的 C8 路径拒掉（EZ0010）——这正是当初换 QFA 的原因</td></tr>
+          <tr><td>拿 FIA 做基线对比</td><td class="pending">只能是 C16 + BF16 cache</td>
+              <td>改 json 去掉 <code>kv_cache_type</code> 与逐层 <code>quant_type</code>。<strong>会卡住的地方</strong>：<code>_ignore_unexpected_suffixes</code> 的扩展也跟着关了，checkpoint 里的 <code>v_cache_scale</code>/<code>fa_v.scale</code> 变成 unexpected key，<code>AutoWeightsLoader</code> 可能拒收</td></tr>
+          <tr><td>只让部分层走 FIA</td><td class="no">做不到</td>
+              <td>模型级开关，见下</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="pit">
+      <span class="label">没有逐层开关，这是刻意的</span>
+      <p>
+        <code>modelslim_config.py:57-61</code> 的注释写得很直白：
+        <em>「We still enable the scheme model-wide, since the backend has no per-layer switch」</em>。
+        哪怕 checkpoint 只对部分层声明了 MXFP8，<code>enable_mxfp_c8_quant</code> 也是<strong>模型级 <code>True</code></strong>，
+        所有 <code>Attention</code> 层都会被装上 QFA 后端；没声明的层拿 <code>127</code> 兜底（scale = 1.0）<strong>静默</strong>跑下去。
+        hybrid 模型的线性注意力层不受影响，因为 <code>_is_c8_mxfp_kv_layer</code> 只认 <code>isinstance(layer, Attention)</code>。
+      </p>
+    </div>
+    <div class="note">
+      <span class="label">建议带上会</span>
+      <p>
+        上游 maintainer 大概率会问同一个问题——「能不能不改权重就退回 FIA」。
+        我们仓里以前有过 <code>junlin-qfa-c8switch</code> 分支专门干这个（C8 开关拿 bf16 基线），2026-09-10 清掉了。
+        真要加，在 <code>vllm_ascend/envs.py</code> 加一个 <code>VLLM_ASCEND_DISABLE_MXFP_C8</code>、
+        在 <code>modelslim_config.py:994</code> 那一行与一下就行，改动很小，而且对真机 A/B 对照很有用。
+      </p>
+    </div>
+
+    <h3 id="ch0-lineage"><span class="h3num">0.3</span>和前序工作的关系</h3>
     <p>
       这不是凭空的新东西，是一条链的末端。评审时如果有人问「为什么现在才提」，答案在这：
     </p>
@@ -714,6 +781,231 @@ hr.soft{border:0;border-top:1px solid var(--rule-soft);margin:36px 0}
           <tr><td>6 个测试文件</td><td class="mono">+1229</td><td>见 <a href="#ch8">第 07 章</a></td></tr>
         </tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ══════════════════ 02 ══════════════════ -->
+  <section id="ch1b">
+    <div class="h2-wrap">
+      <div class="chapter-tag"><span>02</span><span class="sha">结构</span></div>
+      <h2>代码结构</h2>
+      <p class="chapter-sub">
+        上一章是「数据怎么流」，这一章是「代码长什么样」：三个新类挂在哪、谁 import 谁、
+        每个文件里有什么、什么时候被调。
+      </p>
+    </div>
+
+    <h3 id="st-tree"><span class="h3num">2.1</span>三个新类挂在哪</h3>
+    <p>
+      最该先看的一张图。<strong>QFA 的 impl 和既有 FIA-C8 的 impl 是兄弟</strong>——
+      同一个父类的两个子类，各自实现一套 KV cache 方案。这解释了为什么 FIA 一行没动：
+      它们从来不在同一条路径上。
+    </p>
+    <svg viewBox="0 0 720 272" role="img" aria-label="attention impl 继承树"
+         style="max-width:100%;height:auto;margin:0 0 10px;display:block">
+      <g fill="none" stroke="var(--rule)" stroke-width="1.5">
+        <path d="M360 48 L360 78"/>
+        <path d="M360 134 L360 164 M165 164 L560 164 M165 164 L165 194 M560 164 L560 194"/>
+      </g>
+      <g font-family="IBM Plex Mono, ui-monospace, monospace" text-anchor="middle">
+        <rect x="265" y="10" width="190" height="38" rx="5" fill="var(--surface-2)" stroke="var(--rule)"/>
+        <text x="360" y="27" font-size="12.5" fill="var(--ink-2)">AttentionImpl</text>
+        <text x="360" y="41" font-size="10.5" fill="var(--ink-3)">vLLM 抽象基类</text>
+
+        <rect x="205" y="78" width="310" height="56" rx="5" fill="var(--surface)" stroke="var(--rule)"/>
+        <text x="360" y="101" font-size="13" font-weight="600" fill="var(--ink)">AscendAttentionBackendImpl</text>
+        <text x="360" y="120" font-size="10.5" fill="var(--ink-3)">attention_v1.py:522 · 跑 FIA</text>
+
+        <rect x="20" y="194" width="290" height="56" rx="5" fill="var(--surface)" stroke="var(--rule)"/>
+        <text x="165" y="217" font-size="12.5" font-weight="600" fill="var(--ink)">AscendC8AttentionBackendImpl</text>
+        <text x="165" y="236" font-size="10.5" fill="var(--ink-3)">attention_v1.py:1316 · FIA + int8 cache</text>
+
+        <rect x="410" y="194" width="300" height="56" rx="5" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="560" y="217" font-size="12.5" font-weight="600" fill="var(--accent-2)">AscendC8MXFPAttentionBackendImpl</text>
+        <text x="560" y="236" font-size="10.5" fill="var(--accent-2)">c8_mxfp_v1.py:194 · QFA 双算子 ★本 PR</text>
+      </g>
+    </svg>
+    <p>
+      Backend 和 Builder 也是同样的形状，各自只覆盖极少的方法：
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>角色</th><th>父类（既有）</th><th>本 PR 新增</th><th>覆盖了什么</th></tr></thead>
+        <tbody>
+          <tr><td>Backend</td><td class="mono">AscendAttentionBackend<br>attention_v1.py:71</td>
+              <td class="mono">AscendC8MXFPAttentionBackend<br>c8_mxfp_v1.py:55</td>
+              <td>3 个 staticmethod：<code>get_impl_cls</code> / <code>get_builder_cls</code> /
+                  <code>get_supported_kernel_block_sizes</code>（<strong>512</strong> 而不是 128）</td></tr>
+          <tr><td>Builder</td><td class="mono">AscendAttentionMetadataBuilder<br>attention_v1.py:228</td>
+              <td class="mono">AscendC8MXFPMetadataBuilder<br>c8_mxfp_v1.py:81</td>
+              <td><code>get_cudagraph_support</code>（PIECEWISE→<code>UNIFORM_BATCH</code>，FULL→<code>ALWAYS</code>）
+                  与 <code>__init__</code> 里按 512 重算 block-table 宽度</td></tr>
+          <tr><td>Impl</td><td class="mono">AscendAttentionBackendImpl<br>attention_v1.py:522</td>
+              <td class="mono">AscendC8MXFPAttentionBackendImpl<br>c8_mxfp_v1.py:194</td>
+              <td><code>forward</code> / <code>reshape_and_cache</code> 全部重写，另加 11 个 QFA 私有方法</td></tr>
+          <tr><td>Metadata</td><td class="mono" colspan="2">AscendMetadata（<strong>共用</strong>，attention_v1.py:153）</td>
+              <td>没有新建子类，只加了 3 个字段：<code>query_start_loc_gpu</code> / <code>seq_lens_gpu</code> /
+                  <code>qfa_metadata_cache</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      还有一个结构上的异类：<strong>这个后端不走 backend registry</strong>。
+      量化方法在 <code>create_weights</code> 里直接改写实例：
+    </p>
+    <pre><code><span class="cm"># mxfp_c8.py:76-80 —— 就地换类，而不是让 get_attn_backend 选</span>
+layer.attn_backend = AscendC8MXFPAttentionBackend
+layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+<span class="cm"># 改 __class__ 不会调用新类的 __init__，所以状态得在这里补</span>
+layer.impl.enable_hamming_sparse = <span class="kw">False</span></code></pre>
+    <p>
+      好处是非 C8 部署根本 import 不到这个模块；代价是<strong>类属性默认值成了必需品</strong>——
+      <code>enable_hamming_sparse</code> 在类上给了默认值（<code>c8_mxfp_v1.py:256</code>），
+      <code>main_op</code>/<code>metadata_op</code> 也被写成 <code>@property</code> 而不是 <code>__init__</code> 属性，
+      就是因为构造函数从来不会跑。评审时这是个容易被质疑的点，理由已经写在注释里了。
+    </p>
+
+    <h3 id="st-dep"><span class="h3num">2.2</span>模块依赖：底下垫了一层纯函数</h3>
+    <p>
+      这个 PR 分层做得不错，值得单独说：<strong><code>mxfp_kv_cache.py</code> 只 import
+      <code>math</code> / <code>torch</code> / <code>torch_npu</code>，零 vLLM、零 vllm_ascend 依赖。</strong>
+      所有形状公式、scatter、填充、buffer 切分都在这一层，上面两个消费者各取所需。
+    </p>
+    <div class="stack">
+      <div class="layer"><div class="lnum">L3</div><div>
+        <div class="ltitle">调用方</div>
+        <div class="lmeta">worker/model_runner_v1.py · utils.py · quantization/configs/modelslim_config.py</div>
+        <div class="ldesc">
+          model runner 顶层 import 了 <code>mxfp_kv_cache</code> 的 5 个符号，
+          以及 <code>AscendC8MXFPAttentionBackendImpl</code>（<strong>只用来做 <code>isinstance</code></strong>）；
+          <code>utils.py</code> 对 <code>mxfp_kv_page_size_bytes</code> 是函数内延迟 import，避免循环依赖。
+        </div>
+      </div></div>
+      <div class="layer ours"><div class="lnum">L2</div><div>
+        <div class="ltitle">后端与量化方法</div>
+        <div class="lmeta">attention/c8_mxfp_v1.py（825） · quantization/methods/kv_cache/mxfp_c8.py（152）</div>
+        <div class="ldesc">
+          前者依赖 <code>attention_v1</code> 的 4 个类 + <code>mxfp_kv_cache</code> 的 3 个函数；
+          后者只依赖 <code>quantization/base</code> 和 vLLM 的 TP 接口，
+          <strong>对 <code>c8_mxfp_v1</code> 是函数内延迟 import</strong>——两者互不在顶层耦合。
+        </div>
+      </div></div>
+      <div class="layer ours"><div class="lnum">L1</div><div>
+        <div class="ltitle">纯函数层</div>
+        <div class="lmeta">attention/mxfp_kv_cache.py（406） · import math / torch / torch_npu</div>
+        <div class="ldesc">
+          <strong>零框架依赖。</strong>这正是那 570 行 UT 能在本机 CPU 上跑起来的原因——
+          只要把 <code>torch_npu</code> mock 掉，整层都可测。
+        </div>
+      </div></div>
+    </div>
+    <div class="note">
+      <span class="label">唯一的算子入口</span>
+      <p>
+        全模块只有 <code>_get_qfa_ops()</code>（<code>c8_mxfp_v1.py:175</code>）一处 import
+        <code>cann_ops_transformer</code>，而且是<strong>惰性</strong>的，失败时抛一条说清安装来源的
+        <code>RuntimeError</code>。所以 <code>model_runner_v1.py</code> 顶层无条件 import
+        <code>c8_mxfp_v1</code> 是安全的：没装 CANN 算子包的环境照样能起来，
+        只要不真的去跑 C8 层。
+      </p>
+    </div>
+
+    <h3 id="st-sym"><span class="h3num">2.3</span>符号表</h3>
+    <h4><code>attention/mxfp_kv_cache.py</code> — 406 行，无类，全是纯函数</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>符号</th><th>行</th><th>做什么</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">7 个模块常量</td><td class="mono">22–30</td><td>PA_NZ 分片尺寸（64/2/32/16/16）与 MX group size（32）</td></tr>
+          <tr><td class="mono">validate_mxfp_k_scale_head_dim<br>validate_mxfp_v_scale_block_size</td><td class="mono">33<br>40</td><td>整除校验，不满足直接 <code>ValueError</code></td></tr>
+          <tr><td class="mono">mxfp_kv_scale_groups<br>mxfp_kv_block_scale_groups</td><td class="mono">47<br>52</td><td>分组数</td></tr>
+          <tr><td class="mono">mxfp_k_scale_page_bytes<br>mxfp_v_scale_page_bytes</td><td class="mono">57<br>63</td><td>每块 scale 字节，<strong>两者恒等</strong>（UT 断言了）</td></tr>
+          <tr class="ours"><td class="mono">mxfp_k_scale_cache_shape<br>mxfp_v_scale_cache_shape</td><td class="mono">69<br>85</td><td>两个 6 维 PA_NZ 形状——<a href="#ch2-shape">B1.3</a> 那张表的来源</td></tr>
+          <tr><td class="mono">mxfp_kv_page_size_bytes</td><td class="mono">101</td><td>K/V + 两个 scale 的总页字节；hybrid 定容用它</td></tr>
+          <tr><td class="mono">mxfp_resolve_kv_cache_layout</td><td class="mono">117</td><td>从已分配 buffer 反推四个形状并全量交叉校验</td></tr>
+          <tr class="ours"><td class="mono">scatter_mxfp_pa_nz_kv_cache</td><td class="mono">200</td><td>K/V 写 cache，<code>cache_mode="PA_NZ"</code>（<a href="#ch4-scatter">B3.1</a>）</td></tr>
+          <tr class="ours"><td class="mono">fill_mxfp_v_scale_cache</td><td class="mono">270</td><td>静态 V scale 广播填满整个 cache（<a href="#ch4-vscale">B3.3</a>）</td></tr>
+          <tr><td class="mono">mxfp_k_scale_slot_index</td><td class="mono">293</td><td>slot → (block, seg, frag)，padding 行 clamp 到 0</td></tr>
+          <tr class="ours"><td class="mono">scatter_mxfp_k_scale_cache</td><td class="mono">319</td><td>一次 <code>index_put_</code>，零读（<a href="#ch4-kscale">B3.2</a>）</td></tr>
+          <tr><td class="mono">split_hybrid_c8_mxfp_cache_buffer</td><td class="mono">356</td><td>从共享 hybrid buffer <strong>尾部</strong>切出四段（按 review 意见从 model runner 移出来的）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4><code>attention/c8_mxfp_v1.py</code> — 825 行，3 个类 + 2 个模块函数</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>符号</th><th>行</th><th>做什么</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">AscendC8MXFPAttentionBackend</td><td class="mono">55</td><td>只覆盖 3 个 staticmethod；<code>get_supported_kernel_block_sizes → [512]</code></td></tr>
+          <tr><td class="mono">AscendC8MXFPMetadataBuilder</td><td class="mono">81</td><td><code>get_cudagraph_support</code>:99 + <code>__init__</code>:124 按 512 重算 block-table 宽度</td></tr>
+          <tr><td class="mono">QFA_* 常量</td><td class="mono">131–143</td><td>quant mode / mask mode / 4 个 layout / N2TGD 的 80 边界</td></tr>
+          <tr><td class="mono">_get_qfa_ops</td><td class="mono">175</td><td><strong>全模块唯一的算子入口</strong>，惰性 + 模块级缓存</td></tr>
+          <tr><td class="mono">AscendC8MXFPAttentionBackendImpl</td><td class="mono">194</td><td>↓ 以下是它的方法</td></tr>
+          <tr><td class="mono">　main_op / metadata_op</td><td class="mono">263 / 273</td><td><code>@property</code>，因为改 <code>__class__</code> 不跑 <code>__init__</code></td></tr>
+          <tr><td class="mono">　_nz_5d_view</td><td class="mono">277</td><td>自然 4 维存储 → 算子要的 PA_NZ 5 维视图</td></tr>
+          <tr class="ours"><td class="mono">　_qfa_step_cache<br>　_qfa_step_lengths<br>　_qfa_k_scale_slot_index</td><td class="mono">293<br>300<br>338</td><td><strong>每步派生一次、23 层共享</strong>的三件套（<a href="#ch6-why">B5.2</a> 解释为什么图里安全）</td></tr>
+          <tr><td class="mono">　_qfa_v_descale_placeholder</td><td class="mono">355</td><td>拿 V scale cache 前两字节的视图当占位符，零 kernel</td></tr>
+          <tr class="ours"><td class="mono">　_get_qfa_metadata</td><td class="mono">381</td><td>AICPU 计划，每步一个，key = 全部非张量输入</td></tr>
+          <tr><td class="mono">　_qfa_int8_mask</td><td class="mono">457</td><td>mask 转 int8（builder 给的本来就是）</td></tr>
+          <tr class="ours"><td class="mono">　_qfa_query_scale_for_layout</td><td class="mono">467</td><td>TND / N2TGD —— <strong>选 kernel 模板</strong>（<a href="#ch5-layout">B4.3</a>）</td></tr>
+          <tr><td class="mono">　_run_qfa</td><td class="mono">508</td><td>主算子调用，含 bitcast 回 E8M0</td></tr>
+          <tr class="ours"><td class="mono">　_forward_mxfp8_attention</td><td class="mono">589</td><td>一步一次调用覆盖全批，决定 <code>max_seqlen_q</code>/mask/layout</td></tr>
+          <tr><td class="mono">　do_kv_cache_update</td><td class="mono">705</td><td>显式 <code>raise</code>：这条路不该被走到</td></tr>
+          <tr><td class="mono">　reshape_and_cache</td><td class="mono">715</td><td>K/V scatter + K scale scatter</td></tr>
+          <tr><td class="mono">　forward</td><td class="mono">753</td><td>入口：5 道前置检查 → 量化 → 写 cache → 算</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="file-ref">
+      <code>_build_qfa_cu_seqlens</code>（:146）在本版里已无调用方——长度改成在图内派生之后它就剩下了，可以顺手提一句。
+    </p>
+
+    <h4><code>quantization/methods/kv_cache/mxfp_c8.py</code> — 152 行</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>符号</th><th>行</th><th>做什么</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">_quant_weight_loader</td><td class="mono">8</td><td>TP 切分（按 KV head 数）+ 列向量兼容 + 共享 scale 平铺（<a href="#ch3-tp">B2.2</a>）</td></tr>
+          <tr class="ours"><td class="mono">　create_weights</td><td class="mono">68</td><td><strong>装后端的地方</strong>；注册 <code>v_cache_scale</code>/<code>v_cache_offset</code>，127 兜底</td></tr>
+          <tr><td class="mono">　process_weights_after_loading</td><td class="mono">106</td><td>offset 必须为零、0 通道换 127、算倒数</td></tr>
+          <tr><td class="mono">　apply</td><td class="mono">137</td><td>显式 <code>raise</code>：真正的计算在后端，不在量化方法里</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="st-time"><span class="h3num">2.4</span>两条时间线</h3>
+    <p>同样的代码，启动期和每步做的事完全不同。分开看比按文件看清楚得多。</p>
+    <div class="twocol">
+      <div class="col-card good">
+        <span class="phase-tag">启动期 · 全过程只跑一次</span>
+        <h4>从 json 到一个填好的 cache</h4>
+        <ol>
+          <li><code>AscendModelSlimConfig.__init__</code> 读 json，点亮 <code>enable_mxfp_c8_quant</code>，让 FAKQuant 让位</li>
+          <li><code>refresh_block_size</code> 定 block：dense 取 512，hybrid 按 FP8 字节反算</li>
+          <li><code>get_quant_method</code> → <code>create_weights</code>：<strong>换后端类</strong> + 注册两个参数</li>
+          <li>权重加载：<code>_quant_weight_loader</code> 按 KV head 切到各 rank</li>
+          <li><code>process_weights_after_loading</code>：校 offset、换 0 通道、算倒数</li>
+          <li><code>get_kv_cache_spec</code>：把 scale 字节<strong>打包进 head_size</strong>（256→264）</li>
+          <li><code>_allocate_kv_cache_tensors</code>：一块预算切四份</li>
+          <li><code>_reshape_kv_cache_tensors</code>：组成 4 元组，scale 直接按 6 维分配</li>
+          <li class="hl"><strong><code>_fill_c8_mxfp_v_scale_caches</code>：填静态 V scale —— 在任何捕获之前</strong></li>
+          <li>图捕获</li>
+        </ol>
+      </div>
+      <div class="col-card">
+        <span class="phase-tag">每一步 · 23 个 full-attention 层</span>
+        <h4>一次派生，多次消费</h4>
+        <ol>
+          <li><code>builder.build()</code> 产出<strong>一个</strong> <code>AscendMetadata</code>，带着两个 GPU 侧长度张量和一个空的 <code>qfa_metadata_cache</code></li>
+          <li><strong>第 1 层</strong>：派生 <code>cu_seqlens_q</code>/<code>seqused_kv</code>、K-scale slot 分解、AICPU plan——三样都存进那个 cache</li>
+          <li><strong>每一层</strong>：量化 Q/K/V → <code>scatter</code> K/V（PA_NZ）→ <code>index_put_</code> K scale → 调主算子</li>
+          <li><strong>第 2–23 层</strong>：上面第 2 步的三样<strong>全部命中缓存</strong>，只剩量化、两次 scatter 和主算子</li>
+        </ol>
+        <p style="font-size:13.5px;color:var(--ink-2);margin-top:14px;margin-bottom:0">
+          省掉的是 22 次 AICore→AICPU 往返，外加约 200 个冗余 device 小算子。
+        </p>
+      </div>
     </div>
   </section>
 
@@ -1445,6 +1737,10 @@ self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
       顺带确认过一件事：老那段顺手做的 <code>_zero_block_ids</code> 现在落到父类去做了，
       而上游的 <code>KVBlockZeroer</code> 本身就处理 virtual block splitting，所以<strong>零化这条线没问题</strong>。
       这个可以主动说出来，省得评审人去追。
+    </p>
+    <p>
+      同一类的还有一处：<code>c8_mxfp_v1.py:146</code> 的 <code>_build_qfa_cu_seqlens</code>
+      <strong>全仓零调用方</strong>（含测试）。它是长度改成在图内派生之前留下的，可以直接删。
     </p>
 
     <h3 id="q4"><span class="h3num">④</span>注释和实现打架</h3>
