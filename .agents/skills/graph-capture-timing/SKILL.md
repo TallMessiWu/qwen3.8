@@ -82,3 +82,8 @@ dynamo 都重新求值了。本机「没复现」不是证据,只有真机是。
 区分「eager 对图错」的干净单变量见 `npu-remote-diagnose`:`SPEC_EAGER=1` 只关 draft 图,
 `GRAPH=0` / `PIECEWISE` 同时改了 target,**PIECEWISE 下 draft 根本不进图**,所以
 「PIECEWISE 正常」不能用来推断注意力后端有没有问题。
+
+两次真机事故的完整推理链（包括被推翻的假设和当时用错的排除依据）在
+[`docs/cases/397b-moe-ep-graph-bug.md`](../../../docs/cases/397b-moe-ep-graph-bug.md) 与
+[`docs/cases/mtp-accept-graph.md`](../../../docs/cases/mtp-accept-graph.md)——本技能是结论,
+那两篇是「当时为什么这么判断」。

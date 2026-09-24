@@ -64,6 +64,27 @@ UPDATE_BASELINE=1 bash scripts/local/run_cpu_ut.sh   # 确认过之后刷新基�
 `tests/ut/<module>/a2|a3_2|310p/` 这些子目录是 NPU 专属的，本机跑不了，也不该跑——
 路由规则见 vllm-ascend 的 `.github/workflows/scripts/test_config.yaml`。
 
+### 要在「另一条 lane」的分支上跑单测，怎么办
+
+环境一次只能对一条 lane，所以**「某个分支本机跑不了单测」几乎总是 lane 不匹配，是环境
+不是改动**——先跑一个不相干的既有用例确认，别去改代码迎合它，也别为了让某个分支在本机跑
+起来就去乱升 venv：真机版本才是验证基准，乱升会让本机体检失去意义，还会把另一条 lane 的
+能力弄丢。要验另一条 lane 上的改动：
+
+1. 等值确认改动区域在 venv 匹配的那条分支上**逐行相同**；
+2. 开一个一次性 worktree，把 `git diff` 出来的补丁打上去跑；
+3. 配合**反向对照**（不打补丁应该红、打上应该绿）才算数；
+4. 收尾 `git worktree remove --force`。
+
+⚠️ **用 `git apply`，不要 `--3way`**：它会把结果写进索引，之后 `git checkout -- <file>`
+恢复的是「已打补丁」的版本而不是 HEAD，再打一次补丁就会把调用行加两遍（helper 定义会被
+去重、只有调用点重复，所以光数定义个数看不出来）。复原要用 `git checkout HEAD -- <file>`。
+
+绕过 conftest 里的 `adapt_patch()`（它只在魔法 mock 阶段需要）：读 `tests/ut/conftest.py`
+源码，截到 `\nadapt_patch()` 之前 `exec`（只取 `torch_npu` 的 MagicMock 部分），然后
+**先 `import vllm_ascend.ops`** 再 import 被测模块，否则 `device_op` ↔ `ops/__init__`
+会循环导入。
+
 ### 当前实测（2026-09-15，vllm `84030bbe3d` + `junlin-c8-mxfp-16278`）
 
 `run_cpu_ut.sh`：**4374 passed / 1 failed / 37 skipped**，约 30 秒。基线已刷成这 1 条

@@ -19,6 +19,7 @@ description: 为大模型制作可下钻的交互式架构网页（单文件 HTM
 | `references/design-principles.md` | 动手前通读。解释为什么这样画，以及每条规则对应的误读 |
 | `references/component-api.md` | 填内容时查。数据结构、helper 函数、现成组件清单 |
 | `references/layout-pitfalls.md` | 遇到布局怪象时查；改字号或改动画前必读 |
+| `references/local-browser-audit.md` | 要在**本机 WSL** 跑 `audit-browser.js` 时查（借 Windows 侧 Chrome + node 中继） |
 
 ## 工作流
 
@@ -98,6 +99,10 @@ await auditSticky()      // 控制台是否真的钉住
 
 目标是 `pass: true`：滚动条 0、溢出 0、裁切 0。
 `auditPayload` 期望 `overlappingDocks: 0` 且 `minGap > 0`（载荷在卡片下方）。
+
+⚠️ 本机跑要借 Windows 侧的浏览器，装 Linux Chrome 是死路——见
+`references/local-browser-audit.md`。审计前**先对 `git show HEAD:<page>` 跑一遍基线**，
+否则分不清报出来的溢出是不是自己引入的。
 
 ### 5. 修布局问题
 

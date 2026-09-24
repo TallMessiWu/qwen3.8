@@ -94,9 +94,28 @@ AICPU(`param.fdOn = 0`)**三处配套关闭**,不是一行疏忽。
 
 - ops-transformer 仓只有 kernel 实现 + README,**接口文档在别处**。
 - 算子官方文档走 `raw.gitcode.com` 可直连 `curl`(`gitcode.com/.../raw` 只返回 HTML 壳)。
-- 真机行为与文档冲突时以真机为准,并把实测结论写回记忆(带日期和 file:line)。
+  换算子只改路径里的 `attention/<op_name>/docs/torchapi_<op_name>.md`。
+- **交叉验证靠 host checker**:vendored 的 `op_host/checkers/*_checker.cpp` 里的 `expected`
+  数组通常是文档那张表的代码版,两边对上才敢信。
+- descale shape 表、`max_seqlen_*` 语义、tilingKey 六维各自能不能动:QFA 的已整理在主仓
+  [`docs/reference/qfa-op-contract.md`](../../../docs/reference/qfa-op-contract.md),新接算子
+  照同样的方法去它自己的文档里找对应表。
+- 真机行为与文档冲突时以真机为准,并把实测结论写回主仓 `docs/`(带日期和 file:line)。
 
 ## 数据搬运
 
 NPU 上 **FP8 张量必须用字节视图搬运**:`index_put_` / `transpose` 对 float8 会报错或回退 AICPU 打死 device,
 一律 `.view(torch.uint8)` 搬完再换回。
+
+`float8_e4m3fn` / `float8_e8m0fnu` **只能作为算子的输入输出**,任何搬运类操作都不行。已实测踩中的两种:
+
+- `index_put_` → `AclNN_Parameter_Error(EZ1001): Tensor value not implemented for DT_FLOAT8_E4M3FN`
+  (支持列表里没有任何 float8);
+- `permute(...).contiguous()` → 回退到 AICPU 的 TF `Transpose`(`libtf_kernels.so`),执行失败并抛 507018
+  **打死整个 device 上下文**;5D + e8m0 最容易触发。
+
+`.view(dtype)` 在同字节宽度下是零成本位重解释、不改数值,`.to(dtype)` 才是数值强转(会毁数据),
+所以字节视图搬运对 MXFP8 语义完全无影响。要搬的地方:写 KV cache(`index_put_`)、
+descale 布局重排(如 TND→N2TGD 的 5D permute)、量化结果的 permute+contiguous;**只在传给
+`npu_quant_flash_attn{,_metadata}` 时换回 `float8_e4m3fn` / `float8_e8m0fnu`**。
+转置也可以改成在量化**之前**对 BF16 原值做,同样安全。

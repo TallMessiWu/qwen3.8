@@ -7,6 +7,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | `AGENTS.md`（`CLAUDE.md` 是它的符号链接） | 仓库硬性约束、worktree 工作流、vllm-ascend 架构要点 |
+| `docs/README.md` | 文档总目录：`reference/` 反复要查的事实、`cases/` 一次排查的完整记录 |
 | `scripts/README.md` | 每个服务、诊断、压测、回归脚本的用途与运行方式 |
 | `docs/vendor-ops-transformer-op.md` | 以 QFA 为样板，把 ops-transformer 算子接进 `vllm-ascend/csrc` 的完整路径，含 FIA 差异清单 |
 
