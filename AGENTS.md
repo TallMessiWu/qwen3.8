@@ -150,6 +150,8 @@ pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_aclgraph_accuracy.py
 
 **每次提交都用 `/gitmoji-commit` 技能**（已复制到 `.agents/skills/gitmoji-commit/`）：中文 subject、`<emoji-code> <type>(<scope>): <subject>` 格式。无需展示命令或等待用户确认，生成后直接提交；完成验证后再使用普通 `git push` 推送。主仓和子仓的提交都走它。
 
+提交和推送都不需要停下来问。**唯一例外**：远端状态导致必须改写已发布历史时——即需要 `--force` 或 `--force-with-lease`——先找用户确认，不得自行强推。
+
 vllm-ascend 的 pre-commit 装了 `signoff-commit` 钩子，**提交必须带 sign-off**——把 `-s` 加进 gitmoji 技能生成的命令里：
 
 ```bash
