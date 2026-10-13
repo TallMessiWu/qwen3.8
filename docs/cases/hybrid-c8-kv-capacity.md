@@ -1,5 +1,10 @@
 # hybrid C8 的 KV 容量只有 BF16 的四分之一
 
+> **2026-10-13 补充**：PR #17180 已合入主线，但主线使用 packet-packed cache 与
+> `state_content_bytes` 预算，已不同于下文的旧段式布局；#17956 还补了 hybrid 页复用时
+> V scale 的恢复。旧的 4096-token 推导和容量验收数只对原分支/版本有效，不能直接套到
+> 当前主线。当前实现见 [`c8-qfa-config-matrix.md`](../reference/c8-qfa-config-matrix.md)。
+
 > **状态**：修复落在本机（`junlin-c8-mxfp-16614`，`2592b07d2` + `a0e305ea4`），**真机待验**。
 > **来源**：2026-09 的 Claude Code 会话记忆（`~/.claude/projects/…/memory/`），2026-09-24 迁入本仓。
 > `AGENTS.md`「当前状态」有摘要，本文件是根因、验收预期值与 `num_blocks` 反推法。

@@ -21,11 +21,15 @@
 
 ## reference —— 反复要查的事实
 
+**当前 QFA/C8 基线（2026-10-13）**：PR #17180 已合入官方 `upstream/main`；
+源码先看 `vllm-ascend/upstream-main/`，不要拿 `junlin-*` 旧分支代替主线。
+主线采用 packet-packed PA_NZ，配置与 P/D 格式见下面的配置矩阵。
+
 | 文档 | 内容 |
 | --- | --- |
 | `reference/qwen38-model-shapes.md` | 各 Qwen3.8 / Qwen3.5 尺寸的层数、头数、`model_type`、全注意力间隔；本机没权重也能拿结构 |
 | `reference/qfa-op-contract.md` | QFA 两算子的接口契约：descale shape 表、`max_seqlen_*` 语义、tilingKey 六维各自能不能动、metadata plan 的共享边界 |
-| `reference/c8-qfa-config-matrix.md` | 哪些 KV cache / attention 组合真能起服务，以及每条路被什么挡住 |
+| `reference/c8-qfa-config-matrix.md` | #17180 合入后的主线配置、packet-packed PA_NZ、P/D 格式与转换频率、源码入口 |
 
 ## cases —— 一次排查的完整记录
 

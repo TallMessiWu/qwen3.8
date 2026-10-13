@@ -41,7 +41,7 @@ qwen3.8/                   # 主仓（git，分支 main）
     └── upstream-main/     # 常驻 worktree，跟踪官方 upstream/main
 ```
 
-服务器上的对应源码路径是 `/home/hajimi/qwen3.8/vllm` 与 `/home/hajimi/qwen3.8/vllm-ascend/main`；容器通过 `/home:/home` 直接使用宿主机 checkout，`create-container.sh` 默认 editable 安装 `/home/hajimi/qwen3.8/vllm-ascend/junlin-c8-mxfp`（C8 MXFP8 在途分支，基于上游 PR 15484），`main` 仍作为个人 fork 基线维护。
+服务器源码位于 `/home/hajimi/qwen3.8/`，容器通过 `/home:/home` 直接使用宿主机 checkout。**当前 QFA/C8 源码基线是官方 `upstream/main`（PR #17180 已合入），本机看 `vllm-ascend/upstream-main/`。** `create-container.sh` 仍默认 editable 安装旧的 `junlin-c8-mxfp`，这是脚本的遗留默认值，不能据此判断真机正在使用的版本；本次只更新文档，没有改启动脚本或已安装环境。`main` 继续跟踪个人 fork 的 `origin/main`。
 
 **主仓只跟踪两个 submodule 指针 + `scripts/` + agent 配置。** `vllm-ascend/main` 之外的 worktree 目录（包括 `upstream-main` 和各任务分支）被 `.gitignore` 排除（`/vllm-ascend/*` + `!/vllm-ascend/main`），留在本地不进主仓。
 
@@ -78,6 +78,8 @@ git worktree remove ../feat-xxx                        # 收尾清理
 
 ## 本机验证环境（推真机之前先过一遍）
 
+**版本范围（2026-10-13 更新）**：下面的 0.28.0 / `84030bbe3d` 与 CPU 单测计数是旧环境快照，不能当作当前主线验证。当前 `upstream-main` 的 `.github/vllm-main-verified.commit` 是 `8cc9aa5ad350f6f80cf3bebb298d410803ff75a9`，`.github/vllm-release-tag.commit` 是 `v0.30.0`。本次 pull 没有切换只读 `vllm/`、重建 `.venv` 或更新 submodule 指针。要验证新主线，先按它的版本声明对齐环境，再跑下面的检查；不能沿用旧环境的通过数。
+
 `scripts/local/setup-devenv.sh` 在本机建一套对齐真机的 venv：Python 3.11 +
 vllm（直接装 `vllm/` submodule 当前的 checkout，`VLLM_TARGET_DEVICE=empty`，不编译 kernel）
 + torch 2.10.0（带 CUDA，吃 5080）+ editable 的 `vllm-ascend/junlin-c8-mxfp-16278`。`torch_npu` 不装，由 vllm-ascend 自己的
@@ -98,7 +100,7 @@ lane。`VLLM_VERSION=0.28.0` 强行对齐会在 collection 就炸（0.28.0 分�
 要验 0.28.0 那条分支只能覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 临时派生一个
 只读 worktree 重建 venv（用完 `git -C vllm worktree remove` 删掉）。
 
-**⚠️ 2026-09-15 起 0.27.1 已经不能用了。** 近期 upstream/main 的 vllm-ascend 只支持
+**历史环境（2026-09-15）**：当时 0.27.1 已经不能用了；当时 upstream/main 的 vllm-ascend 只支持
 **vllm 恰好 0.28.0**（代码里 101 处 `vllm_version_is("0.28.0")` 守卫）或 **main
 `84030bbe3d`**；0.27.1 会在 `patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups`
 缺失而 import 失败。`junlin-c8-mxfp` / `junlin-qfa` 这两条老分支还钉着 `ba07e4a48f`，
@@ -186,23 +188,38 @@ git commit -s -m ":bug: fix(gdn): 修复 TP8 下 cumsum 分块导致的乱码"
 
 完整规范见 `vllm-ascend/main/AGENTS.md`（代码风格、测试要求、review checklist）。
 
-## 当前状态
+## 当前状态（2026-10-13 核对）
 
-两个常驻 worktree 分别是跟踪 fork 的 `main` 和跟踪官方主线的 `upstream-main`。在途分支各有独立 worktree：
+**QFA / C8-MXFP 已合入官方主线，后续默认查 `vllm-ascend/upstream-main/`。**
+[PR #17180](https://github.com/vllm-project/vllm-ascend/pull/17180) 于北京时间
+2026-10-07 合入，提交 `a7f26e5c4e4d9dd7f20fa114f351860bd6552731`。本次
+`git -C vllm-ascend/upstream-main pull --ff-only upstream main` 已快进到
+`fbb4d867d22095047473e3c7ca9db053f5f4c7b0`，并确认包含该合入提交。
+这是本次源码快照，不是以后可以免 fetch 的固定版本。
 
-- `junlin-c8-mxfp` —— 跟随上游 PR 15484（C8 MXFP8 KV cache + QFA + MTP + PD 分离），基于该 PR 头部。容器和本机 venv 默认 editable 安装的就是它。它的 QFA 来自外部 `cann_ops_transformer` 包，csrc 里没有算子源码，也没有 `VLLM_ASCEND_ENABLE_QFA` 开关。
-- `junlin-qfa` —— QFA 算子接入主线，基于 upstream/main，官方 master QFA 已 vendor 进 csrc。`scripts/setup/` 下三个 `*qfa*` 构建脚本仍默认指向它，因为只有它能从 csrc 编出 QFA。
-- `junlin-c8-mxfp-16614` —— 从上游 PR 16614 头部（本地快照 `pr-16614`）派生。PR 16614 就是 `junlin-c8-mxfp-16278` 那 10 个提交被 rebase 到更新的上游，补丁内容一致。在它之上多两个提交，修的是 **hybrid C8 的 KV 容量只有 BF16 的四分之一**（2026-09-21，仅本机验证，真机待验）：mamba 的配置钩子跑在 `quant_config` 赋值之前，看不到 C8，按 BF16 把 page 定成「2048 token」那么大；随后 `refresh_block_size` 又把 block 写死成 512，于是每个 attention page 有 87% 是填充。现在 hybrid 下按 FP8 字节重算——block 取「一个 SSM state 能装下的 FP8 token 数」（2.4T@TP8 是 4096 = 8 个 512 的 QFA kernel 块），K 段与 ssm 段逐块重合，和 BF16 路径同一个不变量；不能整除时直接报错，凑整会让两组的 block id 串扰。配套把 prefix-cache 的 CoW 块拷贝改成按 kernel 行展开。`junlin-c8-mxfp`、`junlin-c8-mxfp-16278`、`junlin-qfa` 都还带着写死 512 的旧逻辑，这两个提交能无冲突 cherry-pick 过去。细节（真机验收预期值、从「GPU KV cache size」反推 `num_blocks` 的方法）见 `docs/cases/hybrid-c8-kv-capacity.md`。
+- `upstream-main` 跟踪官方 `upstream/main`；`main` 跟踪个人 fork 的 `origin/main`。
+  本次没有同步 fork、切换服务安装路径或推进主仓 submodule 指针。
+- 主线实现集中在 `vllm_ascend/attention/attention_c8_mxfp.py`，启用入口为
+  `--kv-cache-dtype mxfp8`。QFA 两算子来自外部 `cann_ops_transformer.ops`；
+  主线 `csrc/` 没有这两个算子的 vendor 源码。
+- 主线 cache 为 PA_NZ：每个 512-token kernel block 的物理排列是
+  `[K | K_scale | V | V_scale | padding]`，四个张量是分配时建立的共享内存 strided
+  视图。K/V 已是五维 NZ；不要套用旧分支「四维管理视图在调用前 view 成五维」的描述。
+- 同一实现、匹配配置下 P/D 的 KV cache 格式相同；decode 的 TND → N2TGD 重排对象
+  是本步 Q scale。scatter 写本步新 KV，QFA 直接读已有 PA_NZ cache，不逐步转换历史 KV。
+  PD 的跨 TP 重排与真机验收仍需按实际配置单独核对。
+- 主线还包含 #17956：V scale 除初始化时填充外，hybrid 物理页重新分配给 attention 时
+  会恢复，不能再笼统写成「整个运行期只填一次」。
 
-前两条分支各自带着同样的两个真机故障修复，都是「值在错误的时刻被固定」这一类：
+完整的当前格式、配置和源码入口见
+[`docs/reference/c8-qfa-config-matrix.md`](docs/reference/c8-qfa-config-matrix.md)。
 
-1. **MoE 三处 TP 规约按当前通信方式重算**。`ALLGATHER` 是唯一不在融合 kernel 里做 TP 规约的通信方式，而通信方式随每步 token 数变化；原来那个判据在编译区里求值一次、被烘成捕获期 dummy run 的值，长 prompt 下 all_reduce 整个没执行，模型直接吐 EOS。三个消费点必须同时改，只改一处会让 shared 被规约两次、从吐 EOS 变成整段乱码。
-2. **C8_MXFP 的 V scale 缓存不能在捕获期标记为已填充**。ACL 图捕获只记录不执行，而记录「填过了」的那行 Python 是真执行的，于是 V 的 scale 缓存永远全零、反量化后 attention 恰好吐零。target 不受影响，draft 第一次走到这段就是捕获本身，表现为一开 draft 图 MTP 接受率就塌。
+`junlin-c8-mxfp`、`junlin-qfa`、`junlin-c8-mxfp-16278/16614` 和
+`debug-qfa-kv-lens` 仍是本地旧实现/诊断 worktree，**不是当前主线的证据**：旧的
+`junlin-c8-mxfp` / `junlin-qfa` 用 PA_BBND，`16278/16614` 系用 PA_NZ，但内存组织
+仍与合入后的主线不同。旧的 MoE TP 规约、V scale 图捕获和 hybrid KV 容量故障记录保留在
+`docs/cases/`；引用旧提交、验收数或图路径前先核对适用分支。
 
-两条分支的 QFA 进图机制不同，排查时不要互相套用结论：`junlin-c8-mxfp` 是原生 `npugraph_ex`，`junlin-qfa` 是 task group + update 重发。
-
-2026-09-10 清理过一轮分支。`junlin-qfa-c8switch`（C8 开关拿 bf16 基线）、`feat-qfa-dump`（QFA 输入输出 dump 插桩）、`debug-moe-comm-tokens`（MoE 通信判据打印）以及全部 `archive-*` 备份都已从本地和 fork 删除，远端只剩 `main`、`junlin-qfa`、`junlin-c8-mxfp` 三条。`scripts/bench/replay_qfa_dump.py` 的配套插桩（`vllm_ascend/attention/qfa_dump.py`）随 `feat-qfa-dump` 一起没了，回放脚本因此跑不起来，同日一并删除；真要重做 QFA dump，捕获侧和回放侧得一起写回来。
-
-其他功能分支仍按任务单独创建；`scripts/` 已包含 Qwen3.8 服务启动、运行时辅助和回归测试资产，不要把这些脚本误判成插件侧适配实现。
-
-所以别去猜「已有实现」——开新任务时先选择正确基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前先 `git branch -r` 看看有没有相关的在途分支。
+其他功能分支按任务单独创建；`scripts/` 是服务启动、诊断与回归资产，不是插件侧适配实现。
+新任务先选基线：fork 工作从 `main` 派生，上游工作从 `upstream-main` 派生。动某个区域前
+先 `git branch -r` 看相关在途分支；查询当前 QFA 行为先 fetch/pull 主线，再定位实现。

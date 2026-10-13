@@ -1,5 +1,11 @@
 # scripts/local —— 本机脚本（不是服务器脚本）
 
+> **版本范围更新（2026-10-13）**：QFA/C8 已由 PR #17180 合入官方 `upstream/main`。
+> 以下 0.28.0 / `84030bbe3d` / `junlin-c8-mxfp-16278` 和单测计数是旧环境快照；
+> `setup-devenv.sh` 的默认 worktree 仍未改，本次也没有重建 `.venv`。当前主线声明的
+> vLLM main 是 `8cc9aa5ad350f6f80cf3bebb298d410803ff75a9`，release tag 是 `v0.30.0`。
+> 新主线验证须先对齐版本，不能沿用下面的旧通过数。
+
 `scripts/` 下其余内容都是交给服务器（昇腾 NPU）执行的；这个目录相反，只在**本机**跑：
 x86_64 + NVIDIA GPU，没有 NPU、没有 CANN。目的是在把改动推上真机之前，先用静态检查
 和纯 PyTorch 模拟拦掉一批错误。
@@ -22,11 +28,12 @@ source .venv/bin/activate
 | torch_npu | 真 NPU | `tests/ut/conftest.py` 自动注入的 MagicMock |
 
 `vllm/` 跟着 vllm-ascend 的 `.github/vllm-main-verified.commit` 走（当前 main
-`84030bbe3d`）。真机是 pip 装的 0.28.0，两者用起来差别不大，不必纠结；真要对某个确切
-版本，覆盖 `VLLM_REF` + `VLLM_WORKTREE` 从 submodule 临时派生一个只读 worktree
+`84030bbe3d`，旧环境快照）。真机当时是 pip 装的 0.28.0，版本守卫可能走不同 lane，
+不能用本机通过数替代真机版本的验证。要对齐某个确切版本，覆盖 `VLLM_REF` +
+`VLLM_WORKTREE` 从 submodule 临时派生一个只读 worktree
 （用完 `git -C vllm worktree remove` 删掉）。换版本重建会清掉 `.venv`，两套环境没法并存。
 
-**2026-09-15 从 0.27.1 升上来。** 近期 upstream/main 的 vllm-ascend 只支持 vllm 恰好
+**历史环境：2026-09-15 从 0.27.1 升上来。** 当时 upstream/main 的 vllm-ascend 只支持 vllm 恰好
 0.28.0（101 处 `vllm_version_is("0.28.0")` 守卫）或 main `84030bbe3d`；0.27.1 会在
 `patch_kv_cache_utils.py` 就因 `_get_packed_kv_cache_groups` 缺失而 import 失败。
 `junlin-c8-mxfp` / `junlin-qfa` 这两条老分支还钉着 `ba07e4a48f`，要验它们得先把 `vllm/`

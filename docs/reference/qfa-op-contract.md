@@ -1,5 +1,12 @@
 # QFA 两算子的接口契约
 
+> **基线更新（2026-10-13）**：PR #17180 已合入官方主线；当前调用侧看
+> `vllm-ascend/upstream-main/vllm_ascend/attention/attention_c8_mxfp.py`，
+> 本次核对到 `fbb4d867d`。cache 为 packet-packed PA_NZ，启用入口为
+> `--kv-cache-dtype mxfp8`。完整配置与 PD 格式见
+> [`c8-qfa-config-matrix.md`](c8-qfa-config-matrix.md)。下面的旧 vendor host tiling
+> 细节及历史真机结果不能当作当前已安装 CANN 包的验收。
+
 `QuantFlashAttn`（主算子，AI Core）+ `QuantFlashAttnMetadata`（伴生算子，**AICPU**）。
 接入流程见 `../vendor-ops-transformer-op.md`，门禁见技能 `vendor-ascend-op`。
 本页只放**会被反复查的表与语义**。
@@ -34,7 +41,7 @@ TND+PA 的调用示例。
 `max(seqused_q) <= max_seqlen_q`。（AICPU 实现里是 `std::max(attr, 逐 batch 长度)`，
 传小会自愈、传大不会 walk back——所以它是**语义问题不是性能问题**。）
 
-## tilingKey 六维盘点
+## tilingKey 六维盘点（旧 vendor 源码快照）
 
 `GenTilingKey()`（`quant_flash_attn_tiling_mxfp8.cpp`）拿六维拼 key。逐维确认 Python
 侧能不能动：
@@ -60,7 +67,7 @@ TND+PA 的调用示例。
 
 ### 表中 ✅ 那几维是什么时候动的
 
-2026-09-16 三个 commit 落在 `junlin-c8-mxfp-16278`：
+以下是旧分支的本地提交记录，不是 #17180 的合入提交号。2026-09-16 三个 commit 落在 `junlin-c8-mxfp-16278`：
 
 | commit | 改的哪一维 |
 | --- | --- |
@@ -83,7 +90,8 @@ PA_NZ + MXFP8 的融合 scale scatter，以及量级最大的 `flashDecodeFlag_`
 
 **plan 只依赖**：头数 / 头维 / `quantMode` / `cu_seqlens_q` / `seqused_kv` / `maskMode` /
 `win` / `layout` / `deviceInfo`——**没有逐层量**。主算子侧 `this->Input("metadata")` 是
-只读输入；`v_descale` 只在 `layoutKv == "TND"` 做校验，PA_NZ 跳过。
+只读输入。当前主线的 metadata 调用不传 `v_descale`，主算子仍接收 K/V descale；
+不要套用旧 vendor 的「metadata 必须给 V scale 占位符」契约。
 
 ⇒ **一步只调一次、全部注意力层共用**，捕获期同理（调用录在捕获区内，流序保证写先于读）。
 已经照这条砍掉的那批小算子、以及为什么不能把剩下的挪到 `prepare_inputs`，见
@@ -91,8 +99,10 @@ PA_NZ + MXFP8 的融合 scale scatter，以及量级最大的 `flashDecodeFlag_`
 
 ## 源码交叉验证
 
-vendor 进来的一份 csrc 在 `vllm-ascend/junlin-qfa/csrc/attention/quant_flash_attn/`
-（只有 `junlin-qfa` 有，`junlin-c8-mxfp` 系走外部 `cann_ops_transformer` 包）。
+当前主线的调用在 `vllm-ascend/upstream-main/vllm_ascend/attention/attention_c8_mxfp.py`，
+从外部 `cann_ops_transformer.ops` 导入两算子，主线 `csrc/` 没有 vendor 的 QFA 源码。
+`vllm-ascend/junlin-qfa/csrc/attention/quant_flash_attn/` 是历史 vendor 快照，下面这些
+checker / tiling 路径只用于交叉核对那份版本；换包后以所装包及契约体检为准。
 
 - host checker：`op_host/checkers/quant_checker.cpp` 里的 `expected` 数组是上面 descale
   表的**代码版**，核对文档时很好用。

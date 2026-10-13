@@ -1,5 +1,10 @@
 # QFA 前面那串小算子：归属、能不能提前、削到哪一步
 
+> **2026-10-13 补充**：QFA/C8 已由 PR #17180 合入官方主线；当前实现移到
+> `vllm_ascend/attention/attention_c8_mxfp.py`。下文是旧分支的 profiling 与削减记录，
+> 不代表当前主线的 kernel 数；尤其主线 metadata 接口不再接收 `v_descale`，不能继续
+> 套用占位符 zeros / 视图的旧契约。
+
 > **状态**：部分真机待验——占位符视图那三项真机全绿，**gsm8k 精度结果当时未回填**。
 > **来源**：2026-09 的 Claude Code 会话记忆（`~/.claude/projects/…/memory/`），2026-09-24 迁入本仓。
 > ⚠️ 汇报时先把这句说在前面：**这次没有任何东西被提前到 `prepare_inputs`**，

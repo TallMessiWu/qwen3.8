@@ -1,5 +1,10 @@
 # QFA 接入全过程（vendor → eager → 进图 → MXFP8 cache）
 
+> **2026-10-13 补充**：QFA/C8 已通过 PR #17180 合入官方 `upstream/main`，当前源码看
+> `vllm-ascend/upstream-main/vllm_ascend/attention/attention_c8_mxfp.py`。下文的分支血缘、
+> 算子来源及服务安装路径是历史快照；当前配置与 packet-packed PA_NZ 布局见
+> [`c8-qfa-config-matrix.md`](../reference/c8-qfa-config-matrix.md)。
+
 > **状态**：**部分过期**。本文主体写于 2026-09-02/03，讲的是 `junlin-qfa` 那条分支；
 > 2026-09-08 起真机已经切到 `junlin-c8-mxfp` 系，两条分支的 attention 实现差别很大。
 > **来源**：2026-09 的 Claude Code 会话记忆（`~/.claude/projects/…/memory/`），2026-09-24 迁入本仓。
